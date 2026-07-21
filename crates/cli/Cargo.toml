@@ -1,0 +1,15 @@
+[package]
+name = "isopod-cli"
+description = "isopod CLI: one-shot argv + JSON subcommands (image, dev, run, stage, mcp, setup, doctor)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "isopod"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

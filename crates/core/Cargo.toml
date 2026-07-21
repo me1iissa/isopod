@@ -1,0 +1,8 @@
+[package]
+name = "isopod-core"
+description = "isopod orchestrator library: VM lifecycle, stages, snapshots, netns slots, image pipeline, on-disk store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

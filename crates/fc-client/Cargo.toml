@@ -1,0 +1,8 @@
+[package]
+name = "isopod-fc"
+description = "Typed Firecracker API client (unix-socket HTTP), process supervision, hybrid-vsock helper. Pinned to Firecracker v1.16.1."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "isopod-proto"
+description = "Shared host<->guest RPC types (length-prefixed serde-JSON frames over vsock)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

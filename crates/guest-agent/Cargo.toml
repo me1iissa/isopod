@@ -1,0 +1,8 @@
+[package]
+name = "isopod-guest-agent"
+description = "Static musl PID 1 for the guest: mounts, overlay assembly, clock sync, vsock exec RPC."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
