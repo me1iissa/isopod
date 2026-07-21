@@ -336,9 +336,11 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   gcc). Acceptance dogfooded through isopod: bare `pip install requests` → commit → fork by
   vanity name → `import requests` no reinstall → parent byte-identical; egress + host isolation
   live-verified. 8 dogfood findings fixed along the way (docs/dogfood-findings.md).]*
-- **M5 — MCP + skill.** `isopod mcp`, `.mcp.json`, SKILL.md. Acceptance from a real Claude Code
-  session: run code ephemerally → commit stage → new session forks it → fork sees state, parent
-  stage unchanged.
+- **M5 — MCP + skill.** *[✅ COMPLETE 2026-07-21 — `isopod-mcp` rmcp 2.2 stdio server (sandbox_run
+  + stage_list/info/rm + vm_list/gc), SKILL.md, `.mcp.json` + plugin packaging. stdin plumbed
+  end-to-end (finding #4). Dogfooded by driving the real server over stdio: all tools list,
+  sandbox_run + stdin + python all exit 0, zero leaks. Registered in the repo `.mcp.json` for
+  live Claude Code use.]*
 - **M6 — Warm pool.** Snapshot save/resume path under `sandbox_run`/`sandbox_start`, cache
   invalidation keys, clock resync, resume-latency benchmark vs M0 baseline; `stage_info` shows
   cache status.
