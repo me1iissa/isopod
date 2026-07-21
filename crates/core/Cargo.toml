@@ -6,3 +6,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Blocking HTTP: the image pipeline is a synchronous one-shot CLI path, so we
+# opt the workspace reqwest into its `blocking` client (keeps the CLI runtime-free).
+reqwest = { workspace = true, features = ["blocking", "query"] }
+# Crate-local (not in the workspace set): S3 ListObjectsV2 XML parsing + home dir.
+quick-xml = { version = "0.39", features = ["serialize"] }
+dirs = "6"
+
+[dev-dependencies]
+tempfile = { workspace = true }
