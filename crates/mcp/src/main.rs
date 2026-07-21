@@ -116,6 +116,14 @@ struct SandboxRunParams {
     /// or data to the command instead of embedding it in `cmd`.
     #[serde(default)]
     stdin: Option<String>,
+    /// Guest vCPU count (default 1). Must be 1 or an even number, at most the
+    /// host CPU count; an over-cap value errors without booting.
+    #[serde(default)]
+    vcpus: Option<u32>,
+    /// Guest memory in MiB (default 512). Bounded 128..=host-free-RAM; an
+    /// over-cap value errors without booting.
+    #[serde(default)]
+    mem_mib: Option<u32>,
 }
 
 /// Parameters for [`Isopod::stage_info`] and [`Isopod::stage_rm`].
@@ -163,6 +171,10 @@ struct SandboxRunResult {
     duration_ms: u64,
     /// Total wall time of the whole run (boot + exec + teardown) in ms.
     total_ms: u64,
+    /// Guest vCPU count the sandbox booted with (host-validated).
+    vcpus: u32,
+    /// Guest memory in MiB the sandbox booted with (host-validated).
+    mem_mib: u32,
     /// The ephemeral VM id (`dev-<8 hex>`).
     vm_id: String,
     /// Human-memorable vanity name for this run's VM.
@@ -203,6 +215,8 @@ impl From<RunReport> for SandboxRunResult {
             stderr_bytes: r.stderr_bytes,
             duration_ms: r.exec_ms,
             total_ms: r.total_ms,
+            vcpus: r.vcpus,
+            mem_mib: r.mem_mib,
             vm_id: r.vm_id,
             vm_name: r.name,
             rootfs_flavor: r.rootfs_flavor,
@@ -346,7 +360,8 @@ impl Isopod {
     /// `commit_as` to persist the result as a new stage (only when the command
     /// exits 0). A non-zero exit code is returned normally, not as an error.
     /// Networking is on by default; set `network=false` for untrusted code.
-    /// `timeout_s` covers boot + exec (default 120).
+    /// `timeout_s` covers boot + exec (default 120). Size the VM with `vcpus`
+    /// (default 1) and `mem_mib` (default 512); both are host-capped.
     #[tool(
         name = "sandbox_run",
         description = "Run a shell command in a fresh, disposable Firecracker microVM (boot, exec, \
@@ -355,7 +370,7 @@ commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the tool
 (Python/Node/git/gcc); pass `stage` to fork a committed stage, `commit_as` to persist the result \
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
 Networking on by default (network=false for untrusted code). timeout_s covers boot + exec \
-(default 120).",
+(default 120). Size the VM with vcpus (default 1) and mem_mib (default 512), both host-capped.",
         meta = crate::sandbox_run_meta()
     )]
     async fn sandbox_run(
@@ -403,6 +418,9 @@ Networking on by default (network=false for untrusted code). timeout_s covers bo
             commit_as: p.commit_as,
             base,
             stdin: p.stdin.map(String::into_bytes),
+            // Defaults resolved by the core resolver, which also host-validates.
+            vcpus: p.vcpus.unwrap_or(vm::DEFAULT_VCPUS),
+            mem_mib: p.mem_mib.unwrap_or(vm::DEFAULT_MEM_MIB),
         };
 
         // Best-effort idle-timeout keepalive: if the client sent a progressToken,

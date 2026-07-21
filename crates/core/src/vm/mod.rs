@@ -27,9 +27,11 @@ use crate::stage::{self, StageMeta};
 mod build_fc;
 mod console;
 mod registry;
+mod resources;
 
 pub use build_fc::{build_fc, BinPaths, BuildFcOutcome};
 pub use registry::{gc as vm_gc, list as vm_list, reap_orphans, GcReport, VmRecord};
+pub use resources::{Resources, DEFAULT_MEM_MIB, DEFAULT_VCPUS};
 
 /// Per-stream inline capture cap for `isopod run` (64 KiB, per the PLAN's
 /// head-truncation policy); everything is still teed in full to the log files.
@@ -457,14 +459,21 @@ fn build_boot_args(disk: &DiskConfig, net: Option<&net::Slot>) -> String {
 /// When `net` is `Some`, the claimed slot's tap is attached as `eth0` pre-boot
 /// and its static config is baked into the boot args (the guest agent applies it
 /// via ioctls); when `None` (`--no-network`) no NIC is attached at all.
+///
+/// `resources` sets the guest vCPU count and memory size (already host-validated
+/// upstream in [`run_ephemeral`]).
 async fn configure_run_boot(
     client: &FcClient,
     kernel: &Path,
     disk: &DiskConfig,
+    resources: Resources,
     net: Option<&net::Slot>,
 ) -> Result<()> {
     client
-        .put_machine_config(&MachineConfig::new(1, 256))
+        .put_machine_config(&MachineConfig::new(
+            resources.vcpus,
+            u64::from(resources.mem_mib),
+        ))
         .await
         .context("PUT /machine-config")?;
     let args = build_boot_args(disk, net);
@@ -684,6 +693,16 @@ pub struct RunOptions {
     pub base: RootfsFlavor,
     /// Bytes written to the command's stdin (then closed). `None` = no stdin.
     pub stdin: Option<Vec<u8>>,
+    /// Requested guest vCPU count. Validated against the host CPU count (and
+    /// Firecracker's 1-or-even rule) by [`resources::resolve`]; an out-of-range
+    /// value is a hard error, never silently clamped. Use [`DEFAULT_VCPUS`] for
+    /// the default.
+    pub vcpus: u32,
+    /// Requested guest memory in MiB. Validated against the host's free RAM
+    /// (leaving headroom) by [`resources::resolve`]; an out-of-range value is a
+    /// hard error, never silently clamped. Use [`DEFAULT_MEM_MIB`] for the
+    /// default.
+    pub mem_mib: u32,
 }
 
 /// Result of a [`run_ephemeral`], serialized verbatim as `isopod run`'s JSON.
@@ -718,6 +737,10 @@ pub struct RunReport {
     pub exec_ms: u64,
     /// Total wall time of the whole run in milliseconds.
     pub total_ms: u64,
+    /// Guest vCPU count the VM actually booted with (host-validated).
+    pub vcpus: u32,
+    /// Guest memory in MiB the VM actually booted with (host-validated).
+    pub mem_mib: u32,
     /// The firecracker binary used and its provenance.
     pub fc_binary: FcBinary,
     /// Rootfs flavor booted (e.g. `dev-agent`).
@@ -792,6 +815,9 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     if opts.network {
         require_network_setup()?;
     }
+    // Validate the requested resource shape against real host capacity *before*
+    // booting anything: an over-cap request must error with no VM launched.
+    let resources = resources::resolve_for_host(opts.vcpus, opts.mem_mib)?;
     let t_total = Instant::now();
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
@@ -814,7 +840,7 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(run_exec(fc, kernel, plan, opts, t_total))
+    rt.block_on(run_exec(fc, kernel, plan, resources, opts, t_total))
 }
 
 /// How a run's guest disks are laid out. `Flavor` is the legacy single-ext4
@@ -877,6 +903,7 @@ async fn run_exec(
     fc: FcBinary,
     kernel: PathBuf,
     plan: BootPlan,
+    resources: Resources,
     opts: RunOptions,
     t_total: Instant,
 ) -> Result<RunReport> {
@@ -929,6 +956,7 @@ async fn run_exec(
         fc: &fc,
         kernel: &kernel,
         disk: &disk,
+        resources,
         net: net_slot.as_ref(),
         api_sock: &api_sock,
         vsock_uds: &vsock_uds,
@@ -969,6 +997,8 @@ async fn run_exec(
         stderr_bytes: exec.stderr.total_bytes,
         exec_ms: exec.exec_ms,
         total_ms: t_total.elapsed().as_millis() as u64,
+        vcpus: resources.vcpus,
+        mem_mib: resources.mem_mib,
         fc_binary: fc,
         rootfs_flavor: flavor_label,
         serial_log_path: console_log,
@@ -1143,6 +1173,8 @@ struct DriveExecCtx<'a> {
     fc: &'a FcBinary,
     kernel: &'a Path,
     disk: &'a DiskConfig,
+    /// Host-validated vCPU / memory allocation for this VM.
+    resources: Resources,
     /// Claimed network slot (`None` for `--no-network`).
     net: Option<&'a net::Slot>,
     api_sock: &'a Path,
@@ -1181,7 +1213,7 @@ async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
 
     // Pre-boot configuration, including the hybrid-vsock device.
     let client = proc.client().context("building the API client")?;
-    configure_run_boot(&client, ctx.kernel, ctx.disk, ctx.net).await?;
+    configure_run_boot(&client, ctx.kernel, ctx.disk, ctx.resources, ctx.net).await?;
     client
         .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
         .await
@@ -1434,6 +1466,8 @@ mod tests {
             stderr_bytes: 0,
             exec_ms: 12,
             total_ms: 200,
+            vcpus: 1,
+            mem_mib: 512,
             fc_binary: FcBinary {
                 path: PathBuf::from("/x/firecracker"),
                 provenance: FcProvenance::VendoredBuild,
@@ -1453,6 +1487,8 @@ mod tests {
         assert_eq!(v["signal"], serde_json::Value::Null);
         assert_eq!(v["stdout"], serde_json::json!("hi\n"));
         assert_eq!(v["stdout_bytes"], serde_json::json!(3));
+        assert_eq!(v["vcpus"], serde_json::json!(1));
+        assert_eq!(v["mem_mib"], serde_json::json!(512));
         assert_eq!(
             v["fc_binary"]["provenance"],
             serde_json::json!("vendored-build")
@@ -1487,6 +1523,8 @@ mod tests {
             "stderr_bytes",
             "exec_ms",
             "total_ms",
+            "vcpus",
+            "mem_mib",
             "fc_binary",
             "rootfs_flavor",
             "serial_log_path",
@@ -1514,6 +1552,8 @@ mod tests {
             stderr_bytes: 0,
             exec_ms: 3,
             total_ms: 120,
+            vcpus: 2,
+            mem_mib: 1024,
             fc_binary: FcBinary {
                 path: PathBuf::from("/x/firecracker"),
                 provenance: FcProvenance::VendoredBuild,
@@ -1529,6 +1569,8 @@ mod tests {
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["rootfs_flavor"], serde_json::json!("base-alpine"));
+        assert_eq!(v["vcpus"], serde_json::json!(2));
+        assert_eq!(v["mem_mib"], serde_json::json!(1024));
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
         assert_eq!(v["slot"], serde_json::json!(3));

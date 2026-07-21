@@ -11,7 +11,9 @@ use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use isopod_core::image::{self, RootfsFlavor};
 use isopod_core::stage;
-use isopod_core::vm::{self, DevBootOptions, RunOptions, DEFAULT_RUN_FLAVOR};
+use isopod_core::vm::{
+    self, DevBootOptions, RunOptions, DEFAULT_MEM_MIB, DEFAULT_RUN_FLAVOR, DEFAULT_VCPUS,
+};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -79,6 +81,15 @@ struct RunArgs {
     /// Outer wall-clock budget in seconds (covers boot + exec).
     #[arg(long = "timeout-s", default_value_t = 120)]
     timeout_s: u64,
+    /// Guest vCPU count (default 1). Must be 1 or an even number, and at most the
+    /// host CPU count; an over-cap value errors without booting a VM.
+    #[arg(long, default_value_t = DEFAULT_VCPUS)]
+    vcpus: u32,
+    /// Guest memory in MiB (default 512). Bounded below at 128 MiB and above by
+    /// the host's free RAM (headroom reserved); an over-cap value errors without
+    /// booting a VM.
+    #[arg(long = "mem-mib", default_value_t = DEFAULT_MEM_MIB)]
+    mem_mib: u32,
     /// Rootfs flavor to boot.
     #[arg(long, default_value = DEFAULT_RUN_FLAVOR)]
     flavor: String,
@@ -285,6 +296,8 @@ fn run_run(args: RunArgs) -> i32 {
             commit_as: args.commit_as,
             base,
             stdin,
+            vcpus: args.vcpus,
+            mem_mib: args.mem_mib,
         })
     })();
     emit(result)
