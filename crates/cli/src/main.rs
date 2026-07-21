@@ -5,8 +5,11 @@
 //! persists any cross-invocation state under ~/.isopod so any caller
 //! (Claude Code, human shell, CI) can resume.
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
 use isopod_core::image::{self, RootfsFlavor};
+use isopod_core::vm::{self, DevBootOptions};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -54,8 +57,17 @@ enum ImageCommand {
 
 #[derive(Subcommand)]
 enum DevCommand {
-    /// Boot a dev VM and stream its serial banner (M1 exit test)
-    Boot,
+    /// Boot a throwaway dev VM, measure boot latency, verify liveness (M1 exit test)
+    Boot {
+        /// Keep the VM directory's throwaway rootfs copy instead of deleting it.
+        #[arg(long)]
+        keep: bool,
+        /// Seconds to wait for the boot + liveness markers.
+        #[arg(long = "timeout-s", default_value_t = 15)]
+        timeout_s: u64,
+    },
+    /// Build the vendored Firecracker (v1.16.1) and install it to ~/.isopod/bin
+    BuildFc,
 }
 
 fn main() {
@@ -78,13 +90,37 @@ fn run_image(cmd: ImageCommand) -> i32 {
 
 fn run_dev(cmd: DevCommand) -> i32 {
     match cmd {
-        DevCommand::Boot => {
-            println!(
-                "{}",
-                serde_json::json!({"ok": false, "error": "unimplemented (M1 in progress)"})
-            );
-            2
-        }
+        DevCommand::Boot { keep, timeout_s } => emit(vm::dev_boot(DevBootOptions {
+            keep,
+            timeout: Duration::from_secs(timeout_s),
+        })),
+        // build-fc captures environment failures into a `{ok:false,…,findings}`
+        // outcome, so route the exit code off the outcome's own `ok` flag rather
+        // than treating a reportable build failure as an emit() error.
+        DevCommand::BuildFc => match vm::build_fc() {
+            Ok(outcome) => {
+                let ok = outcome.ok;
+                print_json(&outcome);
+                if ok {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => emit::<()>(Err(e)),
+        },
+    }
+}
+
+/// Serialize `value` as the single stdout JSON line, falling back to a
+/// `{ok:false,…}` object if serialization itself fails.
+fn print_json<T: Serialize>(value: &T) {
+    match serde_json::to_string(value) {
+        Ok(json) => println!("{json}"),
+        Err(e) => println!(
+            "{}",
+            serde_json::json!({"ok": false, "error": format!("serialize: {e}")})
+        ),
     }
 }
 
@@ -92,19 +128,10 @@ fn run_dev(cmd: DevCommand) -> i32 {
 /// error object as the single stdout JSON line; return the process exit code.
 fn emit<T: Serialize>(result: anyhow::Result<T>) -> i32 {
     match result {
-        Ok(value) => match serde_json::to_string(&value) {
-            Ok(json) => {
-                println!("{json}");
-                0
-            }
-            Err(e) => {
-                println!(
-                    "{}",
-                    serde_json::json!({"ok": false, "error": format!("serialize: {e}")})
-                );
-                1
-            }
-        },
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
         Err(e) => {
             eprintln!("error: {e:#}");
             println!(

@@ -677,12 +677,14 @@ dependencies = [
  "anyhow",
  "dirs",
  "hex",
+ "isopod-fc",
  "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
