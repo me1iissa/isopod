@@ -96,8 +96,10 @@ impl Default for DevBootOptions {
 pub struct DevBootReport {
     /// Always `true` on the success path (the CLI emits `{ok:false,…}` on error).
     pub ok: bool,
-    /// The generated VM id (`dev-<8 hex>`).
+    /// The generated VM id (`dev-<8 hex>`) — the stable primary key.
     pub vm_id: String,
+    /// Human-memorable vanity name (seeded deterministically from `vm_id`).
+    pub name: String,
     /// Milliseconds from `InstanceStart` returning to the boot marker appearing.
     pub boot_ms: f64,
     /// Number of `TICK` liveness lines observed (guaranteed `>= 2` on success).
@@ -255,6 +257,39 @@ fn generate_vm_id() -> Result<String> {
     ))
 }
 
+/// Choose a vanity name for `vm_id` (unique among VMs recorded under the vms
+/// dir) and persist `<vm_dir>/meta.json` with the instance metadata. The vm_id
+/// stays the primary key; the name is the human/model-memorable handle.
+fn assign_vanity_name(vm_id: &str, vm_dir: &Path, flavor: &str) -> Result<String> {
+    let mut taken = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(vm_dir.parent().unwrap_or(vm_dir)) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(raw) = std::fs::read_to_string(meta_path) {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(name) = meta.get("name").and_then(|v| v.as_str()) {
+                        taken.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let name = crate::names::unique_name(vm_id, |n| taken.contains(n));
+    let created_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let meta = serde_json::json!({
+        "vm_id": vm_id,
+        "name": name,
+        "flavor": flavor,
+        "created_unix": created_unix,
+    });
+    std::fs::write(vm_dir.join("meta.json"), format!("{meta}\n"))
+        .with_context(|| format!("writing {}", vm_dir.join("meta.json").display()))?;
+    Ok(name)
+}
+
 /// Sparse-aware copy of `src` to `dst` (holes preserved) via `cp --sparse=always`.
 fn sparse_copy(src: &Path, dst: &Path) -> Result<()> {
     let status = std::process::Command::new("cp")
@@ -286,6 +321,7 @@ async fn run_boot(
     let vm_dir = paths::vms_dir()?.join(&vm_id);
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
+    let vanity = assign_vanity_name(&vm_id, &vm_dir, &rootfs_flavor)?;
 
     let console_log = vm_dir.join("console.log");
     let rootfs_copy = vm_dir.join("rootfs.ext4");
@@ -320,6 +356,7 @@ async fn run_boot(
     let (boot_ms, ticks) = driven?;
     Ok(DevBootReport {
         ok: true,
+        name: vanity,
         vm_id,
         boot_ms,
         ticks_observed: ticks,
@@ -509,8 +546,10 @@ pub struct RunOptions {
 pub struct RunReport {
     /// Always `true` on the success path (the CLI emits `{ok:false,…}` on error).
     pub ok: bool,
-    /// The generated VM id (`dev-<8 hex>`).
+    /// The generated VM id (`dev-<8 hex>`) — the stable primary key.
     pub vm_id: String,
+    /// Human-memorable vanity name (seeded deterministically from `vm_id`).
+    pub name: String,
     /// Process exit code (`null` if the command was killed by a signal).
     pub exit_code: Option<i32>,
     /// Terminating signal, if any.
@@ -614,6 +653,7 @@ async fn run_exec(
     let vm_dir = paths::vms_dir()?.join(&vm_id);
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
+    let vanity = assign_vanity_name(&vm_id, &vm_dir, &flavor_slug)?;
 
     let console_log = vm_dir.join("console.log");
     let stdout_log = vm_dir.join("exec-stdout.log");
@@ -655,6 +695,7 @@ async fn run_exec(
     let exec = driven?;
     Ok(RunReport {
         ok: true,
+        name: vanity,
         vm_id,
         exit_code: exec.exit_code,
         signal: exec.signal,
@@ -956,6 +997,7 @@ mod tests {
     fn run_report_serializes_expected_shape() {
         let report = RunReport {
             ok: true,
+            name: "radiant-gjallarhorn".into(),
             vm_id: "dev-abcd1234".into(),
             exit_code: Some(0),
             signal: None,

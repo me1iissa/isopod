@@ -313,8 +313,12 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   snapshot round trip through it), image pipeline (S3 prefix enumeration, unprivileged rootfs),
   vendored FC v1.16.1 built from source and booting via `isopod dev boot` (~134–161 ms), 66
   workspace tests green.]*
-- **M2 — Exec.** Guest-agent RPC over vsock; `isopod run -- echo hi` →
-  `{"exit_code":0,"stdout":"hi\n"}`; ephemeral lifecycle (boot→exec→destroy) + `isopod doctor`.
+- **M2 — Exec.** *[✅ COMPLETE 2026-07-21 — musl PID 1 agent (vsock exec server, PID1-correct
+  reaping, clock sync, RB_AUTOBOOT halt) + host AgentClient + `isopod run`: first real run 380 ms
+  total / 36 ms exec, exit codes + streamed/teed output + timeouts proven live. First dogfood run
+  answered an M3 gate: CI 6.18 guest kernel has overlay+squashfs+ext4 built in — custom kernel
+  build demoted to optional boot-time optimization. `isopod doctor` deferred to M4 (setup era,
+  when there's host state worth diagnosing).]*
 - **M3 — Stages.** Overlay chain assembly, `stage commit/list/info/rm`, fork-by-start, scratch
   pool; the round-trip + whiteout + xattr integration tests. Acceptance: commit a
   `pip install requests` stage, fork it, `python -c "import requests"` succeeds, parent unchanged.
