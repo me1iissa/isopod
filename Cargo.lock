@@ -678,12 +678,14 @@ dependencies = [
  "dirs",
  "hex",
  "isopod-fc",
+ "isopod-proto",
  "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -704,6 +706,13 @@ dependencies = [
 [[package]]
 name = "isopod-guest-agent"
 version = "0.1.0"
+dependencies = [
+ "isopod-fc",
+ "isopod-proto",
+ "libc",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "isopod-proto"

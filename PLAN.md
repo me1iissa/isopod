@@ -309,9 +309,10 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   host/kernel**; 🔴 TAP+MASQUERADE egress test under mirrored networking (outcome decides:
   flip `.wslconfig` to NAT vs proxy fallback); measure cold-boot and resume latency (nested EPT
   means expect worse than marketing numbers — get real baselines). Results → `docs/feasibility.md`.
-- **M1 — Boots from Rust.** Workspace scaffold; FC vendored at `v1.16.1` + built by our pipeline
-  (incl. snapshot-editor); `isopod-fc` client; `isopod image` (fetch-kernel, build-rootfs);
-  `isopod dev boot` → agent banner on serial. Proves fc-client + build + image pipeline.
+- **M1 — Boots from Rust.** *[✅ COMPLETE 2026-07-21 — isopod-fc typed client (live boot 39 ms +
+  snapshot round trip through it), image pipeline (S3 prefix enumeration, unprivileged rootfs),
+  vendored FC v1.16.1 built from source and booting via `isopod dev boot` (~134–161 ms), 66
+  workspace tests green.]*
 - **M2 — Exec.** Guest-agent RPC over vsock; `isopod run -- echo hi` →
   `{"exit_code":0,"stdout":"hi\n"}`; ephemeral lifecycle (boot→exec→destroy) + `isopod doctor`.
 - **M3 — Stages.** Overlay chain assembly, `stage commit/list/info/rm`, fork-by-start, scratch

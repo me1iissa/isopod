@@ -9,12 +9,15 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # VM lifecycle (M1 dev boot): the typed FC client + an async runtime to drive it.
 isopod-fc = { workspace = true }
 tokio = { workspace = true }
+# Host<->guest RPC contract (M2 agent): async frame helpers behind the tokio feature.
+isopod-proto = { workspace = true, features = ["tokio"] }
 # Blocking HTTP: the image pipeline is a synchronous one-shot CLI path, so we
 # opt the workspace reqwest into its `blocking` client (keeps the CLI runtime-free).
 reqwest = { workspace = true, features = ["blocking", "query"] }

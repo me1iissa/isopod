@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -86,6 +86,25 @@ pub(crate) async fn drain_serial(
         let _ = log.write_all(b"\n").await;
         // A send error just means the boot watcher already gave up.
         let _ = tx.send((Instant::now(), line));
+    }
+    let _ = log.flush().await;
+}
+
+/// Tee Firecracker's piped stdout (the relayed guest serial console) verbatim
+/// into `log` until the pipe reaches EOF (the VMM exited). Unlike
+/// [`drain_serial`], no marker channel is involved — the ephemeral run flow keys
+/// readiness off the vsock ping, so serial is retained purely for inspection.
+pub(crate) async fn drain_to_log(mut stdout: ChildStdout, mut log: tokio::fs::File) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if log.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
     let _ = log.flush().await;
 }

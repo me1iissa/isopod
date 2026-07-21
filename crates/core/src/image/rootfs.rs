@@ -30,14 +30,22 @@ const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34
 /// Preferred host-provided busybox (Ubuntu ships a static build).
 const SYSTEM_BUSYBOX: &str = "/bin/busybox";
 
-/// Which rootfs to build. `dev-busybox` is the M1 smoke image; `alpine` is
-/// reserved for M2 (the real agent rootfs).
+/// Which rootfs to build.
+///
+/// * `dev-busybox` is the M1 smoke image (busybox init, serial `TICK`).
+/// * `dev-agent` is the M2 image: the same busybox base, but `/sbin/init` is the
+///   real `isopod-guest-agent` musl binary serving the vsock RPC.
+/// * `alpine` is reserved for the full toolchain agent rootfs (not yet built).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootfsFlavor {
     /// Minimal static-busybox image whose init emits `TICK <uptime>` on serial —
     /// the boot liveness signal `isopod dev boot` and the fc-client live test key on.
     DevBusybox,
-    /// Alpine + toolchain agent rootfs (not yet implemented — M2).
+    /// Busybox base with the `isopod-guest-agent` musl binary as `/sbin/init`:
+    /// the M2 exec image. Boots the real PID 1 agent and serves exec/file RPC on
+    /// vsock while emitting the same `ISOPOD-*` / `TICK` markers as `dev-busybox`.
+    DevAgent,
+    /// Alpine + toolchain agent rootfs (not yet implemented).
     Alpine,
 }
 
@@ -46,6 +54,7 @@ impl RootfsFlavor {
     pub fn slug(self) -> &'static str {
         match self {
             RootfsFlavor::DevBusybox => "dev-busybox",
+            RootfsFlavor::DevAgent => "dev-agent",
             RootfsFlavor::Alpine => "alpine",
         }
     }
@@ -54,8 +63,11 @@ impl RootfsFlavor {
     pub fn from_slug(slug: &str) -> Result<Self> {
         match slug {
             "dev-busybox" => Ok(RootfsFlavor::DevBusybox),
+            "dev-agent" => Ok(RootfsFlavor::DevAgent),
             "alpine" => Ok(RootfsFlavor::Alpine),
-            other => bail!("unknown rootfs flavor '{other}' (known: dev-busybox, alpine)"),
+            other => {
+                bail!("unknown rootfs flavor '{other}' (known: dev-busybox, dev-agent, alpine)")
+            }
         }
     }
 }
@@ -101,7 +113,8 @@ pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutc
     assemble_common(root)?;
     match flavor {
         RootfsFlavor::DevBusybox => populate_dev_busybox(root)?,
-        RootfsFlavor::Alpine => bail!("alpine flavor is not implemented yet (M2)"),
+        RootfsFlavor::DevAgent => populate_dev_agent(root)?,
+        RootfsFlavor::Alpine => bail!("alpine flavor is not implemented yet"),
     }
 
     // mkfs into a temp image, then atomically rename into place.
@@ -185,6 +198,105 @@ fn write_dev_busybox_layout(root: &Path) -> Result<()> {
     symlink_force(Path::new("busybox"), &root.join("bin/sh"))?;
     symlink_force(Path::new("sbin/init"), &root.join("init"))?;
     Ok(())
+}
+
+/// Busybox applets the `dev-agent` image symlinks onto `/bin/busybox` so exec
+/// requests can PATH-resolve common commands (the agent's baseline `PATH`
+/// includes `/bin`). The shell (`sh`) and `sleep` are load-bearing for the M2
+/// exec tests; the rest are the everyday coreutils an agent workload expects.
+const DEV_AGENT_APPLETS: &[&str] = &[
+    "sh", "sleep", "echo", "cat", "ls", "env", "pwd", "true", "false", "printf", "head", "tail",
+    "grep", "sed", "mkdir", "rmdir", "rm", "cp", "mv", "ln", "chmod", "sync", "mount", "umount",
+    "uname", "id", "dd", "wc", "sort", "date",
+];
+
+/// Populate the `dev-agent` flavor: the busybox base of `dev-busybox`, but with
+/// the real `isopod-guest-agent` musl binary installed as `/sbin/init`. The agent
+/// is PID 1, so there is no busybox `init` / `inittab` — the agent does the
+/// mounts, boot markers, `TICK` loop, and vsock RPC itself.
+fn populate_dev_agent(root: &Path) -> Result<()> {
+    let agent = locate_guest_agent()?;
+    if !elf_is_static_x86_64(&agent)? {
+        bail!(
+            "guest-agent binary {} is not a static x86_64 ELF; rebuild with \
+             `cargo build --release --target x86_64-unknown-linux-musl -p isopod-guest-agent`",
+            agent.display()
+        );
+    }
+    write_dev_agent_layout(root, &agent)?;
+    provision_busybox(&root.join("bin/busybox"))?;
+    Ok(())
+}
+
+/// Write the `dev-agent` layout *except* the busybox binary (split out so it is
+/// unit-testable with a stand-in agent binary and no real busybox or network).
+fn write_dev_agent_layout(root: &Path, agent_bin: &Path) -> Result<()> {
+    for dir in ["bin", "sbin", "root"] {
+        std::fs::create_dir_all(root.join(dir)).with_context(|| format!("mkdir {dir}"))?;
+    }
+
+    // /sbin/init IS the guest agent (a real ELF PID 1, not a shebang script).
+    let init = root.join("sbin/init");
+    std::fs::copy(agent_bin, &init)
+        .with_context(|| format!("copying guest-agent {} -> sbin/init", agent_bin.display()))?;
+    set_exec(&init)?;
+
+    // /bin/sh and the applet set point at busybox; /init -> /sbin/init so the
+    // kernel finds PID 1 whether or not an explicit `init=` arg is passed.
+    symlink_force(Path::new("busybox"), &root.join("bin/sh"))?;
+    for applet in DEV_AGENT_APPLETS {
+        symlink_force(Path::new("busybox"), &root.join("bin").join(applet))?;
+    }
+    symlink_force(Path::new("sbin/init"), &root.join("init"))?;
+    Ok(())
+}
+
+/// Locate the `isopod-guest-agent` static musl binary that becomes `/sbin/init`.
+///
+/// Resolution order:
+/// 1. `ISOPOD_GUEST_AGENT_BIN` if set (explicit override).
+/// 2. `$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/isopod-guest-agent`.
+/// 3. `<workspace>/target/x86_64-unknown-linux-musl/release/isopod-guest-agent`.
+///
+/// Returns a clear "build it first" error if the binary is absent — the agent is
+/// a separate compile target (`musl`) that the caller must produce beforehand.
+fn locate_guest_agent() -> Result<PathBuf> {
+    const REL: &str = "x86_64-unknown-linux-musl/release/isopod-guest-agent";
+    const BUILD_HINT: &str =
+        "cargo build --release --target x86_64-unknown-linux-musl -p isopod-guest-agent";
+
+    if let Some(explicit) = std::env::var_os("ISOPOD_GUEST_AGENT_BIN") {
+        let p = PathBuf::from(explicit);
+        if !p.exists() {
+            bail!(
+                "ISOPOD_GUEST_AGENT_BIN points at {}, which does not exist; build it first: {BUILD_HINT}",
+                p.display()
+            );
+        }
+        return Ok(p);
+    }
+
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    let bin = target_dir.join(REL);
+    if !bin.exists() {
+        bail!(
+            "guest-agent musl binary not found at {}; build it first: {BUILD_HINT}",
+            bin.display()
+        );
+    }
+    Ok(bin)
+}
+
+/// Absolute path to the workspace root, derived from this crate's manifest dir
+/// (`crates/core` → `..` → `..`).
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Provide a static x86_64 busybox at `dest`: prefer the host's static build,
@@ -321,15 +433,68 @@ mod tests {
 
     #[test]
     fn flavor_slug_roundtrip() {
-        assert_eq!(
-            RootfsFlavor::from_slug("dev-busybox").unwrap(),
-            RootfsFlavor::DevBusybox
-        );
-        assert_eq!(
-            RootfsFlavor::from_slug("alpine").unwrap(),
-            RootfsFlavor::Alpine
-        );
+        for flavor in [
+            RootfsFlavor::DevBusybox,
+            RootfsFlavor::DevAgent,
+            RootfsFlavor::Alpine,
+        ] {
+            assert_eq!(RootfsFlavor::from_slug(flavor.slug()).unwrap(), flavor);
+        }
         assert!(RootfsFlavor::from_slug("nope").is_err());
+    }
+
+    #[test]
+    fn dev_agent_layout_installs_agent_as_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assemble_common(root).unwrap();
+
+        // Stand-in for the real musl agent — the layout copies whatever bytes it
+        // is handed; the ELF static-check lives in `populate_dev_agent`.
+        let fake_agent = dir.path().join("fake-agent");
+        std::fs::write(&fake_agent, b"\x7fELF fake agent bytes").unwrap();
+        write_dev_agent_layout(root, &fake_agent).unwrap();
+
+        // /sbin/init is a regular executable file (the copied agent), NOT a
+        // shebang script and NOT a symlink.
+        let init = root.join("sbin/init");
+        let meta = std::fs::symlink_metadata(&init).unwrap();
+        assert!(meta.file_type().is_file(), "sbin/init must be a real file");
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "sbin/init must be executable"
+        );
+        assert_eq!(
+            std::fs::read(&init).unwrap(),
+            b"\x7fELF fake agent bytes",
+            "sbin/init must be the agent binary bytes"
+        );
+
+        // No busybox init machinery for this flavor.
+        assert!(
+            !root.join("etc/inittab").exists(),
+            "dev-agent must not ship an inittab (agent is PID 1)"
+        );
+        assert!(!root.join("sbin/tick").exists());
+
+        // /init -> /sbin/init, /bin/sh -> busybox, and the applet set is present.
+        assert!(root
+            .join("init")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for applet in ["sh", "sleep", "echo"] {
+            let link = root.join("bin").join(applet);
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "/bin/{applet} must be a busybox symlink"
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("busybox"));
+        }
+
+        // Default exec cwd exists.
+        assert!(root.join("root").is_dir(), "/root must exist (default cwd)");
     }
 
     #[test]

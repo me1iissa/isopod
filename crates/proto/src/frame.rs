@@ -118,7 +118,10 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let msg = Request { id: 1, op: RequestOp::Ping };
+        let msg = Request {
+            id: 1,
+            op: RequestOp::Ping,
+        };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let got: Request = read_frame(&mut Cursor::new(&buf)).unwrap().unwrap();
@@ -127,10 +130,20 @@ mod tests {
 
     #[test]
     fn round_trip_survives_short_reads() {
-        let msg = Request { id: 2, op: RequestOp::Halt { sync: true } };
+        let msg = Request {
+            id: 2,
+            op: RequestOp::Halt { sync: true },
+        };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
-        write_frame(&mut buf, &Request { id: 3, op: RequestOp::Ping }).unwrap();
+        write_frame(
+            &mut buf,
+            &Request {
+                id: 3,
+                op: RequestOp::Ping,
+            },
+        )
+        .unwrap();
         let mut r = OneByte(Cursor::new(&buf));
         let a: Request = read_frame(&mut r).unwrap().unwrap();
         let b: Request = read_frame(&mut r).unwrap().unwrap();
