@@ -22,45 +22,30 @@ Rebuild after any change under `crates/core` or `crates/mcp`; the CLI and the
 MCP server are separate binaries built from a shared library, so a `cargo
 build --release` for one does not update the other.
 
-## Option 1: project-scope `.mcp.json` (dev loop)
+## Option 1: local-scope registration (recommended dev loop)
 
-The repo ships a `.mcp.json` at its root:
-
-```json
-{
-  "mcpServers": {
-    "isopod": {
-      "command": "${CLAUDE_PROJECT_DIR:-.}/target/release/isopod-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-`${CLAUDE_PROJECT_DIR:-.}` is the documented pattern for a project-scoped
-`.mcp.json` entry: Claude Code does not export that variable to itself for
-substitution purposes in this scope, so the `:-.` default (which resolves
-relative to the project root you launched Claude Code from) is required —
-without it the substitution has nothing to expand.
-
-Opening Claude Code with this repo as the working directory auto-discovers
-the file and prompts once for approval (`claude mcp list` / `claude mcp get
-isopod` show pending vs. connected). Equivalently, from scratch:
+Register the built server with an absolute path at **local** scope — it is
+auto-trusted (no approval prompt) and connects immediately:
 
 ```bash
-claude mcp add --scope project isopod -- target/release/isopod-mcp
+cargo build --release -p isopod-mcp
+claude mcp add --scope local isopod -- /absolute/path/to/isopod/target/release/isopod-mcp
+claude mcp list      # -> isopod ... ✔ Connected
 ```
 
-run from the repo root — this writes the same `.mcp.json` shape. If you
-invoke Claude Code from somewhere other than the repo root and the relative
-path doesn't resolve, register with an absolute path instead:
+Tools appear as `mcp__isopod__<tool>`, e.g. `mcp__isopod__sandbox_run`.
 
-```bash
-claude mcp add --scope project isopod -- /absolute/path/to/isopod/target/release/isopod-mcp
-```
+**MCP servers load at Claude Code session startup**, so after registering you
+must **restart Claude Code** (or reconnect) for the tools to appear in a
+running session — registering mid-session does not hot-load them.
 
-Tools registered this way appear as `mcp__isopod__<tool>`, e.g.
-`mcp__isopod__sandbox_run`.
+The repo deliberately does **not** commit a project-scope `.mcp.json`:
+committing one forces an approval prompt on every user and conflicts with a
+local registration of the same name. For distribution, use the bundled plugin
+(Option 2), which carries the server config in its manifest. If you do want a
+project-scope `.mcp.json` (VCS-shared, prompts once for approval), the shape
+is `{"mcpServers":{"isopod":{"command":"${CLAUDE_PROJECT_DIR:-.}/target/release/isopod-mcp","args":[]}}}`
+— but pick either that or the local registration, never both.
 
 ## Option 2: as a Claude Code plugin
 
