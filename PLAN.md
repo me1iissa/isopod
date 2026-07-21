@@ -220,13 +220,17 @@ layers; xattr survival.
 
 ## Networking
 
-- `sudo isopod setup` (one-time, the ONLY root step) provisions N **netns slots**: each netns
-  holds `tap0` with the identical guest-side config (guest always 10.107.7.2/30, gw .1), a veth
-  pair to the root ns with a per-slot transit subnet, nftables SNAT/MASQUERADE + FORWARD rules,
-  `net.ipv4.ip_forward=1` persisted. FC processes launch inside their slot's netns ⇒ every VM
-  sees byte-identical network state ⇒ any snapshot restores into any slot unmodified.
-- Slot pool is claimed/released via `~/.isopod/net/` state files; startup runs a leak-reclaim
-  sweep (E2B pattern) for slots orphaned by crashes.
+- **[REVISED at M4]** `sudo isopod setup` (one-time, the ONLY root step) provisions N
+  **user-owned taps in the root namespace** (`isopod-tap<i>`, per-slot /30: tap `10.107.<i>.1`,
+  guest `.2`), one nftables table (MASQUERADE out the default iface, FORWARD tap↔wan accepts,
+  tap↔tap drop for inter-VM isolation, INPUT drop of new guest→host connections), and persists
+  `net.ipv4.ip_forward=1`. Runtime opens the tap **unprivileged** (M0-proven) — netns slot
+  pools were dropped because entering a netns at runtime requires root, violating the
+  no-root-runtime property. The netns design's identical-guest-IP benefit (snapshot restores
+  into any slot) is recovered at M6 by the guest agent re-applying net config over vsock after
+  resume, exactly like the existing clock resync.
+- Slot pool is claimed/released via `~/.isopod/net/` lockfiles (stale-pid sweep on startup for
+  slots orphaned by crashes).
 - DNS: public resolvers baked into guest `/etc/resolv.conf`.
 - `--no-network`: no NIC attached at all. Control RPC is vsock, so exec works identically.
 - Guest→host: never routed; host services are not reachable from guests (no route, nftables drop).
