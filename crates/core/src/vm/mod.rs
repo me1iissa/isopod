@@ -647,10 +647,6 @@ pub const DEFAULT_RUN_FLAVOR: &str = "dev-agent";
 /// a fresh scratch straight on top of the squashfs base.
 const STAGE_BASE: &str = "base";
 
-/// The `rootfs_flavor` label reported when booting the overlay (`--stage`)
-/// topology; the on-disk root is the squashfs base rather than an ext4 flavor.
-const STAGE_ROOTFS_FLAVOR: &str = "base-sqfs";
-
 /// Options for [`run_ephemeral`].
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -899,7 +895,10 @@ async fn run_exec(
 
     let flavor_label = match &plan {
         BootPlan::Flavor { flavor_slug, .. } => flavor_slug.clone(),
-        BootPlan::Stage { .. } => STAGE_ROOTFS_FLAVOR.to_string(),
+        // Report the ACTUAL base the overlay booted (base-sqfs vs base-alpine),
+        // not a hardcoded constant — a stage run on the Alpine toolchain base
+        // must not mislabel itself as busybox (dogfood finding via MCP).
+        BootPlan::Stage { base_flavor, .. } => base_flavor.clone(),
     };
     let vanity = assign_vanity_name(&vm_id, &vm_dir, &flavor_label)?;
 
@@ -1519,7 +1518,7 @@ mod tests {
                 path: PathBuf::from("/x/firecracker"),
                 provenance: FcProvenance::VendoredBuild,
             },
-            rootfs_flavor: STAGE_ROOTFS_FLAVOR.into(),
+            rootfs_flavor: "base-alpine".into(),
             serial_log_path: PathBuf::from("/v/console.log"),
             stdout_log_path: PathBuf::from("/v/exec-stdout.log"),
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
@@ -1529,7 +1528,7 @@ mod tests {
             guest_ip: Some("10.107.3.2".into()),
         };
         let v = serde_json::to_value(&report).unwrap();
-        assert_eq!(v["rootfs_flavor"], serde_json::json!("base-sqfs"));
+        assert_eq!(v["rootfs_flavor"], serde_json::json!("base-alpine"));
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
         assert_eq!(v["slot"], serde_json::json!(3));
