@@ -45,11 +45,6 @@ pub const MAX_CHAIN_DEPTH: usize = 10;
 /// Default apparent size of a fresh scratch ext4, in MiB (1 GiB, sparse).
 pub const DEFAULT_SCRATCH_MIB: u64 = 1024;
 
-/// The base image every v1 stage records in [`StageMeta::base`]. Only one base
-/// exists today (the Alpine squashfs); the field exists so cache/compat keys can
-/// distinguish bases once more are introduced.
-const BASE_ID: &str = "base-sqfs";
-
 /// Basename of the read-only layer artifact inside a stage directory.
 const LAYER_FILE: &str = "layer.ext4";
 /// Basename of the stage metadata file inside a stage directory.
@@ -100,8 +95,13 @@ pub struct StageMeta {
 /// - the named `parent` does not exist,
 /// - the resulting chain would exceed [`MAX_CHAIN_DEPTH`],
 /// - or the file cannot be hashed / copied / written.
-pub fn commit(scratch_path: &Path, label: &str, parent: Option<&str>) -> Result<StageMeta> {
-    commit_in(&paths::stages_dir()?, scratch_path, label, parent)
+pub fn commit(
+    scratch_path: &Path,
+    label: &str,
+    parent: Option<&str>,
+    base: &str,
+) -> Result<StageMeta> {
+    commit_in(&paths::stages_dir()?, scratch_path, label, parent, base)
 }
 
 /// List every committed stage, sorted oldest-first (`created_unix`, then
@@ -185,6 +185,7 @@ fn commit_in(
     scratch_path: &Path,
     label: &str,
     parent: Option<&str>,
+    base: &str,
 ) -> Result<StageMeta> {
     if label.trim().is_empty() {
         bail!("stage label must not be empty");
@@ -201,11 +202,21 @@ fn commit_in(
         return Ok(existing);
     }
 
-    // Resolve the parent and build the root-first chain (self last).
+    // Resolve the parent and build the root-first chain (self last). A stacked
+    // stage MUST share its parent's base: the layers are overlay upperdirs built
+    // against that base's root, so mounting them over a different base would
+    // silently produce a broken merge (e.g. site-packages with no interpreter).
     let (parent_id, mut chain) = match parent {
         Some(pid) => {
             let pmeta = get_by_id_in(root, pid)?
                 .ok_or_else(|| anyhow!("parent stage {pid:?} not found in the stage store"))?;
+            if pmeta.base != base {
+                bail!(
+                    "base mismatch: stacking on stage {pid:?} (base {:?}) but this run used \
+                     base {base:?}; a chain must share one base",
+                    pmeta.base
+                );
+            }
             (Some(pmeta.stage_id), pmeta.chain)
         }
         None => (None, Vec::new()),
@@ -244,7 +255,7 @@ fn commit_in(
         label: label.to_string(),
         parent: parent_id,
         chain,
-        base: BASE_ID.to_string(),
+        base: base.to_string(),
         created_unix: now_unix(),
         bytes_apparent: fmeta.len(),
         bytes_allocated: fmeta.blocks() * 512,
@@ -452,7 +463,7 @@ mod tests {
 
         let content = b"isopod stage fixture content \x00\x01\x02";
         let scratch = fixture(home.path(), "scratch.img", content);
-        let meta = commit_in(&root, &scratch, "demo/first", None).unwrap();
+        let meta = commit_in(&root, &scratch, "demo/first", None, "base-sqfs").unwrap();
 
         // Content-addressed id is the first 16 hex of BLAKE3(content).
         let expect_id = format!(
@@ -481,7 +492,7 @@ mod tests {
         assert_eq!(reread, meta);
 
         // Idempotent: re-committing identical content returns the same stage.
-        let again = commit_in(&root, &scratch, "some/other-label", None).unwrap();
+        let again = commit_in(&root, &scratch, "some/other-label", None, "base-sqfs").unwrap();
         assert_eq!(again, meta, "re-commit of identical content is idempotent");
         assert_eq!(
             list_in(&root).unwrap().len(),
@@ -496,7 +507,7 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
         let scratch = fixture(home.path(), "s.img", b"x");
-        assert!(commit_in(&root, &scratch, "   ", None).is_err());
+        assert!(commit_in(&root, &scratch, "   ", None, "base-sqfs").is_err());
     }
 
     #[test]
@@ -510,6 +521,7 @@ mod tests {
             &fixture(home.path(), "a", b"alpha-bytes"),
             "alpha",
             None,
+            "base-sqfs",
         )
         .unwrap();
         let b = commit_in(
@@ -517,6 +529,7 @@ mod tests {
             &fixture(home.path(), "b", b"alpine-bytes"),
             "alpine",
             None,
+            "base-sqfs",
         )
         .unwrap();
         let c = commit_in(
@@ -524,6 +537,7 @@ mod tests {
             &fixture(home.path(), "c", b"beta-bytes"),
             "beta",
             None,
+            "base-sqfs",
         )
         .unwrap();
 
@@ -544,8 +558,22 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
-        let a = commit_in(&root, &fixture(home.path(), "a", b"aa"), "alpha", None).unwrap();
-        let b = commit_in(&root, &fixture(home.path(), "b", b"bb"), "alpine", None).unwrap();
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"aa"),
+            "alpha",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
+        let b = commit_in(
+            &root,
+            &fixture(home.path(), "b", b"bb"),
+            "alpine",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
 
         let err = resolve_in(&root, "alp").expect_err("ambiguous prefix must error");
         let msg = err.to_string();
@@ -564,12 +592,20 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
 
-        let a = commit_in(&root, &fixture(home.path(), "a", b"layerA"), "A", None).unwrap();
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"layerA"),
+            "A",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
         let b = commit_in(
             &root,
             &fixture(home.path(), "b", b"layerB"),
             "B",
             Some(&a.stage_id),
+            "base-sqfs",
         )
         .unwrap();
         let c = commit_in(
@@ -577,6 +613,7 @@ mod tests {
             &fixture(home.path(), "c", b"layerC"),
             "C",
             Some(&b.stage_id),
+            "base-sqfs",
         )
         .unwrap();
 
@@ -616,6 +653,7 @@ mod tests {
             &fixture(home.path(), "s", b"z"),
             "l",
             Some("st-doesnotexist0"),
+            "base-sqfs",
         )
         .expect_err("missing parent must error");
         assert!(err.to_string().contains("not found"), "{err}");
@@ -627,12 +665,20 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
 
-        let a = commit_in(&root, &fixture(home.path(), "a", b"pA"), "A", None).unwrap();
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"pA"),
+            "A",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
         let b = commit_in(
             &root,
             &fixture(home.path(), "b", b"pB"),
             "B",
             Some(&a.stage_id),
+            "base-sqfs",
         )
         .unwrap();
         // Delete parent A's directory out from under B (bypassing `remove`, which
@@ -681,12 +727,12 @@ mod tests {
                 &format!("f{i}"),
                 format!("layer-{i}").as_bytes(),
             );
-            let m = commit_in(&root, &f, &format!("l{i}"), parent.as_deref()).unwrap();
+            let m = commit_in(&root, &f, &format!("l{i}"), parent.as_deref(), "base-sqfs").unwrap();
             assert_eq!(m.chain.len(), i + 1);
             parent = Some(m.stage_id);
         }
         let over = fixture(home.path(), "over", b"one-too-many");
-        let err = commit_in(&root, &over, "over", parent.as_deref())
+        let err = commit_in(&root, &over, "over", parent.as_deref(), "base-sqfs")
             .expect_err("committing past the cap must error");
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
@@ -697,12 +743,20 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
 
-        let a = commit_in(&root, &fixture(home.path(), "a", b"rA"), "A", None).unwrap();
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"rA"),
+            "A",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
         let b = commit_in(
             &root,
             &fixture(home.path(), "b", b"rB"),
             "B",
             Some(&a.stage_id),
+            "base-sqfs",
         )
         .unwrap();
 
@@ -726,8 +780,22 @@ mod tests {
         // A foreign directory with no meta.json is ignored.
         std::fs::create_dir_all(root.join("not-a-stage")).unwrap();
 
-        commit_in(&root, &fixture(home.path(), "x", b"one"), "one", None).unwrap();
-        commit_in(&root, &fixture(home.path(), "y", b"two"), "two", None).unwrap();
+        commit_in(
+            &root,
+            &fixture(home.path(), "x", b"one"),
+            "one",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
+        commit_in(
+            &root,
+            &fixture(home.path(), "y", b"two"),
+            "two",
+            None,
+            "base-sqfs",
+        )
+        .unwrap();
         let listed = list_in(&root).unwrap();
         assert_eq!(listed.len(), 2, "foreign dir skipped");
         assert!(
@@ -771,7 +839,7 @@ mod tests {
             m.len()
         );
 
-        let meta = commit_in(&root, &scratch, "e2e/real-ext4", None).unwrap();
+        let meta = commit_in(&root, &scratch, "e2e/real-ext4", None, "base-sqfs").unwrap();
         assert_eq!(meta.stage_id, stage_id_for(&scratch).unwrap());
 
         let layer = root.join(&meta.stage_id).join("layer.ext4");

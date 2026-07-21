@@ -682,6 +682,10 @@ pub struct RunOptions {
     /// After a clean run, commit the scratch upperdir as a new stage with this
     /// label. Only honoured in the overlay topology (requires [`stage`](Self::stage)).
     pub commit_as: Option<String>,
+    /// Squashfs base image the overlay topology boots as `vda` (only used with
+    /// [`stage`](Self::stage)): [`RootfsFlavor::BaseSqfs`] (busybox, default) or
+    /// [`RootfsFlavor::BaseAlpine`] (python/node/git/gcc toolchain).
+    pub base: RootfsFlavor,
 }
 
 /// Result of a [`run_ephemeral`], serialized verbatim as `isopod run`'s JSON.
@@ -798,7 +802,7 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     // layers + fresh scratch); without it, boot the legacy dev-agent ext4
     // exactly as M2 did (zero regression).
     let plan = match &opts.stage {
-        Some(stage_ref) => resolve_stage_plan(stage_ref)?,
+        Some(stage_ref) => resolve_stage_plan(stage_ref, opts.base)?,
         None => {
             let (rootfs, flavor_slug) = resolve_rootfs(opts.flavor)?;
             BootPlan::Flavor {
@@ -830,6 +834,9 @@ enum BootPlan {
     Stage {
         /// Squashfs base image (`vda`, read-only root).
         base_sqfs: PathBuf,
+        /// Base flavor slug this run booted (recorded on any committed stage so
+        /// forks reuse the same base — a chain must share one base).
+        base_flavor: String,
         /// Committed layer artifacts, root-first (oldest-first) = the PUT order
         /// for `vdb..`.
         layer_paths: Vec<PathBuf>,
@@ -841,28 +848,29 @@ enum BootPlan {
 /// Resolve a `--stage <ref>` into a [`BootPlan::Stage`]: locate the squashfs
 /// base, and (unless `ref` is the reserved word `base`) resolve the stage and
 /// its full layer chain.
-fn resolve_stage_plan(stage_ref: &str) -> Result<BootPlan> {
-    let base_sqfs = base_sqfs_path()?;
+fn resolve_stage_plan(stage_ref: &str, base: RootfsFlavor) -> Result<BootPlan> {
+    // A fresh `--stage base` run uses the requested base flavor. Forking an
+    // existing stage instead uses the stage's RECORDED base — the layers were
+    // built against that base's root, so booting them on a different base would
+    // produce a broken merge; the recorded base is authoritative and `--base` is
+    // ignored for forks (removing a silent footgun).
     if stage_ref == STAGE_BASE {
         return Ok(BootPlan::Stage {
-            base_sqfs,
+            base_sqfs: image::base_image_path(base)?,
+            base_flavor: base.slug().to_string(),
             layer_paths: Vec::new(),
             parent: None,
         });
     }
     let meta = stage::resolve(stage_ref)?;
+    let recorded_base = RootfsFlavor::from_slug(&meta.base)?;
     let layer_paths = stage::chain_paths(&meta)?;
     Ok(BootPlan::Stage {
-        base_sqfs,
+        base_sqfs: image::base_image_path(recorded_base)?,
+        base_flavor: meta.base.clone(),
         layer_paths,
         parent: Some(meta.stage_id),
     })
-}
-
-/// Locate the squashfs base image the overlay topology boots as `vda`.
-fn base_sqfs_path() -> Result<PathBuf> {
-    // Canonical resolver (validates it is a squashfs base and that it is built).
-    image::base_image_path(RootfsFlavor::BaseSqfs)
 }
 
 /// Async driver: create the VM dir, materialize the guest disks, boot + exec,
@@ -1009,6 +1017,8 @@ enum DiskConfig {
     Stage {
         /// Squashfs base (`vda`, read-only root).
         base_sqfs: PathBuf,
+        /// Base flavor slug (recorded on any stage committed from this run).
+        base_flavor: String,
         /// Committed layers, root-first (the `vdb..` PUT order).
         layer_paths: Vec<PathBuf>,
         /// Fresh writable scratch (the overlay upperdir; removed unless `--keep`).
@@ -1028,6 +1038,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path) -> Result<DiskConfig> {
         }
         BootPlan::Stage {
             base_sqfs,
+            base_flavor,
             layer_paths,
             parent,
         } => {
@@ -1035,6 +1046,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path) -> Result<DiskConfig> {
             stage::make_scratch_ext4(&scratch, stage::DEFAULT_SCRATCH_MIB)?;
             Ok(DiskConfig::Stage {
                 base_sqfs: base_sqfs.clone(),
+                base_flavor: base_flavor.clone(),
                 layer_paths: layer_paths.clone(),
                 scratch,
                 parent: parent.clone(),
@@ -1071,7 +1083,10 @@ fn maybe_commit_stage(
     driven: &Result<ExecResult>,
 ) -> Result<Option<StageMeta>> {
     let DiskConfig::Stage {
-        scratch, parent, ..
+        scratch,
+        parent,
+        base_flavor,
+        ..
     } = disk
     else {
         // Guard against a nonsensical --commit-as on the non-overlay topology.
@@ -1092,7 +1107,21 @@ fn maybe_commit_stage(
         );
         return Ok(None);
     }
-    let meta = stage::commit(scratch, label, parent.as_deref())?;
+    // Commit only a *successful* run: `--commit-as` expresses intent to capture a
+    // known-good state, so committing after a failed command (e.g. a `pip install`
+    // that errored) would silently produce a stage missing what the user meant to
+    // bake in (dogfood finding). Non-zero exit → skip with a clear reason.
+    if exec.exit_code != Some(0) {
+        eprintln!(
+            "run: not committing stage {label:?}: the command exited {} \
+             (commit only captures a successful run; re-run so it exits 0 to commit)",
+            exec.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| format!("via signal {:?}", exec.signal))
+        );
+        return Ok(None);
+    }
+    let meta = stage::commit(scratch, label, parent.as_deref(), base_flavor)?;
     eprintln!(
         "run: committed stage {} ({}) labelled {:?}",
         meta.stage_id, meta.name, meta.label
@@ -1508,6 +1537,7 @@ mod tests {
         // Stage topology adds isopod.layers=<N>.
         let stage = DiskConfig::Stage {
             base_sqfs: PathBuf::from("/i/base.sqfs"),
+            base_flavor: "base-sqfs".into(),
             layer_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
             scratch: PathBuf::from("/v/scratch.ext4"),
             parent: None,

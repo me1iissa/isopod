@@ -656,6 +656,37 @@ fn write_alpine_runtime_config(root: &Path) -> Result<()> {
     let repos =
         format!("{ALPINE_CDN}/{ALPINE_BRANCH}/main\n{ALPINE_CDN}/{ALPINE_BRANCH}/community\n");
     std::fs::write(apk_dir.join("repositories"), repos).context("writing /etc/apk/repositories")?;
+    remove_pep668_markers(root)?;
+    Ok(())
+}
+
+/// Delete every `pythonX.Y/EXTERNALLY-MANAGED` marker so `pip install` works
+/// out of the box. PEP 668 marks a distro's Python as "externally managed" to
+/// stop users breaking the system interpreter — but an isopod guest is a
+/// disposable sandbox whose entire purpose is to install packages freely, so
+/// the marker is pure friction here (dogfood finding: bare `pip install` else
+/// fails with a PEP-668 error and an agent must know to pass
+/// `--break-system-packages`).
+fn remove_pep668_markers(root: &Path) -> Result<()> {
+    let libdir = root.join("usr/lib");
+    let Ok(entries) = std::fs::read_dir(&libdir) else {
+        return Ok(()); // no /usr/lib (non-python base): nothing to do
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("python3") {
+            let marker = entry.path().join("EXTERNALLY-MANAGED");
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::new(e).context(format!("removing {}", marker.display()))
+                    )
+                }
+            }
+        }
+    }
     Ok(())
 }
 

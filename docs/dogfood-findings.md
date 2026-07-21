@@ -48,7 +48,58 @@ distinct vanity names).
    base-sqfs). Guest-env facts for the record: 235 MB usable RAM of 256
    configured, ~53 MB free rootfs, 302 busybox applets, uid 0.
 
-6. **[note] DOC — `--timeout-s` budget includes boot.** `--timeout-s 3` gives
+## 2026-07-21 — M4 networking (live, post-`sudo isopod setup`)
+
+Egress works (ICMP + DNS through the NAT), concurrency lands on distinct slots
+(0/1), host isolation holds (guest can't reach the host tap — the `iifname`
+input-drop fix), `--no-network` attaches no NIC. Two findings:
+
+7. **[open] HIGH — a leaked firecracker holding a tap breaks its slot until
+   manually killed.** A VMM that outlived its run (here `dev-85eddd65` from an
+   earlier failed attempt) kept `isopod-tap0` open, so every later slot-0 run
+   died with `EBUSY` at `PUT /network-interfaces` — a confusing, persistent
+   failure with no self-recovery. The stale-lock sweep only reclaims locks whose
+   pid is *dead*; a live-but-orphaned VMM defeats it. → FIX: (a) claim should
+   verify the tap is actually openable (or that no firecracker holds it) and
+   either reclaim or skip to the next slot; (b) harden run teardown so a VMM is
+   never orphaned (audit every error path between spawn and shutdown; the
+   FcProcess Drop guard should cover it — find why this one escaped); (c)
+   `isopod vm gc` / a `--kill-stale` should reap orphaned VMMs. Worth fixing
+   before M5 (an MCP client hitting a wedged slot would be baffling).
+
+8. **[note] MINOR — HTTP-by-IP to 1.1.1.1:80 is an unreliable egress probe.**
+   `wget http://1.1.1.1` doesn't cleanly return 200 (Cloudflare redirects to
+   HTTPS), so it's a poor liveness check even though egress works. Use ICMP +
+   DNS (both confirmed) in the runbook; drop the plain-HTTP-by-IP check.
+
+## 2026-07-21 — M4 acceptance (pip/git through isopod, Alpine base)
+
+The marquee test passed: bare `pip install requests` into an Alpine stage →
+commit → fork BY VANITY NAME → `import requests` with no reinstall → parent
+byte-identical. Three fixes fell out of running it:
+
+10. **[fixed 3bea60c+] HIGH — bare `pip install` failed (PEP 668).** Alpine's
+    Python 3.14 ships an `EXTERNALLY-MANAGED` marker, so `pip install` errored
+    and an agent would have to know `--break-system-packages`. In a disposable
+    sandbox that protection is pure friction. → FIXED: the `base-alpine` build
+    removes every `pythonX.Y/EXTERNALLY-MANAGED` marker; bare `pip install` now
+    works.
+
+11. **[fixed] HIGH — `--commit-as` committed a stage even when the command
+    FAILED.** The first pip run errored (PEP 668) yet still committed a stage
+    (`lucent-crucible`) missing the package — a silent footgun for anyone who
+    later forks it. → FIXED: `--commit-as` now commits only on `exit_code == 0`,
+    logging a clear skip reason otherwise.
+
+12. **[fixed] HIGH — a stage didn't record which base it was built on.** Meta
+    hardcoded `base: base-sqfs` regardless; forking an Alpine-built stage
+    without remembering `--base base-alpine` would mount alpine layers over a
+    busybox base (site-packages but no interpreter) — a silent broken merge.
+    → FIXED: `stage::commit` records the true base flavor; a fork auto-uses the
+    recorded base (verified: forking with no `--base` runs Python 3.14), and
+    stacking enforces a single base per chain.
+
+9. **[note] DOC — `--timeout-s` budget includes boot.** `--timeout-s 3` gives
    the command ~2.6 s of real exec time (boot consumes ~0.4 s of the budget).
    Reasonable semantics for an outer wall clock, but must be documented in the
    CLI help and the eventual MCP tool description (whose default timeout should

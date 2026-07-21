@@ -104,6 +104,10 @@ struct RunArgs {
     /// (requires `--stage`).
     #[arg(long = "commit-as", value_name = "LABEL")]
     commit_as: Option<String>,
+    /// Squashfs base for the overlay topology (with `--stage`): `base-sqfs`
+    /// (busybox, default) or `base-alpine` (python/node/git/gcc toolchain).
+    #[arg(long, default_value = "base-sqfs")]
+    base: String,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
@@ -245,6 +249,13 @@ fn run_dev(cmd: DevCommand) -> i32 {
 fn run_run(args: RunArgs) -> i32 {
     let result = (|| -> anyhow::Result<vm::RunReport> {
         let flavor = RootfsFlavor::from_slug(&args.flavor)?;
+        let base = RootfsFlavor::from_slug(&args.base)?;
+        if !base.is_squashfs_base() {
+            anyhow::bail!(
+                "--base {} is not a squashfs base (use base-sqfs or base-alpine)",
+                args.base
+            );
+        }
         let env = vm::parse_env_kv(&args.env)?;
         vm::run_ephemeral(RunOptions {
             argv: args.argv,
@@ -256,6 +267,7 @@ fn run_run(args: RunArgs) -> i32 {
             network: !args.no_network,
             stage: args.stage,
             commit_as: args.commit_as,
+            base,
         })
     })();
     emit(result)
