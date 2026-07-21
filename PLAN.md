@@ -341,9 +341,21 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   end-to-end (finding #4). Dogfooded by driving the real server over stdio: all tools list,
   sandbox_run + stdin + python all exit 0, zero leaks. Registered in the repo `.mcp.json` for
   live Claude Code use.]*
-- **M6 — Warm pool.** Snapshot save/resume path under `sandbox_run`/`sandbox_start`, cache
-  invalidation keys, clock resync, resume-latency benchmark vs M0 baseline; `stage_info` shows
-  cache status.
+- **M5.5 — Flex resources.** Per-VM `vcpus` + `mem_mib` (replacing the hardcoded 1/256):
+  `RunOptions`/`sandbox_run`/CLI params, host-aware caps (≤ host nproc; mem leaves host headroom),
+  clear clamp errors, reported in `RunReport`. Default bumped to 1 vCPU / 512 MiB (256 OOMs on
+  bigger installs). Foundational for M6 — the warm-pool key includes the resource shape.
+- **M6 — Warm pool.** Full-snapshot save/resume so a fresh `sandbox_run` (no stage layers)
+  hot-resumes in ~ms instead of a ~400 ms cold boot. Snapshot a booted-idle, network-less VM per
+  **(fc build hash, host kernel, cpu model, base flavor, vcpus, mem_mib, snapshot format)** key;
+  resume into a fresh empty scratch at the snapshot's drive path + `vsock_override` + a new
+  network interface via `network_overrides`. **Post-resume the guest is reconfigured over vsock**
+  (new proto op `ConfigureNet` applying the slot's IP/gw/dns at runtime, + `SyncClock`) — this is
+  where the M4-revision's "identical net state" promise is paid off. Forking a committed stage
+  stays cold-boot in v1 (its disk differs per chain; per-stage snapshots are a later add).
+  Cache invalidation on any key change (WSL2 kernel auto-updates WILL fire it → silent cold-boot
+  fallback). `stage_info`/a `warmpool` status command shows cache state; resume-latency benchmark
+  vs the M0 baseline.
 
 **Backlog (v2+):** jailer hardening; UFFD lazy restore + snapshot compression; `stage flatten`;
 PTY exec; host→guest port forwarding; plugin marketplace packaging; systemd user service +
