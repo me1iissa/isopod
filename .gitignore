@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.ext4
+*.sqfs
+*.squashfs
+vmlinux*
+/images/out/
