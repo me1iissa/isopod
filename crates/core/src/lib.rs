@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod image;
 pub mod names;
+pub mod net;
 pub mod paths;
 pub mod stage;
 pub mod vm;

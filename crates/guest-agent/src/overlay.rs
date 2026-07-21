@@ -28,12 +28,13 @@
 
 use std::io;
 
+use crate::cmdline;
 use crate::server::log;
 use crate::sys::{self, MS_NOATIME, MS_RDONLY};
 
-/// Command-line token prefix whose presence switches the agent into overlay-root
-/// mode; the suffix is the committed stage-layer count (`>= 0`).
-const LAYERS_PREFIX: &str = "isopod.layers=";
+/// Command-line key whose presence switches the agent into overlay-root mode;
+/// the value is the committed stage-layer count (`>= 0`).
+const LAYERS_KEY: &str = "isopod.layers";
 
 /// Staging mountpoint for the merged overlay before `pivot_root` makes it `/`.
 const STAGING: &str = "/mnt";
@@ -79,9 +80,7 @@ pub fn assemble_if_requested() {
 /// absent (legacy writable-root boot). A present-but-unparseable value degrades
 /// to zero layers so a writable scratch is still layered over the read-only base.
 fn parse_layers(cmdline: &str) -> Option<usize> {
-    let value = cmdline
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix(LAYERS_PREFIX))?;
+    let value = cmdline::value(cmdline, LAYERS_KEY)?;
     Some(value.parse::<usize>().unwrap_or(0))
 }
 

@@ -19,8 +19,10 @@
 //! `unsafe` is unavoidable for the libc calls PID 1 must make; it is confined to
 //! [`sys`], which exposes safe wrappers to the rest of the crate.
 
+mod cmdline;
 mod conn;
 mod exec;
+mod net;
 mod overlay;
 mod reaper;
 mod server;
@@ -45,6 +47,12 @@ fn main() {
     // the overlay root over the squashfs base + committed layers + scratch and
     // pivots into it; without it, the ext4 root is used unchanged.
     overlay::assemble_if_requested();
+
+    // Apply static network config from the kernel command line (`isopod.net=…`).
+    // Done AFTER the overlay pivot so `/etc/resolv.conf` lands in the merged
+    // writable root, and BEFORE the vsock server starts. Best-effort: a missing
+    // or broken NIC is logged and does not stop exec (control RPC is vsock).
+    net::configure_if_requested();
 
     server::print_marker("ISOPOD-INIT-START");
     server::print_marker(&format!(

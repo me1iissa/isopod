@@ -358,3 +358,191 @@ pub fn umount_detach(target: &str) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
+
+// ===========================================================================
+// IPv4 interface configuration (classic SIOC* ioctls; no netlink, no shelling
+// out — the guest agent stays std + libc only).
+// ===========================================================================
+
+/// Linux `IFNAMSIZ`: interface names are at most 15 bytes plus a NUL terminator.
+const IFNAMSIZ: usize = 16;
+
+/// A `struct ifreq` sized to the kernel ABI: the 16-byte interface name followed
+/// by the 24-byte `ifr_ifru` union (whose largest member, `struct ifmap`, is 24
+/// bytes on 64-bit). The union is treated as an opaque buffer into which the wire
+/// image of the member the ioctl needs is written — a `sockaddr` for address ops
+/// or a `short` for flags.
+///
+/// The exact 40-byte size is load-bearing: the kernel copies `sizeof(struct
+/// ifreq)` bytes from our pointer, so a short struct would let it read past our
+/// allocation. A compile-time assertion below pins the size.
+#[repr(C)]
+struct Ifreq {
+    name: [u8; IFNAMSIZ],
+    ifru: [u8; 24],
+}
+
+const _: () = assert!(std::mem::size_of::<Ifreq>() == 40);
+
+impl Ifreq {
+    /// A zeroed `ifreq` with `ifr_name` set to `ifname`.
+    fn new(ifname: &str) -> io::Result<Self> {
+        let bytes = ifname.as_bytes();
+        if bytes.len() >= IFNAMSIZ {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("interface name {ifname:?} exceeds IFNAMSIZ-1"),
+            ));
+        }
+        let mut name = [0u8; IFNAMSIZ];
+        name[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            name,
+            ifru: [0u8; 24],
+        })
+    }
+}
+
+/// The 16-byte wire image of a `sockaddr_in` for IPv4 `addr`: `sin_family`
+/// (native-endian `AF_INET`), `sin_port` 0, `sin_addr` in network byte order
+/// (the natural `a.b.c.d` octet order), and zero padding.
+fn sockaddr_in_bytes(addr: [u8; 4]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+    // b[2..4] = sin_port (0); b[4..8] = sin_addr; b[8..16] = sin_zero (0).
+    b[4..8].copy_from_slice(&addr);
+    b
+}
+
+/// Build a `sockaddr` holding IPv4 `addr` (family `AF_INET`).
+fn sockaddr_v4(addr: [u8; 4]) -> libc::sockaddr {
+    // SAFETY: `libc::sockaddr` and the 16-byte `sockaddr_in` wire image are both
+    // 16 bytes of plain-old-data; reinterpreting the image as a `sockaddr` is a
+    // valid, size-checked transmute.
+    unsafe { std::mem::transmute::<[u8; 16], libc::sockaddr>(sockaddr_in_bytes(addr)) }
+}
+
+/// Create an `AF_INET` / `SOCK_DGRAM` socket to issue configuration ioctls on.
+fn inet_dgram_socket() -> io::Result<OwnedFd> {
+    // SAFETY: a `socket` call with a valid domain/type/protocol triple; returns a
+    // new fd or -1, checked below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor we now exclusively own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Issue an `ifreq`-shaped ioctl (`request`) on a fresh configuration socket.
+fn ioctl_ifreq(request: libc::Ioctl, req: &mut Ifreq) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let sock = inet_dgram_socket()?;
+    // SAFETY: `req` is a live, correctly sized (40-byte) `ifreq`; `request` is a
+    // valid `SIOC*` interface ioctl that reads/writes exactly that struct through
+    // the pointer; `sock` is a valid `AF_INET` datagram socket held for the call.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), request, req as *mut Ifreq) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Set interface `ifname`'s IPv4 address (`SIOCSIFADDR`).
+///
+/// Returns an `ENODEV` [`io::Error`] if the interface does not exist (e.g. no
+/// NIC was attached) — callers use that to degrade gracefully.
+pub fn set_if_addr(ifname: &str, addr: [u8; 4]) -> io::Result<()> {
+    let mut req = Ifreq::new(ifname)?;
+    req.ifru[0..16].copy_from_slice(&sockaddr_in_bytes(addr));
+    ioctl_ifreq(libc::SIOCSIFADDR as libc::Ioctl, &mut req)
+}
+
+/// Set interface `ifname`'s IPv4 netmask (`SIOCSIFNETMASK`).
+pub fn set_if_netmask(ifname: &str, mask: [u8; 4]) -> io::Result<()> {
+    let mut req = Ifreq::new(ifname)?;
+    req.ifru[0..16].copy_from_slice(&sockaddr_in_bytes(mask));
+    ioctl_ifreq(libc::SIOCSIFNETMASK as libc::Ioctl, &mut req)
+}
+
+/// Bring interface `ifname` up: read its flags (`SIOCGIFFLAGS`), OR in
+/// `IFF_UP | IFF_RUNNING`, and write them back (`SIOCSIFFLAGS`).
+pub fn set_if_up(ifname: &str) -> io::Result<()> {
+    let mut req = Ifreq::new(ifname)?;
+    ioctl_ifreq(libc::SIOCGIFFLAGS as libc::Ioctl, &mut req)?;
+    // `ifr_flags` is a `short` occupying the first two bytes of the union.
+    let mut flags = i16::from_ne_bytes([req.ifru[0], req.ifru[1]]);
+    flags |= (libc::IFF_UP | libc::IFF_RUNNING) as i16;
+    req.ifru[0..2].copy_from_slice(&flags.to_ne_bytes());
+    ioctl_ifreq(libc::SIOCSIFFLAGS as libc::Ioctl, &mut req)
+}
+
+/// Add the IPv4 default route via gateway `gw` (`SIOCADDRT` with an
+/// `RTF_UP | RTF_GATEWAY` rtentry; destination and genmask `0.0.0.0`).
+pub fn add_default_route(gw: [u8; 4]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `rtentry` is plain-old-data; an all-zero bit pattern is a valid
+    // empty route that we immediately fill in.
+    let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+    rt.rt_dst = sockaddr_v4([0, 0, 0, 0]);
+    rt.rt_genmask = sockaddr_v4([0, 0, 0, 0]);
+    rt.rt_gateway = sockaddr_v4(gw);
+    rt.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
+    let sock = inet_dgram_socket()?;
+    // SAFETY: `&mut rt` is a live, fully-initialized `rtentry`; `SIOCADDRT` reads
+    // exactly that struct through the pointer; `sock` is a valid `AF_INET` socket
+    // held for the duration of the call.
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            libc::SIOCADDRT as libc::Ioctl,
+            &mut rt as *mut libc::rtentry,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ifreq_is_exactly_kernel_sized() {
+        assert_eq!(std::mem::size_of::<Ifreq>(), 40);
+    }
+
+    #[test]
+    fn sockaddr_in_bytes_layout() {
+        let b = sockaddr_in_bytes([10, 107, 3, 2]);
+        // sin_family = AF_INET (2) in native-endian.
+        assert_eq!(&b[0..2], &(libc::AF_INET as u16).to_ne_bytes());
+        // sin_port = 0.
+        assert_eq!(&b[2..4], &[0, 0]);
+        // sin_addr = network-order a.b.c.d.
+        assert_eq!(&b[4..8], &[10, 107, 3, 2]);
+        // sin_zero = 0.
+        assert_eq!(&b[8..16], &[0u8; 8]);
+    }
+
+    #[test]
+    fn sockaddr_v4_roundtrips_family_and_addr() {
+        let sa = sockaddr_v4([192, 168, 1, 254]);
+        // Reinterpret back to raw bytes and check the fields.
+        let raw: [u8; 16] = unsafe { std::mem::transmute(sa) };
+        assert_eq!(&raw[0..2], &(libc::AF_INET as u16).to_ne_bytes());
+        assert_eq!(&raw[4..8], &[192, 168, 1, 254]);
+    }
+
+    #[test]
+    fn ifreq_new_copies_name_and_rejects_long() {
+        let r = Ifreq::new("eth0").unwrap();
+        assert_eq!(&r.name[0..4], b"eth0");
+        assert_eq!(r.name[4], 0, "name must be NUL-padded");
+        assert!(Ifreq::new("this-name-is-way-too-long").is_err());
+    }
+}

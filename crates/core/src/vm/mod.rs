@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
-use isopod_fc::models::{BootSource, Drive, MachineConfig, Vsock};
+use isopod_fc::models::{BootSource, Drive, MachineConfig, NetworkInterface, Vsock};
 use isopod_fc::{FcClient, FcProcess, FcProcessConfig, LogLevel, StdioMode, VmId};
 
 use crate::agent::{AgentClient, ExecSpec, StreamCapture};
 use crate::image::{self, RootfsFlavor};
+use crate::net;
 use crate::paths;
 use crate::stage::{self, StageMeta};
 
@@ -424,6 +425,26 @@ async fn configure_boot(client: &FcClient, kernel: &Path, rootfs: &Path) -> Resu
     Ok(())
 }
 
+/// Assemble the guest kernel command line for a run: the shared optimized
+/// [`BOOT_ARGS`], plus ` isopod.layers=<N>` for the overlay topology, plus the
+/// static net config (` isopod.net=… isopod.gw=… isopod.dns=…`) when a slot is
+/// claimed. Split out so the arg contract is unit-testable without a live VM.
+fn build_boot_args(disk: &DiskConfig, net: Option<&net::Slot>) -> String {
+    let mut args = String::from(BOOT_ARGS);
+    if let DiskConfig::Stage { layer_paths, .. } = disk {
+        args.push_str(&format!(" isopod.layers={}", layer_paths.len()));
+    }
+    if let Some(slot) = net {
+        args.push_str(&format!(
+            " isopod.net={} isopod.gw={} isopod.dns={}",
+            slot.guest_cidr(),
+            slot.host_ip(),
+            net::DEFAULT_DNS,
+        ));
+    }
+    args
+}
+
 /// Pre-boot configuration for `isopod run`, dispatching on the disk topology.
 ///
 /// `Flavor` reproduces the M2 single-ext4 root byte-for-byte. `Stage` puts the
@@ -432,17 +453,27 @@ async fn configure_boot(client: &FcClient, kernel: &Path, rootfs: &Path) -> Resu
 /// last; it also appends ` isopod.layers=<N>` to the boot args so the guest
 /// agent assembles the overlay. Drives appear in the guest as `/dev/vd{a,b,…}`
 /// in PUT order, so the ordering here is the contract with the guest agent.
-async fn configure_run_boot(client: &FcClient, kernel: &Path, disk: &DiskConfig) -> Result<()> {
+///
+/// When `net` is `Some`, the claimed slot's tap is attached as `eth0` pre-boot
+/// and its static config is baked into the boot args (the guest agent applies it
+/// via ioctls); when `None` (`--no-network`) no NIC is attached at all.
+async fn configure_run_boot(
+    client: &FcClient,
+    kernel: &Path,
+    disk: &DiskConfig,
+    net: Option<&net::Slot>,
+) -> Result<()> {
     client
         .put_machine_config(&MachineConfig::new(1, 256))
         .await
         .context("PUT /machine-config")?;
+    let args = build_boot_args(disk, net);
+    client
+        .put_boot_source(&BootSource::new(kernel.to_string_lossy(), args))
+        .await
+        .context("PUT /boot-source")?;
     match disk {
         DiskConfig::Flavor { rootfs_copy } => {
-            client
-                .put_boot_source(&BootSource::new(kernel.to_string_lossy(), BOOT_ARGS))
-                .await
-                .context("PUT /boot-source")?;
             client
                 .put_drive(&Drive::virtio(
                     "rootfs",
@@ -459,11 +490,6 @@ async fn configure_run_boot(client: &FcClient, kernel: &Path, disk: &DiskConfig)
             scratch,
             ..
         } => {
-            let args = format!("{BOOT_ARGS} isopod.layers={}", layer_paths.len());
-            client
-                .put_boot_source(&BootSource::new(kernel.to_string_lossy(), args))
-                .await
-                .context("PUT /boot-source")?;
             // vda: squashfs base — read-only root device.
             client
                 .put_drive(&Drive::virtio(
@@ -498,6 +524,21 @@ async fn configure_run_boot(client: &FcClient, kernel: &Path, disk: &DiskConfig)
                 .await
                 .context("PUT /drives/scratch")?;
         }
+    }
+    // eth0: the claimed slot's host tap, with the slot's deterministic MAC.
+    if let Some(slot) = net {
+        let iface = NetworkInterface {
+            iface_id: "eth0".to_string(),
+            host_dev_name: slot.tap_name(),
+            guest_mac: Some(slot.guest_mac()),
+            mtu: None,
+            rx_rate_limiter: None,
+            tx_rate_limiter: None,
+        };
+        client
+            .put_network_interface(&iface)
+            .await
+            .context("PUT /network-interfaces/eth0")?;
     }
     Ok(())
 }
@@ -627,8 +668,11 @@ pub struct RunOptions {
     pub flavor: RootfsFlavor,
     /// Keep the VM directory's throwaway disk copy instead of deleting it.
     pub keep: bool,
-    /// Reserved for M4; ignored for now (control RPC is vsock, so exec works
-    /// with or without a NIC).
+    /// Attach a NAT-egress NIC (default `true`). When set, a network slot is
+    /// claimed (requiring `sudo isopod setup` to have run), the slot's tap is
+    /// wired in pre-boot, and the guest is handed static net config on the
+    /// kernel command line. `false` (`--no-network`) attaches no NIC at all;
+    /// control RPC is vsock, so exec works identically either way.
     pub network: bool,
     /// Fork from a committed stage: its `stage_id`, vanity name, or unique label
     /// prefix. The reserved word `base` boots the overlay topology with zero
@@ -690,6 +734,13 @@ pub struct RunReport {
     /// [`stage_id`](Self::stage_id)).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_name: Option<String>,
+    /// The claimed network slot index (present only when networking is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<usize>,
+    /// The guest's IP for this run (`10.107.<slot>.2`; present only when
+    /// networking is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_ip: Option<String>,
 }
 
 /// Compute the in-guest exec timeout from the outer budget and elapsed time,
@@ -733,6 +784,11 @@ pub fn parse_env_kv(items: &[String]) -> Result<Vec<(String, String)>> {
 pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     if opts.argv.is_empty() {
         bail!("run_ephemeral requires a non-empty argv");
+    }
+    // Fail fast, before any artifact resolution or disk copy, if a networked run
+    // was asked for but the host has not been set up.
+    if opts.network {
+        require_network_setup()?;
     }
     let t_total = Instant::now();
     let fc = resolve_fc_bin()?;
@@ -805,15 +861,8 @@ fn resolve_stage_plan(stage_ref: &str) -> Result<BootPlan> {
 
 /// Locate the squashfs base image the overlay topology boots as `vda`.
 fn base_sqfs_path() -> Result<PathBuf> {
-    let p = paths::images_dir()?.join("base.sqfs");
-    if !p.exists() {
-        bail!(
-            "base squashfs image not found at {}; build it first: \
-             `isopod image build-rootfs --flavor base-sqfs`",
-            p.display()
-        );
-    }
-    Ok(p)
+    // Canonical resolver (validates it is a squashfs base and that it is built).
+    image::base_image_path(RootfsFlavor::BaseSqfs)
 }
 
 /// Async driver: create the VM dir, materialize the guest disks, boot + exec,
@@ -846,10 +895,24 @@ async fn run_exec(
     // committed layers are shared read-only and never copied).
     let disk = prepare_disk(&plan, &vm_dir)?;
 
+    // Claim a network slot (default-on). The slot's Drop releases the lock, so
+    // it must outlive the whole boot/exec/teardown — it stays live until this
+    // function returns. `--no-network` attaches no NIC.
+    let net_slot = if opts.network {
+        Some(claim_network()?)
+    } else {
+        None
+    };
+    let (slot_index, guest_ip) = match &net_slot {
+        Some(s) => (Some(s.index()), Some(s.guest_ip())),
+        None => (None, None),
+    };
+
     let driven = drive_exec(DriveExecCtx {
         fc: &fc,
         kernel: &kernel,
         disk: &disk,
+        net: net_slot.as_ref(),
         api_sock: &api_sock,
         vsock_uds: &vsock_uds,
         console_log: &console_log,
@@ -896,7 +959,43 @@ async fn run_exec(
         stderr_log_path: stderr_log,
         stage_id: committed.as_ref().map(|m| m.stage_id.clone()),
         stage_name: committed.as_ref().map(|m| m.name.clone()),
+        slot: slot_index,
+        guest_ip,
     })
+}
+
+/// Error out (naming the sudo command) if networking is requested but the
+/// one-time host setup has not run. Cheap and side-effect-free, so it is called
+/// early in [`run_ephemeral`] to fail fast before any disk is materialized.
+///
+/// # Errors
+/// If `sudo isopod setup` has not created the slot manifest.
+fn require_network_setup() -> Result<()> {
+    if net::setup_manifest_exists() {
+        return Ok(());
+    }
+    bail!(
+        "networking requires one-time host setup that has not run.\n\
+         Run it once (the only step that needs root):\n\
+         \n    sudo isopod setup\n\n\
+         or re-run this command with --no-network to boot without a NIC."
+    )
+}
+
+/// Claim a network slot for a networked run, requiring the one-time host setup.
+///
+/// Sweeps stale locks first (crash recovery), then claims the lowest free slot.
+///
+/// # Errors
+/// If `sudo isopod setup` has not run (names the command), or every slot is in
+/// use.
+fn claim_network() -> Result<net::Slot> {
+    require_network_setup()?;
+    // Best-effort: reclaim slots orphaned by crashed runs before claiming.
+    if let Err(e) = net::sweep_stale() {
+        eprintln!("run: warning: stale-slot sweep failed (continuing): {e:#}");
+    }
+    net::claim()
 }
 
 /// The resolved, materialized guest-disk layout for one run.
@@ -1006,6 +1105,8 @@ struct DriveExecCtx<'a> {
     fc: &'a FcBinary,
     kernel: &'a Path,
     disk: &'a DiskConfig,
+    /// Claimed network slot (`None` for `--no-network`).
+    net: Option<&'a net::Slot>,
     api_sock: &'a Path,
     vsock_uds: &'a Path,
     console_log: &'a Path,
@@ -1042,7 +1143,7 @@ async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
 
     // Pre-boot configuration, including the hybrid-vsock device.
     let client = proc.client().context("building the API client")?;
-    configure_run_boot(&client, ctx.kernel, ctx.disk).await?;
+    configure_run_boot(&client, ctx.kernel, ctx.disk, ctx.net).await?;
     client
         .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
         .await
@@ -1305,6 +1406,8 @@ mod tests {
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
             stage_id: None,
             stage_name: None,
+            slot: None,
+            guest_ip: None,
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
@@ -1325,6 +1428,12 @@ mod tests {
         assert!(
             v.get("stage_name").is_none(),
             "stage_name must be absent when None"
+        );
+        // Networking-off run: slot/guest_ip omitted entirely.
+        assert!(v.get("slot").is_none(), "slot must be absent when None");
+        assert!(
+            v.get("guest_ip").is_none(),
+            "guest_ip must be absent when None"
         );
         for key in [
             "ok",
@@ -1377,10 +1486,35 @@ mod tests {
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
             stage_id: Some("st-0123456789abcdef".into()),
             stage_name: Some("radiant-ghost".into()),
+            slot: Some(3),
+            guest_ip: Some("10.107.3.2".into()),
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["rootfs_flavor"], serde_json::json!("base-sqfs"));
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
+        assert_eq!(v["slot"], serde_json::json!(3));
+        assert_eq!(v["guest_ip"], serde_json::json!("10.107.3.2"));
+    }
+
+    #[test]
+    fn build_boot_args_appends_layers_and_net() {
+        // Flavor topology, no network: bare boot args.
+        let flavor = DiskConfig::Flavor {
+            rootfs_copy: PathBuf::from("/v/rootfs.ext4"),
+        };
+        assert_eq!(build_boot_args(&flavor, None), BOOT_ARGS);
+
+        // Stage topology adds isopod.layers=<N>.
+        let stage = DiskConfig::Stage {
+            base_sqfs: PathBuf::from("/i/base.sqfs"),
+            layer_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            scratch: PathBuf::from("/v/scratch.ext4"),
+            parent: None,
+        };
+        let args = build_boot_args(&stage, None);
+        assert!(args.starts_with(BOOT_ARGS));
+        assert!(args.contains(" isopod.layers=2"));
+        assert!(!args.contains("isopod.net="));
     }
 }

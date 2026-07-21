@@ -44,6 +44,21 @@ enum Command {
         #[command(subcommand)]
         command: VmCommand,
     },
+    /// Provision host networking (run once as root via sudo); `--remove` tears it down
+    Setup(SetupArgs),
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    /// Number of network slots (taps `isopod-tap0..N-1`) to provision.
+    #[arg(long, default_value_t = isopod_core::net::DEFAULT_SLOT_COUNT)]
+    slots: usize,
+    /// Tear down all isopod networking (taps, nftables table, sysctl file).
+    #[arg(long)]
+    remove: bool,
+    /// Override the auto-detected default-route egress interface to NAT out of.
+    #[arg(long)]
+    iface: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -69,6 +84,11 @@ struct RunArgs {
     /// Keep the VM directory's throwaway rootfs copy instead of deleting it.
     #[arg(long)]
     keep: bool,
+    /// Boot without any network interface (default: attach a NAT-egress NIC,
+    /// which requires `sudo isopod setup` to have run once). Exec works either
+    /// way — control RPC is vsock, not the network.
+    #[arg(long = "no-network")]
+    no_network: bool,
     /// Working directory inside the guest (default `/root`).
     #[arg(long)]
     cwd: Option<String>,
@@ -153,8 +173,21 @@ fn main() {
         Command::Run(args) => run_run(args),
         Command::Stage { command } => run_stage(command),
         Command::Vm { command } => run_vm(command),
+        Command::Setup(args) => run_setup(args),
     };
     std::process::exit(code);
+}
+
+/// `isopod setup [--slots N] [--iface NAME] [--remove]` — the one-time
+/// privileged host provisioning (run as root via sudo).
+fn run_setup(args: SetupArgs) -> i32 {
+    emit(isopod_core::net::setup::run(
+        isopod_core::net::setup::SetupOptions {
+            slots: args.slots,
+            remove: args.remove,
+            iface: args.iface,
+        },
+    ))
 }
 
 fn run_vm(cmd: VmCommand) -> i32 {
@@ -220,7 +253,7 @@ fn run_run(args: RunArgs) -> i32 {
             timeout_s: args.timeout_s,
             flavor,
             keep: args.keep,
-            network: true,
+            network: !args.no_network,
             stage: args.stage,
             commit_as: args.commit_as,
         })
