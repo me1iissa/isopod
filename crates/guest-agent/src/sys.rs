@@ -239,3 +239,122 @@ pub fn getpid() -> i32 {
     // SAFETY: `getpid` takes no arguments and cannot fail.
     unsafe { libc::getpid() }
 }
+
+/// Mount flag: mount (or bind) read-only (`MS_RDONLY`).
+pub const MS_RDONLY: u64 = libc::MS_RDONLY;
+/// Mount flag: never update inode access times (`MS_NOATIME`).
+pub const MS_NOATIME: u64 = libc::MS_NOATIME;
+
+/// Mount `fstype` at `target` from `source` with raw `flags` and an optional
+/// filesystem-specific `data` string (e.g. the overlayfs `lowerdir=…` options).
+///
+/// Unlike [`mount`], every non-zero return — including `EBUSY` — is surfaced as
+/// an error: the stacked stage mounts (scratch ext4, layer ext4, merged overlay)
+/// have no "already mounted, ignore it" fast path.
+pub fn mount_with_data(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: u64,
+    data: Option<&str>,
+) -> io::Result<()> {
+    let source = cstr(source)?;
+    let target = cstr(target)?;
+    let fstype = cstr(fstype)?;
+    let data_c = match data {
+        Some(d) => Some(cstr(d)?),
+        None => None,
+    };
+    let data_ptr = data_c
+        .as_ref()
+        .map_or(std::ptr::null(), |c| c.as_ptr().cast());
+    // SAFETY: `source`/`target`/`fstype` are NUL-terminated C strings that
+    // outlive the call; `data_ptr` is either NULL or a NUL-terminated string
+    // owned by `data_c` (also alive for the call); `flags` is a valid MS_* mask.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags as libc::c_ulong,
+            data_ptr,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Make the whole mount tree rooted at `/` private and recursive
+/// (`mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`), so `pivot_root` is not
+/// rejected by shared mount propagation. A minimal (no-systemd) guest usually
+/// boots with private mounts already; this is belt-and-braces.
+pub fn make_root_private() -> io::Result<()> {
+    let root = cstr("/")?;
+    // SAFETY: changing propagation needs only a valid `target` path; `source`,
+    // `fstype` and `data` are ignored for `MS_PRIVATE` and passed as NULL.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Change the process working directory (`chdir(2)`).
+pub fn chdir(path: &str) -> io::Result<()> {
+    let path = cstr(path)?;
+    // SAFETY: `path` is a NUL-terminated C string valid for the call.
+    let rc = unsafe { libc::chdir(path.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `pivot_root(2)`: make `new_root` the process root, mounting the old root at
+/// `put_old`. There is no libc function wrapper, so the raw syscall is used.
+///
+/// The agent drives this with the `pivot_root(".", ".")` idiom (documented in
+/// `pivot_root(2)` NOTES): with the merged overlay as the working directory, the
+/// old root is stacked over the new root at `/`, and a subsequent
+/// [`umount_detach`] of `.` removes it — leaving no `put_old` directory behind
+/// in the overlay upper.
+pub fn pivot_root(new_root: &str, put_old: &str) -> io::Result<()> {
+    let new_root = cstr(new_root)?;
+    let put_old = cstr(put_old)?;
+    // SAFETY: both arguments are NUL-terminated C strings valid for the call;
+    // `SYS_pivot_root` consumes exactly these two path pointers and returns 0 or
+    // -1 with `errno` set.
+    let rc = unsafe { libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), put_old.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Lazily detach the mount at `target` (`umount2(target, MNT_DETACH)`): the
+/// mount leaves the namespace immediately but its superblock stays alive while
+/// still referenced (here, by the overlay that pins the old root's layers).
+pub fn umount_detach(target: &str) -> io::Result<()> {
+    let target = cstr(target)?;
+    // SAFETY: `target` is a NUL-terminated C string valid for the call.
+    let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}

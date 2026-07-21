@@ -26,17 +26,39 @@ const BASE_ENV: &[(&str, &str)] = &[
 const DEFAULT_CWD: &str = "/root";
 
 /// Handle an `Exec` request end-to-end: stream `ExecStream` frames, then exactly
-/// one terminal frame (`ExecDone` on success, `Error` if the command could not
-/// be spawned at all).
+/// one terminal `ExecDone` frame.
+///
+/// A spawn failure (command not found, not executable, bad cwd) is a *command*
+/// outcome, not an infrastructure fault: it reports shell convention
+/// `exit_code: 127` with the reason on stderr, so callers can distinguish "your
+/// command is wrong" from "the sandbox broke" (dogfood finding #3). `Error`
+/// frames are reserved for malformed requests (e.g. empty argv).
 pub fn handle_exec(conn: &Conn, id: u64, req: ExecRequest, reaper: &Reaper) {
     if let Err(e) = run_exec(conn, id, &req, reaper) {
-        // Spawn failure (e.g. command not found): a single Error frame is the
-        // terminal response for this request id. Any later I/O failure is a dead
-        // connection and nothing more can be sent.
+        if req.argv.is_empty() {
+            let _ = conn.send(&Response {
+                id,
+                body: ResponseBody::Error {
+                    message: format!("exec: {e}"),
+                },
+            });
+            return;
+        }
+        let reason = format!("isopod-exec: {}: {e}\n", req.argv[0]);
         let _ = conn.send(&Response {
             id,
-            body: ResponseBody::Error {
-                message: format!("exec: {e}"),
+            body: ResponseBody::ExecStream {
+                stream: ExecStreamKind::Stderr,
+                data_b64: isopod_proto::b64_encode(reason.as_bytes()),
+            },
+        });
+        let _ = conn.send(&Response {
+            id,
+            body: ResponseBody::ExecDone {
+                exit_code: Some(127),
+                signal: None,
+                duration_ms: 0,
+                timed_out: false,
             },
         });
     }

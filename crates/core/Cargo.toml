@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Stage store (M3): content-addressed layer ids via streamed BLAKE3 hashing.
+blake3 = { workspace = true }
 # VM lifecycle (M1 dev boot): the typed FC client + an async runtime to drive it.
 isopod-fc = { workspace = true }
 tokio = { workspace = true }

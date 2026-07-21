@@ -11,4 +11,4 @@ mod rootfs;
 mod s3;
 
 pub use kernel::{fetch_kernel, FetchKernelOutcome};
-pub use rootfs::{build_rootfs, BuildRootfsOutcome, RootfsFlavor};
+pub use rootfs::{build_rootfs, make_scratch_ext4, BuildRootfsOutcome, RootfsFlavor};

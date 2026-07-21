@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use isopod_core::image::{self, RootfsFlavor};
+use isopod_core::stage;
 use isopod_core::vm::{self, DevBootOptions, RunOptions, DEFAULT_RUN_FLAVOR};
 use serde::Serialize;
 
@@ -33,6 +34,28 @@ enum Command {
     },
     /// Boot an ephemeral VM, run a command over vsock, and destroy it
     Run(RunArgs),
+    /// Manage the persistent stage store (list, info, rm)
+    Stage {
+        #[command(subcommand)]
+        command: StageCommand,
+    },
+    /// Browse and prune recorded VM directories (ls, gc)
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommand {
+    /// List recorded VMs newest-first (id, vanity name, flavor, created, bytes)
+    Ls,
+    /// Remove old VM directories (keeps the newest N and anything under a minute old)
+    Gc {
+        /// How many of the newest VM records to keep.
+        #[arg(long = "keep-last", default_value_t = 20)]
+        keep_last: usize,
+    },
 }
 
 #[derive(Args)]
@@ -52,9 +75,34 @@ struct RunArgs {
     /// Environment variable to set (repeatable): `--env KEY=VALUE`.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
+    /// Fork from a committed stage: its id, vanity name, or unique label prefix.
+    /// The reserved word `base` starts fresh from the squashfs base with zero
+    /// layers. Omit to keep the legacy dev-agent ext4 topology.
+    #[arg(long)]
+    stage: Option<String>,
+    /// After a clean run, commit the scratch as a new stage with this label
+    /// (requires `--stage`).
+    #[arg(long = "commit-as", value_name = "LABEL")]
+    commit_as: Option<String>,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum StageCommand {
+    /// List committed stages (oldest-first)
+    List,
+    /// Show a stage's full metadata and layer chain
+    Info {
+        /// Stage id, vanity name, or unique label prefix.
+        reference: String,
+    },
+    /// Remove a stage (refused if another stage's chain references it)
+    Rm {
+        /// Stage id, vanity name, or unique label prefix.
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -103,8 +151,22 @@ fn main() {
         Command::Image { command } => run_image(command),
         Command::Dev { command } => run_dev(command),
         Command::Run(args) => run_run(args),
+        Command::Stage { command } => run_stage(command),
+        Command::Vm { command } => run_vm(command),
     };
     std::process::exit(code);
+}
+
+fn run_vm(cmd: VmCommand) -> i32 {
+    match cmd {
+        VmCommand::Ls => emit(
+            isopod_core::vm::vm_list().map(|vms| serde_json::json!({ "ok": true, "vms": vms })),
+        ),
+        VmCommand::Gc { keep_last } => emit(isopod_core::vm::vm_gc(
+            keep_last,
+            std::time::Duration::from_secs(60),
+        )),
+    }
 }
 
 fn run_image(cmd: ImageCommand) -> i32 {
@@ -159,9 +221,31 @@ fn run_run(args: RunArgs) -> i32 {
             flavor,
             keep: args.keep,
             network: true,
+            stage: args.stage,
+            commit_as: args.commit_as,
         })
     })();
     emit(result)
+}
+
+/// `isopod stage {list,info,rm}` — stage-store management. Each subcommand emits
+/// exactly one JSON object.
+fn run_stage(cmd: StageCommand) -> i32 {
+    match cmd {
+        StageCommand::List => {
+            emit(stage::list().map(|stages| serde_json::json!({ "ok": true, "stages": stages })))
+        }
+        StageCommand::Info { reference } => emit((|| -> anyhow::Result<serde_json::Value> {
+            let meta = stage::resolve(&reference)?;
+            let layer_paths = stage::chain_paths(&meta)?;
+            Ok(serde_json::json!({ "ok": true, "stage": meta, "layer_paths": layer_paths }))
+        })()),
+        StageCommand::Rm { reference } => {
+            emit(stage::remove(&reference).map(
+                |m| serde_json::json!({ "ok": true, "removed": m.stage_id, "label": m.label }),
+            ))
+        }
+    }
 }
 
 /// Serialize `value` as the single stdout JSON line, falling back to a

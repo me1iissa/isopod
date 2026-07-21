@@ -19,5 +19,8 @@ libc = "0.2"
 # `cargo build`), so the static musl artifact stays proto + libc only.
 isopod-fc = { path = "../fc-client" }
 isopod-proto = { path = "../proto", features = ["tokio"] }
+# The stage-overlay live test builds its scratch drives with the same helper the
+# host track uses (`isopod_core::image::make_scratch_ext4`).
+isopod-core = { path = "../core" }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"

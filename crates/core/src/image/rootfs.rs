@@ -35,6 +35,9 @@ const SYSTEM_BUSYBOX: &str = "/bin/busybox";
 /// * `dev-busybox` is the M1 smoke image (busybox init, serial `TICK`).
 /// * `dev-agent` is the M2 image: the same busybox base, but `/sbin/init` is the
 ///   real `isopod-guest-agent` musl binary serving the vsock RPC.
+/// * `base-sqfs` is the M3 stage base: the `dev-agent` population plus the empty
+///   overlay mountpoints, packed **read-only with `mksquashfs`** into `base.sqfs`
+///   (not `mkfs.ext4`) — the bottom layer of every stage overlay chain.
 /// * `alpine` is reserved for the full toolchain agent rootfs (not yet built).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootfsFlavor {
@@ -45,6 +48,11 @@ pub enum RootfsFlavor {
     /// the M2 exec image. Boots the real PID 1 agent and serves exec/file RPC on
     /// vsock while emitting the same `ISOPOD-*` / `TICK` markers as `dev-busybox`.
     DevAgent,
+    /// M3 stage base: the `dev-agent` population plus empty overlay mountpoints
+    /// (`/rom`, `/overlay`, `/layers/0..9`, `/mnt`), packed read-only with
+    /// `mksquashfs` into `base.sqfs`. The agent overlays committed stage layers
+    /// and a writable scratch on top of it and pivots in.
+    BaseSqfs,
     /// Alpine + toolchain agent rootfs (not yet implemented).
     Alpine,
 }
@@ -55,6 +63,7 @@ impl RootfsFlavor {
         match self {
             RootfsFlavor::DevBusybox => "dev-busybox",
             RootfsFlavor::DevAgent => "dev-agent",
+            RootfsFlavor::BaseSqfs => "base-sqfs",
             RootfsFlavor::Alpine => "alpine",
         }
     }
@@ -64,9 +73,13 @@ impl RootfsFlavor {
         match slug {
             "dev-busybox" => Ok(RootfsFlavor::DevBusybox),
             "dev-agent" => Ok(RootfsFlavor::DevAgent),
+            "base-sqfs" => Ok(RootfsFlavor::BaseSqfs),
             "alpine" => Ok(RootfsFlavor::Alpine),
             other => {
-                bail!("unknown rootfs flavor '{other}' (known: dev-busybox, dev-agent, alpine)")
+                bail!(
+                    "unknown rootfs flavor '{other}' \
+                     (known: dev-busybox, dev-agent, base-sqfs, alpine)"
+                )
             }
         }
     }
@@ -77,7 +90,7 @@ impl RootfsFlavor {
 pub struct BuildRootfsOutcome {
     /// Always `true` on the success path.
     pub ok: bool,
-    /// Absolute path to the ext4 image.
+    /// Absolute path to the image (ext4, or `base.sqfs` for `base-sqfs`).
     pub rootfs_path: PathBuf,
     /// Flavor slug that was built.
     pub flavor: String,
@@ -97,7 +110,7 @@ pub struct BuildRootfsOutcome {
 /// unless `force` is set.
 pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutcome> {
     let images = paths::images_dir()?;
-    let dest = images.join(format!("rootfs-{}.ext4", flavor.slug()));
+    let dest = image_dest(&images, flavor);
 
     if dest.exists() && !force {
         eprintln!(
@@ -114,18 +127,35 @@ pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutc
     match flavor {
         RootfsFlavor::DevBusybox => populate_dev_busybox(root)?,
         RootfsFlavor::DevAgent => populate_dev_agent(root)?,
+        RootfsFlavor::BaseSqfs => populate_base_sqfs(root)?,
         RootfsFlavor::Alpine => bail!("alpine flavor is not implemented yet"),
     }
 
-    // mkfs into a temp image, then atomically rename into place.
+    // Pack into a temp image, then atomically rename into place. `base-sqfs` is a
+    // read-only squashfs; every other flavor is a sparse ext4.
     let tmp_img = tempfile::NamedTempFile::new_in(&images).context("creating temp image")?;
-    run_mkfs(root, tmp_img.path(), ROOTFS_SIZE)?;
-    tmp_img.as_file().sync_all().context("fsync rootfs image")?;
+    match flavor {
+        RootfsFlavor::BaseSqfs => run_mksquashfs(root, tmp_img.path())?,
+        _ => run_mkfs(Some(root), tmp_img.path(), ROOTFS_SIZE)?,
+    }
+    // fsync via a fresh handle: a packer may have re-created the inode.
+    std::fs::File::open(tmp_img.path())
+        .and_then(|f| f.sync_all())
+        .context("fsync image")?;
     let (_, tmp_path) = tmp_img.keep().context("finalizing temp image")?;
     std::fs::rename(&tmp_path, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp_path.display(), dest.display()))?;
 
     outcome_for(&dest, flavor, false)
+}
+
+/// Destination image path for `flavor` under `images`: `base.sqfs` for the
+/// squashfs stage base, `rootfs-<slug>.ext4` for the ext4 flavors.
+fn image_dest(images: &Path, flavor: RootfsFlavor) -> PathBuf {
+    match flavor {
+        RootfsFlavor::BaseSqfs => images.join("base.sqfs"),
+        other => images.join(format!("rootfs-{}.ext4", other.slug())),
+    }
 }
 
 /// Build the JSON outcome for an existing image file.
@@ -143,10 +173,19 @@ fn outcome_for(dest: &Path, flavor: RootfsFlavor, cached: bool) -> Result<BuildR
 }
 
 /// Pseudo-filesystem mountpoints every flavor needs. `/dev` is auto-mounted by
-/// the kernel (devtmpfs) but the directory must exist first.
+/// the kernel (devtmpfs) but the directory must exist first. `/tmp` and
+/// `/var/tmp` get the sticky 1777 mode real tools expect (dogfood finding:
+/// scripts assume a writable /tmp exists).
 fn assemble_common(root: &Path) -> Result<()> {
-    for dir in ["proc", "sys", "dev", "tmp", "etc"] {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in ["proc", "sys", "dev", "etc", "var"] {
         std::fs::create_dir_all(root.join(dir)).with_context(|| format!("mkdir {dir}"))?;
+    }
+    for tmp in ["tmp", "var/tmp"] {
+        let p = root.join(tmp);
+        std::fs::create_dir_all(&p).with_context(|| format!("mkdir {tmp}"))?;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o1777))
+            .with_context(|| format!("chmod 1777 {tmp}"))?;
     }
     Ok(())
 }
@@ -207,7 +246,7 @@ fn write_dev_busybox_layout(root: &Path) -> Result<()> {
 const DEV_AGENT_APPLETS: &[&str] = &[
     "sh", "sleep", "echo", "cat", "ls", "env", "pwd", "true", "false", "printf", "head", "tail",
     "grep", "sed", "mkdir", "rmdir", "rm", "cp", "mv", "ln", "chmod", "sync", "mount", "umount",
-    "uname", "id", "dd", "wc", "sort", "date",
+    "uname", "id", "dd", "wc", "sort", "date", "touch", "stat",
 ];
 
 /// Populate the `dev-agent` flavor: the busybox base of `dev-busybox`, but with
@@ -215,6 +254,48 @@ const DEV_AGENT_APPLETS: &[&str] = &[
 /// is PID 1, so there is no busybox `init` / `inittab` — the agent does the
 /// mounts, boot markers, `TICK` loop, and vsock RPC itself.
 fn populate_dev_agent(root: &Path) -> Result<()> {
+    let agent = locate_checked_agent()?;
+    write_dev_agent_layout(root, &agent)?;
+    provision_busybox(&root.join("bin/busybox"))?;
+    Ok(())
+}
+
+/// Empty overlay mountpoint directories the `base-sqfs` image ships (relative to
+/// the rootfs). `/rom` is reserved; `/overlay` is the scratch (writable upper)
+/// mountpoint; `/mnt` is the pivot staging point. `/layers/0..9` are the stage
+/// layer mountpoints (see [`BASE_LAYER_SLOTS`]).
+const BASE_OVERLAY_DIRS: &[&str] = &["rom", "overlay", "mnt"];
+/// Number of preallocated `/layers/<i>` stage mountpoints (`/layers/0..9`).
+const BASE_LAYER_SLOTS: usize = 10;
+
+/// Populate the `base-sqfs` flavor: the `dev-agent` population (agent as
+/// `/sbin/init`, busybox applets, `/bin/sh`, `/root`) plus the empty overlay
+/// mountpoints the stage topology pivots through. Packed read-only with
+/// `mksquashfs` rather than `mkfs.ext4`.
+fn populate_base_sqfs(root: &Path) -> Result<()> {
+    let agent = locate_checked_agent()?;
+    write_dev_agent_layout(root, &agent)?;
+    provision_busybox(&root.join("bin/busybox"))?;
+    write_base_overlay_dirs(root)?;
+    Ok(())
+}
+
+/// Create the empty overlay mountpoints (`/rom`, `/overlay`, `/mnt`,
+/// `/layers/0..9`) — split out so it is unit-testable without a busybox or agent.
+fn write_base_overlay_dirs(root: &Path) -> Result<()> {
+    for dir in BASE_OVERLAY_DIRS {
+        std::fs::create_dir_all(root.join(dir)).with_context(|| format!("mkdir /{dir}"))?;
+    }
+    for i in 0..BASE_LAYER_SLOTS {
+        let dir = root.join(format!("layers/{i}"));
+        std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Locate the guest-agent musl binary and verify it is a static x86_64 ELF (a
+/// dynamic binary would fail to run as PID 1 in the minimal guest).
+fn locate_checked_agent() -> Result<PathBuf> {
     let agent = locate_guest_agent()?;
     if !elf_is_static_x86_64(&agent)? {
         bail!(
@@ -223,9 +304,7 @@ fn populate_dev_agent(root: &Path) -> Result<()> {
             agent.display()
         );
     }
-    write_dev_agent_layout(root, &agent)?;
-    provision_busybox(&root.join("bin/busybox"))?;
-    Ok(())
+    Ok(agent)
 }
 
 /// Write the `dev-agent` layout *except* the busybox binary (split out so it is
@@ -341,16 +420,20 @@ fn provision_busybox(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run `mkfs.ext4 -d <root> <img> <size>` unprivileged. Journal is disabled and
-/// itable/journal init is eager, matching the M0 recipe for deterministic images.
-/// Note: mkfs.ext4 requires options to precede the `device [size]` operands.
-fn run_mkfs(root: &Path, img: &Path, size: &str) -> Result<()> {
-    let out = Command::new("mkfs.ext4")
-        .arg("-q")
+/// Run `mkfs.ext4` unprivileged onto `img` sized `size`. With `dir = Some(d)` the
+/// filesystem is prepopulated from `d` (`-d`); with `None` an empty filesystem is
+/// laid down (the scratch/pool path). Journal is disabled and itable/journal init
+/// is eager, matching the M0 recipe for deterministic prewarmed images. Note:
+/// mkfs.ext4 requires options to precede the `device [size]` operands.
+fn run_mkfs(dir: Option<&Path>, img: &Path, size: &str) -> Result<()> {
+    let mut cmd = Command::new("mkfs.ext4");
+    cmd.arg("-q")
         .args(["-O", "^has_journal"])
-        .args(["-E", "lazy_itable_init=0,lazy_journal_init=0"])
-        .arg("-d")
-        .arg(root)
+        .args(["-E", "lazy_itable_init=0,lazy_journal_init=0"]);
+    if let Some(d) = dir {
+        cmd.arg("-d").arg(d);
+    }
+    let out = cmd
         .arg(img)
         .arg(size)
         .output()
@@ -363,6 +446,49 @@ fn run_mkfs(root: &Path, img: &Path, size: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Pack `root` into a read-only squashfs image at `img` with
+/// `mksquashfs <root> <img> -all-root -noappend` (quiet). `-all-root` maps every
+/// file to uid/gid 0 so the unprivileged build produces a root-owned image;
+/// `-noappend` overwrites the pre-created temp file rather than appending.
+fn run_mksquashfs(root: &Path, img: &Path) -> Result<()> {
+    let out = Command::new("mksquashfs")
+        .arg(root)
+        .arg(img)
+        .arg("-all-root")
+        .arg("-noappend")
+        .arg("-quiet")
+        .arg("-no-progress")
+        .output()
+        .context("spawning mksquashfs (is squashfs-tools installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "mksquashfs failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Create a fresh, empty, writable **sparse ext4** image at `path` sized
+/// `size_mib` mebibytes — the overlay *scratch* drive (and the prewarmed
+/// empty-image pool) that the stage machinery layers a writable upper on.
+///
+/// Fully unprivileged: a sparse regular file laid out by `mkfs.ext4` with **no**
+/// `-d` (the filesystem is empty), the journal disabled, and lazy inode-table /
+/// journal init disabled so a prewarmed image boots deterministically without a
+/// first-write init storm (the M0 recipe). Overwrites any existing file at
+/// `path`.
+///
+/// # Errors
+/// Fails if the file cannot be created or `mkfs.ext4` is missing / errors.
+pub fn make_scratch_ext4(path: &Path, size_mib: u64) -> Result<()> {
+    // Truncate/create the backing file; mkfs lays the fs out sparsely to `size`.
+    std::fs::File::create(path)
+        .with_context(|| format!("creating scratch image {}", path.display()))?;
+    run_mkfs(None, path, &format!("{size_mib}M"))
 }
 
 /// Write `contents` to `path` and mark it executable (`0755`).
@@ -436,11 +562,72 @@ mod tests {
         for flavor in [
             RootfsFlavor::DevBusybox,
             RootfsFlavor::DevAgent,
+            RootfsFlavor::BaseSqfs,
             RootfsFlavor::Alpine,
         ] {
             assert_eq!(RootfsFlavor::from_slug(flavor.slug()).unwrap(), flavor);
         }
+        assert_eq!(
+            RootfsFlavor::from_slug("base-sqfs").unwrap(),
+            RootfsFlavor::BaseSqfs
+        );
         assert!(RootfsFlavor::from_slug("nope").is_err());
+    }
+
+    #[test]
+    fn base_sqfs_dest_is_squashfs_not_ext4() {
+        let images = Path::new("/x/images");
+        assert_eq!(
+            image_dest(images, RootfsFlavor::BaseSqfs),
+            images.join("base.sqfs")
+        );
+        assert_eq!(
+            image_dest(images, RootfsFlavor::DevAgent),
+            images.join("rootfs-dev-agent.ext4")
+        );
+    }
+
+    #[test]
+    fn base_overlay_dirs_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_base_overlay_dirs(root).unwrap();
+        for d in ["rom", "overlay", "mnt"] {
+            assert!(root.join(d).is_dir(), "missing overlay mountpoint /{d}");
+        }
+        for i in 0..BASE_LAYER_SLOTS {
+            assert!(
+                root.join(format!("layers/{i}")).is_dir(),
+                "missing stage mountpoint /layers/{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn make_scratch_ext4_writes_valid_sparse_superblock() {
+        // Hermetic skip when e2fsprogs is unavailable.
+        if Command::new("mkfs.ext4").arg("-V").output().is_err() {
+            eprintln!("SKIP make_scratch_ext4 test: mkfs.ext4 not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("scratch.ext4");
+        make_scratch_ext4(&img, 16).expect("mkfs scratch");
+
+        let meta = std::fs::metadata(&img).unwrap();
+        assert_eq!(meta.len(), 16 * 1024 * 1024, "apparent size is 16 MiB");
+        // On-disk allocation far below apparent size ⇒ the empty image is sparse.
+        assert!(
+            meta.blocks() * 512 < meta.len(),
+            "empty scratch image should be sparse"
+        );
+        // ext4 superblock magic 0xEF53 (little-endian) at byte offset 0x438.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&img).unwrap();
+        f.seek(SeekFrom::Start(0x438)).unwrap();
+        let mut magic = [0u8; 2];
+        f.read_exact(&mut magic).unwrap();
+        assert_eq!(magic, [0x53, 0xEF], "ext4 superblock magic present");
     }
 
     #[test]

@@ -21,11 +21,14 @@ use isopod_fc::{FcClient, FcProcess, FcProcessConfig, LogLevel, StdioMode, VmId}
 use crate::agent::{AgentClient, ExecSpec, StreamCapture};
 use crate::image::{self, RootfsFlavor};
 use crate::paths;
+use crate::stage::{self, StageMeta};
 
 mod build_fc;
 mod console;
+mod registry;
 
 pub use build_fc::{build_fc, BinPaths, BuildFcOutcome};
+pub use registry::{gc as vm_gc, list as vm_list, GcReport, VmRecord};
 
 /// Per-stream inline capture cap for `isopod run` (64 KiB, per the PLAN's
 /// head-truncation policy); everything is still teed in full to the log files.
@@ -421,6 +424,84 @@ async fn configure_boot(client: &FcClient, kernel: &Path, rootfs: &Path) -> Resu
     Ok(())
 }
 
+/// Pre-boot configuration for `isopod run`, dispatching on the disk topology.
+///
+/// `Flavor` reproduces the M2 single-ext4 root byte-for-byte. `Stage` puts the
+/// squashfs base as the read-only root `vda`, each committed layer read-only in
+/// root-first (oldest-first) order as `vdb..`, and the fresh writable scratch
+/// last; it also appends ` isopod.layers=<N>` to the boot args so the guest
+/// agent assembles the overlay. Drives appear in the guest as `/dev/vd{a,b,…}`
+/// in PUT order, so the ordering here is the contract with the guest agent.
+async fn configure_run_boot(client: &FcClient, kernel: &Path, disk: &DiskConfig) -> Result<()> {
+    client
+        .put_machine_config(&MachineConfig::new(1, 256))
+        .await
+        .context("PUT /machine-config")?;
+    match disk {
+        DiskConfig::Flavor { rootfs_copy } => {
+            client
+                .put_boot_source(&BootSource::new(kernel.to_string_lossy(), BOOT_ARGS))
+                .await
+                .context("PUT /boot-source")?;
+            client
+                .put_drive(&Drive::virtio(
+                    "rootfs",
+                    rootfs_copy.to_string_lossy(),
+                    true,
+                    true,
+                ))
+                .await
+                .context("PUT /drives/rootfs")?;
+        }
+        DiskConfig::Stage {
+            base_sqfs,
+            layer_paths,
+            scratch,
+            ..
+        } => {
+            let args = format!("{BOOT_ARGS} isopod.layers={}", layer_paths.len());
+            client
+                .put_boot_source(&BootSource::new(kernel.to_string_lossy(), args))
+                .await
+                .context("PUT /boot-source")?;
+            // vda: squashfs base — read-only root device.
+            client
+                .put_drive(&Drive::virtio(
+                    "base",
+                    base_sqfs.to_string_lossy(),
+                    true,
+                    true,
+                ))
+                .await
+                .context("PUT /drives/base")?;
+            // vdb..: committed stage layers, read-only, oldest-first.
+            for (i, layer) in layer_paths.iter().enumerate() {
+                let id = format!("layer{i}");
+                client
+                    .put_drive(&Drive::virtio(
+                        id.as_str(),
+                        layer.to_string_lossy(),
+                        false,
+                        true,
+                    ))
+                    .await
+                    .with_context(|| format!("PUT /drives/{id}"))?;
+            }
+            // last drive: fresh writable scratch (the overlay upperdir).
+            client
+                .put_drive(&Drive::virtio(
+                    "scratch",
+                    scratch.to_string_lossy(),
+                    false,
+                    false,
+                ))
+                .await
+                .context("PUT /drives/scratch")?;
+        }
+    }
+    Ok(())
+}
+
 /// Spawn firecracker, configure 1 vCPU / 256 MiB, boot, and watch the serial
 /// console for the boot + liveness markers. On any error the [`FcProcess`] drop
 /// guard still tears the VMM down. Returns `(boot_ms, ticks_observed)`.
@@ -521,6 +602,14 @@ async fn wait_for_markers(
 /// The default agent rootfs flavor slug for `isopod run`.
 pub const DEFAULT_RUN_FLAVOR: &str = "dev-agent";
 
+/// Reserved `--stage` word: overlay topology with **zero** committed layers —
+/// a fresh scratch straight on top of the squashfs base.
+const STAGE_BASE: &str = "base";
+
+/// The `rootfs_flavor` label reported when booting the overlay (`--stage`)
+/// topology; the on-disk root is the squashfs base rather than an ext4 flavor.
+const STAGE_ROOTFS_FLAVOR: &str = "base-sqfs";
+
 /// Options for [`run_ephemeral`].
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -533,12 +622,22 @@ pub struct RunOptions {
     /// Outer wall-clock budget in seconds (covers boot + exec; default 120).
     pub timeout_s: u64,
     /// Rootfs flavor to boot (the agent flavor, `dev-agent`, by default).
+    /// Ignored when [`stage`](Self::stage) is set (the overlay topology boots
+    /// the squashfs base instead).
     pub flavor: RootfsFlavor,
-    /// Keep the VM directory's throwaway rootfs copy instead of deleting it.
+    /// Keep the VM directory's throwaway disk copy instead of deleting it.
     pub keep: bool,
     /// Reserved for M4; ignored for now (control RPC is vsock, so exec works
     /// with or without a NIC).
     pub network: bool,
+    /// Fork from a committed stage: its `stage_id`, vanity name, or unique label
+    /// prefix. The reserved word `base` boots the overlay topology with zero
+    /// layers (fresh from the squashfs base). `None` keeps the legacy dev-agent
+    /// ext4 topology with no overlay (zero regression from M2).
+    pub stage: Option<String>,
+    /// After a clean run, commit the scratch upperdir as a new stage with this
+    /// label. Only honoured in the overlay topology (requires [`stage`](Self::stage)).
+    pub commit_as: Option<String>,
 }
 
 /// Result of a [`run_ephemeral`], serialized verbatim as `isopod run`'s JSON.
@@ -583,6 +682,14 @@ pub struct RunReport {
     pub stdout_log_path: PathBuf,
     /// Absolute path to the retained full stderr log.
     pub stderr_log_path: PathBuf,
+    /// The `stage_id` committed by `--commit-as` (present only when a stage was
+    /// committed this run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    /// The vanity name of the committed stage (present only alongside
+    /// [`stage_id`](Self::stage_id)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_name: Option<String>,
 }
 
 /// Compute the in-guest exec timeout from the outer budget and elapsed time,
@@ -630,22 +737,91 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     let t_total = Instant::now();
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
-    let (rootfs, flavor_slug) = resolve_rootfs(opts.flavor)?;
+
+    // `--stage` switches to the overlay topology (squashfs base + committed
+    // layers + fresh scratch); without it, boot the legacy dev-agent ext4
+    // exactly as M2 did (zero regression).
+    let plan = match &opts.stage {
+        Some(stage_ref) => resolve_stage_plan(stage_ref)?,
+        None => {
+            let (rootfs, flavor_slug) = resolve_rootfs(opts.flavor)?;
+            BootPlan::Flavor {
+                rootfs,
+                flavor_slug,
+            }
+        }
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(run_exec(fc, kernel, rootfs, flavor_slug, opts, t_total))
+    rt.block_on(run_exec(fc, kernel, plan, opts, t_total))
 }
 
-/// Async driver: create the VM dir, sparse-copy the rootfs, boot + exec, then
-/// clean up the throwaway copy (keeping the logs).
+/// How a run's guest disks are laid out. `Flavor` is the legacy single-ext4
+/// root (no overlay); `Stage` is the overlay topology (squashfs base as `vda`,
+/// N committed read-only stage layers `vdb..`, then a fresh writable scratch).
+enum BootPlan {
+    /// Legacy dev-agent ext4 root, no overlay.
+    Flavor {
+        /// Cached rootfs image to sparse-copy and boot.
+        rootfs: PathBuf,
+        /// Flavor slug reported in the [`RunReport`].
+        flavor_slug: String,
+    },
+    /// Overlay topology.
+    Stage {
+        /// Squashfs base image (`vda`, read-only root).
+        base_sqfs: PathBuf,
+        /// Committed layer artifacts, root-first (oldest-first) = the PUT order
+        /// for `vdb..`.
+        layer_paths: Vec<PathBuf>,
+        /// The forked stage's `stage_id` (the commit parent); `None` for `base`.
+        parent: Option<String>,
+    },
+}
+
+/// Resolve a `--stage <ref>` into a [`BootPlan::Stage`]: locate the squashfs
+/// base, and (unless `ref` is the reserved word `base`) resolve the stage and
+/// its full layer chain.
+fn resolve_stage_plan(stage_ref: &str) -> Result<BootPlan> {
+    let base_sqfs = base_sqfs_path()?;
+    if stage_ref == STAGE_BASE {
+        return Ok(BootPlan::Stage {
+            base_sqfs,
+            layer_paths: Vec::new(),
+            parent: None,
+        });
+    }
+    let meta = stage::resolve(stage_ref)?;
+    let layer_paths = stage::chain_paths(&meta)?;
+    Ok(BootPlan::Stage {
+        base_sqfs,
+        layer_paths,
+        parent: Some(meta.stage_id),
+    })
+}
+
+/// Locate the squashfs base image the overlay topology boots as `vda`.
+fn base_sqfs_path() -> Result<PathBuf> {
+    let p = paths::images_dir()?.join("base.sqfs");
+    if !p.exists() {
+        bail!(
+            "base squashfs image not found at {}; build it first: \
+             `isopod image build-rootfs --flavor base-sqfs`",
+            p.display()
+        );
+    }
+    Ok(p)
+}
+
+/// Async driver: create the VM dir, materialize the guest disks, boot + exec,
+/// optionally commit the scratch as a stage, then clean up (keeping the logs).
 async fn run_exec(
     fc: FcBinary,
     kernel: PathBuf,
-    rootfs: PathBuf,
-    flavor_slug: String,
+    plan: BootPlan,
     opts: RunOptions,
     t_total: Instant,
 ) -> Result<RunReport> {
@@ -653,22 +829,27 @@ async fn run_exec(
     let vm_dir = paths::vms_dir()?.join(&vm_id);
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
-    let vanity = assign_vanity_name(&vm_id, &vm_dir, &flavor_slug)?;
+
+    let flavor_label = match &plan {
+        BootPlan::Flavor { flavor_slug, .. } => flavor_slug.clone(),
+        BootPlan::Stage { .. } => STAGE_ROOTFS_FLAVOR.to_string(),
+    };
+    let vanity = assign_vanity_name(&vm_id, &vm_dir, &flavor_label)?;
 
     let console_log = vm_dir.join("console.log");
     let stdout_log = vm_dir.join("exec-stdout.log");
     let stderr_log = vm_dir.join("exec-stderr.log");
-    let rootfs_copy = vm_dir.join("rootfs.ext4");
     let api_sock = vm_dir.join("api.sock");
     let vsock_uds = vm_dir.join("vsock.sock");
 
-    // Always boot a throwaway copy; the cached image must stay pristine.
-    sparse_copy(&rootfs, &rootfs_copy)?;
+    // Materialize the throwaway disks (the cached base/rootfs stay pristine;
+    // committed layers are shared read-only and never copied).
+    let disk = prepare_disk(&plan, &vm_dir)?;
 
     let driven = drive_exec(DriveExecCtx {
         fc: &fc,
         kernel: &kernel,
-        rootfs_copy: &rootfs_copy,
+        disk: &disk,
         api_sock: &api_sock,
         vsock_uds: &vsock_uds,
         console_log: &console_log,
@@ -680,18 +861,18 @@ async fn run_exec(
     })
     .await;
 
-    // Remove the throwaway rootfs copy unless --keep; keep every log regardless.
+    // Commit the scratch into the stage store (only on a clean run) *before*
+    // removing it.
+    let commit_outcome = maybe_commit_stage(&disk, &opts, &driven);
+
+    // Remove throwaway disk(s) unless --keep; keep every log regardless.
     if !opts.keep {
-        match std::fs::remove_file(&rootfs_copy) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!(
-                "run: warning: could not remove {}: {e}",
-                rootfs_copy.display()
-            ),
-        }
+        cleanup_disk(&disk);
     }
 
+    // Surface a commit failure ahead of the exec result: the user explicitly
+    // asked to persist the stage.
+    let committed = commit_outcome?;
     let exec = driven?;
     Ok(RunReport {
         ok: true,
@@ -709,18 +890,122 @@ async fn run_exec(
         exec_ms: exec.exec_ms,
         total_ms: t_total.elapsed().as_millis() as u64,
         fc_binary: fc,
-        rootfs_flavor: flavor_slug,
+        rootfs_flavor: flavor_label,
         serial_log_path: console_log,
         stdout_log_path: stdout_log,
         stderr_log_path: stderr_log,
+        stage_id: committed.as_ref().map(|m| m.stage_id.clone()),
+        stage_name: committed.as_ref().map(|m| m.name.clone()),
     })
+}
+
+/// The resolved, materialized guest-disk layout for one run.
+enum DiskConfig {
+    /// Legacy single-ext4 root (throwaway copy of a cached flavor image).
+    Flavor {
+        /// The booted throwaway rootfs copy (removed unless `--keep`).
+        rootfs_copy: PathBuf,
+    },
+    /// Overlay topology.
+    Stage {
+        /// Squashfs base (`vda`, read-only root).
+        base_sqfs: PathBuf,
+        /// Committed layers, root-first (the `vdb..` PUT order).
+        layer_paths: Vec<PathBuf>,
+        /// Fresh writable scratch (the overlay upperdir; removed unless `--keep`).
+        scratch: PathBuf,
+        /// Commit parent for `--commit-as` (`None` when forked from `base`).
+        parent: Option<String>,
+    },
+}
+
+/// Create the per-run disk artifacts named by `plan` inside `vm_dir`.
+fn prepare_disk(plan: &BootPlan, vm_dir: &Path) -> Result<DiskConfig> {
+    match plan {
+        BootPlan::Flavor { rootfs, .. } => {
+            let rootfs_copy = vm_dir.join("rootfs.ext4");
+            sparse_copy(rootfs, &rootfs_copy)?;
+            Ok(DiskConfig::Flavor { rootfs_copy })
+        }
+        BootPlan::Stage {
+            base_sqfs,
+            layer_paths,
+            parent,
+        } => {
+            let scratch = vm_dir.join("scratch.ext4");
+            stage::make_scratch_ext4(&scratch, stage::DEFAULT_SCRATCH_MIB)?;
+            Ok(DiskConfig::Stage {
+                base_sqfs: base_sqfs.clone(),
+                layer_paths: layer_paths.clone(),
+                scratch,
+                parent: parent.clone(),
+            })
+        }
+    }
+}
+
+/// Remove the run's throwaway disk (the flavor rootfs copy, or the scratch);
+/// read-only base/committed-layer images are shared and never touched.
+fn cleanup_disk(disk: &DiskConfig) {
+    let throwaway = match disk {
+        DiskConfig::Flavor { rootfs_copy } => rootfs_copy,
+        DiskConfig::Stage { scratch, .. } => scratch,
+    };
+    match std::fs::remove_file(throwaway) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "run: warning: could not remove {}: {e}",
+            throwaway.display()
+        ),
+    }
+}
+
+/// Commit the scratch as a new stage when `--commit-as` is set and the run
+/// completed cleanly (overlay topology, exec succeeded, and did not time out —
+/// a timed-out guest may have an unsynced scratch). Returns the committed stage
+/// on success, `Ok(None)` when there is nothing to commit, and `Err` only if the
+/// commit itself failed.
+fn maybe_commit_stage(
+    disk: &DiskConfig,
+    opts: &RunOptions,
+    driven: &Result<ExecResult>,
+) -> Result<Option<StageMeta>> {
+    let DiskConfig::Stage {
+        scratch, parent, ..
+    } = disk
+    else {
+        // Guard against a nonsensical --commit-as on the non-overlay topology.
+        if opts.commit_as.is_some() {
+            eprintln!("run: ignoring --commit-as: nothing to commit without --stage");
+        }
+        return Ok(None);
+    };
+    let Some(label) = &opts.commit_as else {
+        return Ok(None);
+    };
+    let Ok(exec) = driven else {
+        return Ok(None); // exec failed outright; nothing worth committing
+    };
+    if exec.timed_out {
+        eprintln!(
+            "run: not committing stage {label:?}: the exec timed out (scratch may be inconsistent)"
+        );
+        return Ok(None);
+    }
+    let meta = stage::commit(scratch, label, parent.as_deref())?;
+    eprintln!(
+        "run: committed stage {} ({}) labelled {:?}",
+        meta.stage_id, meta.name, meta.label
+    );
+    Ok(Some(meta))
 }
 
 /// Everything [`drive_exec`] needs (bundled to keep the arg count sane).
 struct DriveExecCtx<'a> {
     fc: &'a FcBinary,
     kernel: &'a Path,
-    rootfs_copy: &'a Path,
+    disk: &'a DiskConfig,
     api_sock: &'a Path,
     vsock_uds: &'a Path,
     console_log: &'a Path,
@@ -757,7 +1042,7 @@ async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
 
     // Pre-boot configuration, including the hybrid-vsock device.
     let client = proc.client().context("building the API client")?;
-    configure_boot(&client, ctx.kernel, ctx.rootfs_copy).await?;
+    configure_run_boot(&client, ctx.kernel, ctx.disk).await?;
     client
         .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
         .await
@@ -1018,6 +1303,8 @@ mod tests {
             serial_log_path: PathBuf::from("/v/console.log"),
             stdout_log_path: PathBuf::from("/v/exec-stdout.log"),
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
+            stage_id: None,
+            stage_name: None,
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
@@ -1028,6 +1315,16 @@ mod tests {
         assert_eq!(
             v["fc_binary"]["provenance"],
             serde_json::json!("vendored-build")
+        );
+        // The optional stage fields are omitted entirely when no stage was
+        // committed (skip_serializing_if = Option::is_none).
+        assert!(
+            v.get("stage_id").is_none(),
+            "stage_id must be absent when None"
+        );
+        assert!(
+            v.get("stage_name").is_none(),
+            "stage_name must be absent when None"
         );
         for key in [
             "ok",
@@ -1051,5 +1348,39 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "RunReport JSON missing key {key:?}");
         }
+    }
+
+    #[test]
+    fn run_report_includes_stage_fields_when_committed() {
+        let report = RunReport {
+            ok: true,
+            name: "umbral-thorn".into(),
+            vm_id: "dev-11223344".into(),
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            exec_ms: 3,
+            total_ms: 120,
+            fc_binary: FcBinary {
+                path: PathBuf::from("/x/firecracker"),
+                provenance: FcProvenance::VendoredBuild,
+            },
+            rootfs_flavor: STAGE_ROOTFS_FLAVOR.into(),
+            serial_log_path: PathBuf::from("/v/console.log"),
+            stdout_log_path: PathBuf::from("/v/exec-stdout.log"),
+            stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
+            stage_id: Some("st-0123456789abcdef".into()),
+            stage_name: Some("radiant-ghost".into()),
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["rootfs_flavor"], serde_json::json!("base-sqfs"));
+        assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
+        assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
     }
 }
