@@ -29,7 +29,7 @@ mod console;
 mod registry;
 
 pub use build_fc::{build_fc, BinPaths, BuildFcOutcome};
-pub use registry::{gc as vm_gc, list as vm_list, GcReport, VmRecord};
+pub use registry::{gc as vm_gc, list as vm_list, reap_orphans, GcReport, VmRecord};
 
 /// Per-stream inline capture cap for `isopod run` (64 KiB, per the PLAN's
 /// head-truncation policy); everything is still teed in full to the log files.
@@ -882,10 +882,18 @@ async fn run_exec(
     opts: RunOptions,
     t_total: Instant,
 ) -> Result<RunReport> {
+    // Reap any firecracker orphaned by a previous run whose CLI was killed
+    // before `kill_on_drop` could fire (Ctrl-C, MCP-client timeout, SIGKILL) —
+    // otherwise its held tap wedges that network slot (dogfood finding #7).
+    registry::reap_orphans();
+
     let vm_id = generate_vm_id()?;
     let vm_dir = paths::vms_dir()?.join(&vm_id);
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
+    // Record the owning CLI pid so the reaper can tell a live run's VMM from an
+    // orphaned one regardless of process reparenting.
+    let _ = std::fs::write(vm_dir.join("owner.pid"), std::process::id().to_string());
 
     let flavor_label = match &plan {
         BootPlan::Flavor { flavor_slug, .. } => flavor_slug.clone(),

@@ -48,8 +48,10 @@ pub fn list() -> Result<Vec<VmRecord>> {
 
 /// Remove old VM directories: keep the newest `keep_last`, plus anything
 /// younger than `min_age` (safety margin so an in-flight run's directory is
-/// never collected mid-boot).
+/// never collected mid-boot). First reaps any orphaned firecracker processes so
+/// a leaked VMM never keeps a slot wedged.
 pub fn gc(keep_last: usize, min_age: Duration) -> Result<GcReport> {
+    reap_orphans();
     gc_in(&paths::vms_dir()?, keep_last, min_age)
 }
 
@@ -104,6 +106,77 @@ fn gc_in(root: &Path, keep_last: usize, min_age: Duration) -> Result<GcReport> {
         kept,
         freed_bytes: freed,
     })
+}
+
+/// Kill firecracker processes orphaned by a run whose owning CLI has exited.
+///
+/// A run records its CLI pid in `<vm_dir>/owner.pid`; firecracker carries
+/// `--id <vm_id>` in its argv. For each live firecracker we map `--id` back to
+/// its VM dir, and if the recorded owner pid is no longer alive the VMM is an
+/// orphan (its `kill_on_drop` guard never ran) — SIGKILL it so its held tap /
+/// resources are freed. Best-effort: every step is guarded; a live run's VMM
+/// (owner still alive) is never touched. Unix-only; a no-op elsewhere.
+pub fn reap_orphans() {
+    let Ok(vms) = paths::vms_dir() else { return };
+    for (pid, vm_id) in firecracker_procs() {
+        let owner = vms.join(&vm_id).join("owner.pid");
+        let owner_alive = std::fs::read_to_string(&owner)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .map(pid_alive)
+            .unwrap_or(false); // no/unreadable owner pid ⇒ treat as orphan
+        if !owner_alive {
+            let _ = kill_pid(pid);
+        }
+    }
+}
+
+/// Enumerate `(pid, vm_id)` for every running `firecracker --id <vm_id>` by
+/// scanning `/proc/<pid>/cmdline`.
+fn firecracker_procs() -> Vec<(i32, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        // cmdline is NUL-separated argv.
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if args.first().map(|a| a.ends_with("firecracker")) != Some(true) {
+            continue;
+        }
+        if let Some(i) = args.iter().position(|a| a == "--id") {
+            if let Some(id) = args.get(i + 1) {
+                if id.starts_with("dev-") {
+                    found.push((pid, id.clone()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether `pid` is a live process (`/proc/<pid>` exists).
+fn pid_alive(pid: i32) -> bool {
+    pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// SIGKILL a pid via the `kill` binary (core takes no `libc` dependency).
+fn kill_pid(pid: i32) -> std::io::Result<()> {
+    eprintln!("vm: reaping orphaned firecracker pid {pid}");
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .map(|_| ())
 }
 
 /// Read one VM directory into a record, tolerating missing/corrupt meta.

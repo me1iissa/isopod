@@ -54,7 +54,7 @@ Egress works (ICMP + DNS through the NAT), concurrency lands on distinct slots
 (0/1), host isolation holds (guest can't reach the host tap — the `iifname`
 input-drop fix), `--no-network` attaches no NIC. Two findings:
 
-7. **[open] HIGH — a leaked firecracker holding a tap breaks its slot until
+7. **[fixed 4605db8+] HIGH — a leaked firecracker holding a tap breaks its slot until
    manually killed.** A VMM that outlived its run (here `dev-85eddd65` from an
    earlier failed attempt) kept `isopod-tap0` open, so every later slot-0 run
    died with `EBUSY` at `PUT /network-interfaces` — a confusing, persistent
