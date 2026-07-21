@@ -319,9 +319,13 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   answered an M3 gate: CI 6.18 guest kernel has overlay+squashfs+ext4 built in — custom kernel
   build demoted to optional boot-time optimization. `isopod doctor` deferred to M4 (setup era,
   when there's host state worth diagnosing).]*
-- **M3 — Stages.** Overlay chain assembly, `stage commit/list/info/rm`, fork-by-start, scratch
-  pool; the round-trip + whiteout + xattr integration tests. Acceptance: commit a
-  `pip install requests` stage, fork it, `python -c "import requests"` succeeds, parent unchanged.
+- **M3 — Stages.** *[✅ COMPLETE 2026-07-21 — squashfs base + guest overlay chains
+  (isopod.layers cmdline contract, pivot_root, whiteouts debugfs-proven), content-addressed
+  stage store with vanity names, `run --stage/--commit-as`, `stage list/info/rm`, `vm ls/gc`.
+  Acceptance dogfooded through isopod: commit → fork BY NAME → stack (modify+delete) →
+  whiteout verified → parent sha256-identical. The original pip-based acceptance needs
+  networking and moves to M4. Note: scratch pool prewarm deferred — scratch mkfs is on the
+  run path today (~50-100 ms); pool it in M6 with the snapshot warm pool.]*
 - **M4 — Network.** `sudo isopod setup` slot pool, NAT per M0's verdict, leak-reclaim sweep,
   `--no-network`. Acceptance: `git clone` + `pip install` inside a VM; exec still works with
   networking off.
