@@ -1,8 +1,20 @@
 [package]
 name = "isopod-proto"
-description = "Shared host<->guest RPC types (length-prefixed serde-JSON frames over vsock)."
+description = "Shared host<->guest RPC contract: length-prefixed serde-JSON frames over vsock."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Async frame helpers for the host side; the guest agent stays sync/std-only.
+tokio = ["dep:tokio"]
+
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+# Binary payloads (exec output, file contents) travel as base64 strings so the
+# JSON frames stay valid UTF-8 regardless of guest output.
+base64 = "0.22"
