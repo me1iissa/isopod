@@ -40,7 +40,15 @@ distinct vanity names).
    exist yet either. → file for M5 (MCP `file_put` + a `--stdin-file` flag land
    together).
 
-5. **[note] DOC — `--timeout-s` budget includes boot.** `--timeout-s 3` gives
+5. **[open] MEDIUM — guest rootfs has no `/tmp`.** Found by probing the guest
+   environment: `echo t > /tmp/x` fails on a fresh dev-agent VM (the dir simply
+   isn't in the image; `mkdir -p` works). A large fraction of real scripts and
+   tools assume `/tmp`. → FIX at M3 integration: add `/tmp` (mode 1777) and
+   `/var/tmp` to every flavor's populate step (dev-busybox, dev-agent,
+   base-sqfs). Guest-env facts for the record: 235 MB usable RAM of 256
+   configured, ~53 MB free rootfs, 302 busybox applets, uid 0.
+
+6. **[note] DOC — `--timeout-s` budget includes boot.** `--timeout-s 3` gives
    the command ~2.6 s of real exec time (boot consumes ~0.4 s of the budget).
    Reasonable semantics for an outer wall clock, but must be documented in the
    CLI help and the eventual MCP tool description (whose default timeout should
