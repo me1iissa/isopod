@@ -6,3 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Crate-local on purpose: this client talks plain HTTP over a unix socket, so
+# it needs no TLS backend at all — leaner than the workspace entry (rustls).
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Crate-local: needed to SIGKILL the whole Firecracker process group (kill(-pgid))
+# during supervised shutdown; not covered by tokio's per-child kill_on_drop.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
