@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use isopod_core::image::{self, RootfsFlavor};
 use isopod_core::stage;
@@ -108,6 +109,9 @@ struct RunArgs {
     /// (busybox, default) or `base-alpine` (python/node/git/gcc toolchain).
     #[arg(long, default_value = "base-sqfs")]
     base: String,
+    /// Feed the command's stdin from a file (`-` for the host's stdin).
+    #[arg(long = "stdin-file", value_name = "PATH")]
+    stdin_file: Option<String>,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
@@ -257,6 +261,18 @@ fn run_run(args: RunArgs) -> i32 {
             );
         }
         let env = vm::parse_env_kv(&args.env)?;
+        let stdin = match &args.stdin_file {
+            Some(p) if p == "-" => {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("reading stdin for --stdin-file -")?;
+                Some(buf)
+            }
+            Some(p) => Some(std::fs::read(p).with_context(|| format!("reading {p}"))?),
+            None => None,
+        };
         vm::run_ephemeral(RunOptions {
             argv: args.argv,
             env,
@@ -268,6 +284,7 @@ fn run_run(args: RunArgs) -> i32 {
             stage: args.stage,
             commit_as: args.commit_as,
             base,
+            stdin,
         })
     })();
     emit(result)

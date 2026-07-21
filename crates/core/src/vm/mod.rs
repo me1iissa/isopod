@@ -686,6 +686,8 @@ pub struct RunOptions {
     /// [`stage`](Self::stage)): [`RootfsFlavor::BaseSqfs`] (busybox, default) or
     /// [`RootfsFlavor::BaseAlpine`] (python/node/git/gcc toolchain).
     pub base: RootfsFlavor,
+    /// Bytes written to the command's stdin (then closed). `None` = no stdin.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// Result of a [`run_ephemeral`], serialized verbatim as `isopod run`'s JSON.
@@ -1234,7 +1236,7 @@ async fn run_command(agent: &AgentClient, ctx: &DriveExecCtx<'_>) -> Result<Exec
         env: ctx.opts.env.clone(),
         cwd: ctx.opts.cwd.clone(),
         timeout_ms: Some(remaining_ms),
-        stdin: None,
+        stdin: ctx.opts.stdin.clone(),
         stdout_log: ctx.stdout_log.to_path_buf(),
         stderr_log: ctx.stderr_log.to_path_buf(),
         inline_cap: INLINE_CAP,

@@ -34,7 +34,7 @@ distinct vanity names).
    outcome (`exit_code:127`-style or an `error_kind` field), reserving
    `ok:false` for infrastructure faults.
 
-4. **[open] LOW — no stdin plumbing in the CLI.** The proto supports
+4. **[fixed M5] LOW — no stdin plumbing.** The proto supports
    `stdin_b64` end-to-end but `isopod run` has no `--stdin`/`--stdin-file`, so
    piping data into a sandboxed command requires a file-put dance that doesn't
    exist yet either. → file for M5 (MCP `file_put` + a `--stdin-file` flag land
