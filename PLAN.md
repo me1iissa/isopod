@@ -330,9 +330,12 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   whiteout verified → parent sha256-identical. The original pip-based acceptance needs
   networking and moves to M4. Note: scratch pool prewarm deferred — scratch mkfs is on the
   run path today (~50-100 ms); pool it in M6 with the snapshot warm pool.]*
-- **M4 — Network.** `sudo isopod setup` slot pool, NAT per M0's verdict, leak-reclaim sweep,
-  `--no-network`. Acceptance: `git clone` + `pip install` inside a VM; exec still works with
-  networking off.
+- **M4 — Network.** *[✅ COMPLETE 2026-07-21 — `sudo isopod setup` provisions user-owned tap
+  slots + nftables NAT (masquerade, tap↔tap + guest→host isolation), guest IP via cmdline+ioctls,
+  `--no-network`, orphan-VMM reaper. Alpine dev base (`base-alpine.sqfs`: python3/pip/node/git/
+  gcc). Acceptance dogfooded through isopod: bare `pip install requests` → commit → fork by
+  vanity name → `import requests` no reinstall → parent byte-identical; egress + host isolation
+  live-verified. 8 dogfood findings fixed along the way (docs/dogfood-findings.md).]*
 - **M5 — MCP + skill.** `isopod mcp`, `.mcp.json`, SKILL.md. Acceptance from a real Claude Code
   session: run code ephemerally → commit stage → new session forks it → fork sees state, parent
   stage unchanged.
