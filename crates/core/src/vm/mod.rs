@@ -704,6 +704,13 @@ pub struct RunOptions {
     /// hard error, never silently clamped. Use [`DEFAULT_MEM_MIB`] for the
     /// default.
     pub mem_mib: u32,
+    /// Requested writable scratch size in MiB — the overlay upperdir (the ext4
+    /// scratch drive) of a `--stage` run. `None` uses [`stage::DEFAULT_SCRATCH_MIB`].
+    /// Validated ([`MIN_SCRATCH_MIB`]..=[`MAX_SCRATCH_MIB`]) before boot; an
+    /// out-of-range value is a hard error. Ignored by the legacy dev-agent
+    /// topology and by warm resumes (which use a RAM/tmpfs upper) — passing it
+    /// forces the cold ext4 path so the requested size always takes effect.
+    pub scratch_mib: Option<u32>,
 }
 
 /// Which boot path served a run: a warm snapshot resume or a cold boot.
@@ -836,6 +843,9 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     // Validate the requested resource shape against real host capacity *before*
     // booting anything: an over-cap request must error with no VM launched.
     let resources = resources::resolve_for_host(opts.vcpus, opts.mem_mib)?;
+    // Validate the requested scratch size too (default when unset); an
+    // out-of-range value errors here with no VM launched.
+    let scratch_mib = resolve_scratch_mib(opts.scratch_mib)?;
     let t_total = Instant::now();
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
@@ -858,7 +868,15 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(run_exec(fc, kernel, plan, resources, opts, t_total))
+    rt.block_on(run_exec(
+        fc,
+        kernel,
+        plan,
+        resources,
+        scratch_mib,
+        opts,
+        t_total,
+    ))
 }
 
 /// How a run's guest disks are laid out. `Flavor` is the legacy single-ext4
@@ -922,6 +940,7 @@ async fn run_exec(
     kernel: PathBuf,
     plan: BootPlan,
     resources: Resources,
+    scratch_mib: u64,
     opts: RunOptions,
     t_total: Instant,
 ) -> Result<RunReport> {
@@ -987,6 +1006,7 @@ async fn run_exec(
         kernel: &kernel,
         plan: &plan,
         resources,
+        scratch_mib,
         warm_key: warm_key.as_ref(),
         net: net_slot.as_ref(),
         api_sock: &api_sock,
@@ -1055,10 +1075,12 @@ async fn run_exec(
 ///
 /// Warm-eligible iff `--stage base` (a fresh base-squashfs overlay with zero
 /// committed layers), no `--commit-as` (the RAM upper has no scratch to commit),
+/// no `--scratch-mib` (an explicit disk-backed scratch forces the cold ext4 path
+/// so the requested size takes effect — a warm resume uses a RAM/tmpfs upper),
 /// and networking on (resume retargets a NIC and re-IPs the guest). A stage
-/// *fork*, a committing run, or `--no-network` cold-boots unchanged. A legacy
-/// `stage: None` (dev-agent ext4) run is intentionally excluded: its rootfs
-/// differs from the base-squashfs warm shape.
+/// *fork*, a committing run, a sized-scratch run, or `--no-network` cold-boots
+/// unchanged. A legacy `stage: None` (dev-agent ext4) run is intentionally
+/// excluded: its rootfs differs from the base-squashfs warm shape.
 fn warm_snapshot_key(
     fc: &FcBinary,
     kernel: &Path,
@@ -1069,7 +1091,7 @@ fn warm_snapshot_key(
     if !matches!(&opts.stage, Some(s) if s == STAGE_BASE) {
         return None;
     }
-    if opts.commit_as.is_some() || !opts.network {
+    if opts.commit_as.is_some() || !opts.network || opts.scratch_mib.is_some() {
         return None;
     }
     let BootPlan::Stage { base_flavor, .. } = plan else {
@@ -1233,15 +1255,51 @@ pub fn warmpool_build(base: RootfsFlavor, vcpus: u32, mem_mib: u32) -> Result<Wa
 /// # Errors
 /// If `sudo isopod setup` has not created the slot manifest.
 fn require_network_setup() -> Result<()> {
-    if net::setup_manifest_exists() {
-        return Ok(());
+    if !net::setup_manifest_exists() {
+        bail!(
+            "networking requires one-time host setup that has not run.\n\
+             Run it once (the only step that needs root):\n\
+             \n    sudo isopod setup\n\n\
+             or re-run this command with --no-network to boot without a NIC."
+        );
     }
-    bail!(
-        "networking requires one-time host setup that has not run.\n\
-         Run it once (the only step that needs root):\n\
-         \n    sudo isopod setup\n\n\
-         or re-run this command with --no-network to boot without a NIC."
-    )
+    // Setup ran, but tap devices do not survive a host/WSL2 restart. Detect the
+    // evaporated-taps case here and name the fix, instead of failing deep in
+    // boot with a raw Firecracker "Open tap device failed: Operation not
+    // permitted / Invalid TUN/TAP Backend" that gives no hint (dogfood #13).
+    if !net::provisioned_taps_present().context("checking provisioned tap devices")? {
+        bail!(
+            "networking was provisioned but its tap devices are missing — the \
+             host was most likely restarted (WSL2 tears down tap devices on \
+             restart). Re-provision it (the only step that needs root):\n\
+             \n    sudo isopod setup\n\n\
+             or re-run this command with --no-network to boot without a NIC."
+        );
+    }
+    Ok(())
+}
+
+/// Lower bound on a requested [`RunOptions::scratch_mib`]; below this, ext4
+/// metadata leaves too little usable space to be worth booting.
+pub const MIN_SCRATCH_MIB: u32 = 128;
+
+/// Upper bound on a requested [`RunOptions::scratch_mib`] (64 GiB). The scratch
+/// image is sparse, but `mkfs.ext4` still lays out inode tables proportional to
+/// the apparent size, so an unbounded request is refused.
+pub const MAX_SCRATCH_MIB: u32 = 64 * 1024;
+
+/// Validate an optional scratch-size request, returning the resolved size in MiB
+/// ([`stage::DEFAULT_SCRATCH_MIB`] when unset). Never silently clamps — an
+/// out-of-range request errors, matching the vcpus/mem_mib contract.
+fn resolve_scratch_mib(requested: Option<u32>) -> Result<u64> {
+    match requested {
+        None => Ok(stage::DEFAULT_SCRATCH_MIB),
+        Some(mib) if (MIN_SCRATCH_MIB..=MAX_SCRATCH_MIB).contains(&mib) => Ok(u64::from(mib)),
+        Some(mib) => bail!(
+            "requested scratch size {mib} MiB is out of range \
+             ({MIN_SCRATCH_MIB}..={MAX_SCRATCH_MIB} MiB)"
+        ),
+    }
 }
 
 /// Claim a network slot for a networked run, requiring the one-time host setup.
@@ -1283,7 +1341,7 @@ enum DiskConfig {
 }
 
 /// Create the per-run disk artifacts named by `plan` inside `vm_dir`.
-fn prepare_disk(plan: &BootPlan, vm_dir: &Path) -> Result<DiskConfig> {
+fn prepare_disk(plan: &BootPlan, vm_dir: &Path, scratch_mib: u64) -> Result<DiskConfig> {
     match plan {
         BootPlan::Flavor { rootfs, .. } => {
             let rootfs_copy = vm_dir.join("rootfs.ext4");
@@ -1297,7 +1355,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path) -> Result<DiskConfig> {
             parent,
         } => {
             let scratch = vm_dir.join("scratch.ext4");
-            stage::make_scratch_ext4(&scratch, stage::DEFAULT_SCRATCH_MIB)?;
+            stage::make_scratch_ext4(&scratch, scratch_mib)?;
             Ok(DiskConfig::Stage {
                 base_sqfs: base_sqfs.clone(),
                 base_flavor: base_flavor.clone(),
@@ -1391,6 +1449,8 @@ struct BootCtx<'a> {
     plan: &'a BootPlan,
     /// Host-validated vCPU / memory allocation for this VM.
     resources: Resources,
+    /// Resolved writable-scratch size (MiB) for a cold Stage run's ext4 upper.
+    scratch_mib: u64,
     /// The warm-pool snapshot key when this run is warm-eligible and its
     /// snapshot is present (`None` ⇒ always cold-boot).
     warm_key: Option<&'a SnapshotKey>,
@@ -1489,7 +1549,7 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
     }
 
     // Cold path: materialize the disk, cold-boot, run.
-    let disk = match prepare_disk(ctx.plan, ctx.vm_dir) {
+    let disk = match prepare_disk(ctx.plan, ctx.vm_dir, ctx.scratch_mib) {
         Ok(d) => d,
         Err(e) => {
             return BootOutcome {
@@ -1657,6 +1717,25 @@ mod tests {
     /// An `exists` predicate matching a fixed allow-list of paths.
     fn exists_set<'a>(present: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
         move |p: &Path| present.iter().any(|s| Path::new(s) == p)
+    }
+
+    #[test]
+    fn scratch_mib_resolves_default_and_enforces_bounds() {
+        // Unset -> the module default.
+        assert_eq!(resolve_scratch_mib(None).unwrap(), stage::DEFAULT_SCRATCH_MIB);
+        // In-range values pass through unchanged (as u64).
+        assert_eq!(
+            resolve_scratch_mib(Some(MIN_SCRATCH_MIB)).unwrap(),
+            u64::from(MIN_SCRATCH_MIB)
+        );
+        assert_eq!(resolve_scratch_mib(Some(4096)).unwrap(), 4096);
+        assert_eq!(
+            resolve_scratch_mib(Some(MAX_SCRATCH_MIB)).unwrap(),
+            u64::from(MAX_SCRATCH_MIB)
+        );
+        // Out of range errors, never silently clamps.
+        assert!(resolve_scratch_mib(Some(MIN_SCRATCH_MIB - 1)).is_err());
+        assert!(resolve_scratch_mib(Some(MAX_SCRATCH_MIB + 1)).is_err());
     }
 
     #[test]

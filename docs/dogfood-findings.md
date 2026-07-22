@@ -114,21 +114,29 @@ stage-fork model end to end: stage the toolchain once (rustup stable-musl 1.97.1
 stage in 22 s), then fork it and build with `target/` on a guest tmpfs. Proof the stage/fork
 model + M5.5 flex resources carry a real heavy workload. Five gaps fell out.
 
-13. **[open] HIGH — sandbox networking doesn't survive a WSL2/host restart, and the failure is
+13. **[fixed] HIGH — sandbox networking doesn't survive a WSL2/host restart, and the failure is
     cryptic.** The user-owned `isopod-tap0..7` are non-persistent; after the WSL utility VM
     recycles they vanish and every networked `run`/`sandbox_run` fails with a raw Firecracker
     string — `Open tap device failed: Operation not permitted ... Invalid TUN/TAP Backend
     provided by isopod-tap0` — with **no hint** the fix is `sudo isopod setup`. Hit both the MCP
-    path and the M6 agent this session. → pre-boot, verify the claimed tap exists and emit a
-    clear "host restarted? re-run `sudo isopod setup`" message; optionally auto-reprovision when
-    we hold CAP_NET_ADMIN. (PLAN networking risk #3, made concrete.)
+    path and the M6 agent this session. → FIXED: `require_network_setup` now, when a manifest
+    exists, also checks the provisioned taps are actually present (`net::provisioned_taps_present`
+    → `/sys/class/net/isopod-tap<i>`) and fails fast — before any disk work — with an actionable
+    "networking was provisioned but its tap devices are missing — the host was most likely
+    restarted … re-run `sudo isopod setup` (or --no-network)" message. (Runtime is unprivileged,
+    so auto-reprovision isn't possible; the clear message is the fix. Unit-tested via an injected
+    presence predicate.) (PLAN networking risk #3, made concrete.)
 
-14. **[open] MED — writable scratch (overlay upper) is fixed at ~1 GiB with no size knob.** A
+14. **[fixed] MED — writable scratch (overlay upper) was fixed at ~1 GiB with no size knob.** A
     *minimal* rustup toolchain (799 MiB) nearly fills it (98 MiB free, 89 %); a real build
     (`target/` reached 1.5 GiB) can't fit at all. Workaround that unblocked the self-build: mount
     a tmpfs in the guest and point `CARGO_TARGET_DIR`/`RUSTUP_HOME`/`CARGO_HOME` at it (trades RAM
-    for space). → add a `--scratch-mib` knob (size the ext4 upper) and/or document the tmpfs
-    pattern for builds. isopod targets dev workloads; 1 GiB is too small for many.
+    for space). → FIXED: added `--scratch-mib` (CLI) / `scratch_mib` (MCP `sandbox_run`), bounded
+    128..=65536 MiB, validated before boot (clear range error, no VM launched). The image is
+    sparse, so a large apparent size costs little host disk until written. Verified live: 4096 →
+    3.9 G overlay, 8192 → 7.8 G. Passing it forces the cold ext4 path (a warm resume uses a RAM
+    tmpfs upper), so the requested size always takes effect; `--mem-mib` remains the lever for a
+    bigger RAM upper on warm runs.
 
 15. **[open] MED — no Rust toolchain in any base, and `base-alpine` has no `apk`.** The squashfs
     base bakes in python/node/git/gcc/make/cmake but strips the package manager, so you can't

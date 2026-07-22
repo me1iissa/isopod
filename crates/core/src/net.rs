@@ -229,6 +229,36 @@ pub fn read_manifest() -> Result<Manifest> {
     read_manifest_in(&net_dir()?)
 }
 
+/// Whether the kernel currently exposes a network device named `name`
+/// (a `/sys/class/net/<name>` entry).
+fn tap_present(name: &str) -> bool {
+    Path::new("/sys/class/net").join(name).exists()
+}
+
+/// Whether every tap the recorded manifest provisioned is present in the kernel
+/// right now. Returns `Ok(false)` — not an error — when a manifest exists but
+/// its taps are gone, which is the signature of a host/WSL2 restart since
+/// `sudo isopod setup` (tap devices do not survive a restart).
+///
+/// # Errors
+/// If the manifest cannot be read or a slot index is out of the tap-name range.
+pub fn provisioned_taps_present() -> Result<bool> {
+    let manifest = read_manifest()?;
+    all_taps_present(manifest.slot_count, tap_present)
+}
+
+/// Core of [`provisioned_taps_present`] with the presence predicate injected, so
+/// the "one missing ⇒ not present" logic is unit-testable without touching
+/// `/sys`.
+fn all_taps_present(slot_count: usize, present: impl Fn(&str) -> bool) -> Result<bool> {
+    for i in 0..slot_count {
+        if !present(&tap_name(i)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Reclaim slot locks whose owning pid is dead (crash recovery), returning how
 /// many were reclaimed.
 ///
@@ -401,6 +431,16 @@ mod tests {
         assert_eq!(tap_name(249).unwrap(), "isopod-tap249"); // 13 bytes, fits
                                                              // A wildly out-of-range index would overflow IFNAMSIZ.
         assert!(tap_name(1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn all_taps_present_detects_a_missing_tap() {
+        // Every provisioned tap present -> Ok(true).
+        assert!(all_taps_present(4, |_| true).unwrap());
+        // Any tap missing (here: not tap2) -> Ok(false), the restart signature.
+        assert!(!all_taps_present(4, |n| n != "isopod-tap2").unwrap());
+        // Zero provisioned slots is vacuously present.
+        assert!(all_taps_present(0, |_| false).unwrap());
     }
 
     #[test]

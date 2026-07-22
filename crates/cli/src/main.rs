@@ -95,6 +95,12 @@ struct RunArgs {
     /// booting a VM.
     #[arg(long = "mem-mib", default_value_t = DEFAULT_MEM_MIB)]
     mem_mib: u32,
+    /// Writable scratch size in MiB for a `--stage` run's overlay upper (the ext4
+    /// scratch drive). Default ~1024; bounded 128..=65536. The image is sparse
+    /// (costs little host disk until written). Ignored by the legacy topology and
+    /// by warm resumes; passing it forces the cold ext4 path.
+    #[arg(long = "scratch-mib")]
+    scratch_mib: Option<u32>,
     /// Rootfs flavor to boot.
     #[arg(long, default_value = DEFAULT_RUN_FLAVOR)]
     flavor: String,
@@ -366,6 +372,7 @@ fn run_run(args: RunArgs) -> i32 {
             stdin,
             vcpus: args.vcpus,
             mem_mib: args.mem_mib,
+            scratch_mib: args.scratch_mib,
         })
     })();
     emit(result)

@@ -124,6 +124,12 @@ struct SandboxRunParams {
     /// over-cap value errors without booting.
     #[serde(default)]
     mem_mib: Option<u32>,
+    /// Writable scratch size in MiB for the overlay upper (the ext4 scratch
+    /// drive). Default ~1024; bounded 128..=65536. Sparse (costs little host disk
+    /// until written). Raise it for build workloads that outgrow ~1 GiB. Ignored
+    /// by warm resumes (which use a RAM upper); passing it forces the disk path.
+    #[serde(default)]
+    scratch_mib: Option<u32>,
 }
 
 /// Parameters for [`Isopod::stage_info`] and [`Isopod::stage_rm`].
@@ -421,6 +427,7 @@ Networking on by default (network=false for untrusted code). timeout_s covers bo
             // Defaults resolved by the core resolver, which also host-validates.
             vcpus: p.vcpus.unwrap_or(vm::DEFAULT_VCPUS),
             mem_mib: p.mem_mib.unwrap_or(vm::DEFAULT_MEM_MIB),
+            scratch_mib: p.scratch_mib,
         };
 
         // Best-effort idle-timeout keepalive: if the client sent a progressToken,
