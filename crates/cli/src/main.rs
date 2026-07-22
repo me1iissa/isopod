@@ -132,10 +132,12 @@ struct RunArgs {
     /// (requires `--stage`).
     #[arg(long = "commit-as", value_name = "LABEL")]
     commit_as: Option<String>,
-    /// Squashfs base for the overlay topology (with `--stage`): `base-sqfs`
-    /// (busybox, default) or `base-alpine` (python/node/git/gcc toolchain).
-    #[arg(long, default_value = "base-sqfs")]
-    base: String,
+    /// Squashfs base for the overlay topology: `base-sqfs` (busybox, the
+    /// default) or `base-alpine` (python/node/git/gcc toolchain). Requires
+    /// `--stage` — without it the run boots the legacy `--flavor` topology,
+    /// which has no base, so a lone `--base` is a hard error (finding #16).
+    #[arg(long)]
+    base: Option<String>,
     /// Feed the command's stdin from a file (`-` for the host's stdin).
     #[arg(long = "stdin-file", value_name = "PATH")]
     stdin_file: Option<String>,
@@ -344,11 +346,19 @@ fn run_dev(cmd: DevCommand) -> i32 {
 fn run_run(args: RunArgs) -> i32 {
     let result = (|| -> anyhow::Result<vm::RunReport> {
         let flavor = RootfsFlavor::from_slug(&args.flavor)?;
-        let base = RootfsFlavor::from_slug(&args.base)?;
+        // `--base` only means something on the stage/overlay topology; silently
+        // booting the legacy dev-agent rootfs instead was dogfood finding #16.
+        if args.base.is_some() && args.stage.is_none() {
+            anyhow::bail!(
+                "--base is only meaningful with --stage; pass `--stage base` to boot the \
+                 squashfs/overlay topology, or drop --base to keep the legacy --flavor topology"
+            );
+        }
+        let base_slug = args.base.as_deref().unwrap_or("base-sqfs");
+        let base = RootfsFlavor::from_slug(base_slug)?;
         if !base.is_squashfs_base() {
             anyhow::bail!(
-                "--base {} is not a squashfs base (use base-sqfs or base-alpine)",
-                args.base
+                "--base {base_slug} is not a squashfs base (use base-sqfs or base-alpine)"
             );
         }
         let env = vm::parse_env_kv(&args.env)?;
