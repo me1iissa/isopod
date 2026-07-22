@@ -449,6 +449,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_command_prefix_is_byte_identical_to_no_prefix() {
+        // The F2 jail is wired via `command_prefix`; when the flag is off an
+        // empty prefix must leave the argv exactly as the historical path. This
+        // pins the "flag-OFF byte-identical" guarantee at the argv layer.
+        let base = FcProcessConfig::new("/usr/bin/firecracker", "/run/vm.sock")
+            .id(VmId::new("dev-abc").unwrap())
+            .log_path("/v/firecracker.log")
+            .log_level(LogLevel::Warning);
+        let with_empty = FcProcessConfig::new("/usr/bin/firecracker", "/run/vm.sock")
+            .id(VmId::new("dev-abc").unwrap())
+            .log_path("/v/firecracker.log")
+            .log_level(LogLevel::Warning)
+            .command_prefix(Vec::new());
+        assert_eq!(
+            base.build_argv(),
+            with_empty.build_argv(),
+            "an empty command_prefix must not alter the argv"
+        );
+        assert_eq!(base.build_argv()[0], "/usr/bin/firecracker");
+    }
+
+    #[test]
+    fn jail_prefix_precedes_the_firecracker_binary() {
+        // The flag-ON shape: `[jail_bin, --cgroup, …, --root, …, --, ]` prepended,
+        // so argv[0] is the launcher and the Firecracker binary (argv[0] of the
+        // exec'd program) still carries `--id`, which the orphan reaper keys on.
+        let cfg = FcProcessConfig::new("/home/u/.isopod/bin/firecracker", "/v/api.sock")
+            .id(VmId::new("dev-1").unwrap())
+            .command_prefix(vec![
+                "/home/u/.isopod/bin/isopod-jail".into(),
+                "--cgroup".into(),
+                "/sys/fs/cgroup/user.slice/isopod.slice/dev-1".into(),
+                "--root".into(),
+                "/v/jail-root".into(),
+                "--".into(),
+            ]);
+        let argv = cfg.build_argv();
+        assert_eq!(argv[0], "/home/u/.isopod/bin/isopod-jail");
+        // The `--` separator immediately precedes the Firecracker binary path.
+        let dashdash = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(argv[dashdash + 1], "/home/u/.isopod/bin/firecracker");
+        // `--id dev-1` survives so the cmdline reaper still matches the real VMM.
+        let id_pos = argv.iter().position(|a| a == "--id").unwrap();
+        assert_eq!(argv[id_pos + 1], "dev-1");
+    }
+
     #[tokio::test]
     async fn spawn_reports_exit_when_binary_bad() {
         // `/bin/false` exits 1 immediately and never creates a socket; spawn

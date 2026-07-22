@@ -364,20 +364,25 @@ async fn spawn_piped_draining(
     api_sock: &Path,
     vm_id: &str,
     console_log: &Path,
+    prefix: Vec<String>,
 ) -> Result<FcProcess> {
     let id = VmId::new(vm_id)
         .map_err(|e| anyhow::anyhow!("invalid VM id {vm_id:?} for snapshot process: {e}"))?;
     let fc_log = console_log.with_file_name("firecracker.log");
-    let mut proc = FcProcess::spawn(
-        FcProcessConfig::new(fc_bin, api_sock)
-            .id(id)
-            .stdio(StdioMode::Piped)
-            .log_path(&fc_log)
-            .log_level(LogLevel::Warning)
-            .socket_timeout(Duration::from_secs(10)),
-    )
-    .await
-    .context("spawning firecracker")?;
+    let mut config = FcProcessConfig::new(fc_bin, api_sock)
+        .id(id)
+        .stdio(StdioMode::Piped)
+        .log_path(&fc_log)
+        .log_level(LogLevel::Warning)
+        .socket_timeout(Duration::from_secs(10));
+    // Jail exec-prefix (ISOPOD_JAIL=1). Empty when off, so the argv is
+    // byte-identical to the historical snapshot build/resume path.
+    if !prefix.is_empty() {
+        config = config.command_prefix(prefix);
+    }
+    let mut proc = FcProcess::spawn(config)
+        .await
+        .context("spawning firecracker")?;
     if let Some(stdout) = proc.child_mut().stdout.take() {
         let log = tokio::fs::File::create(console_log)
             .await
@@ -440,7 +445,28 @@ async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> 
     let vsock_uds = vm_dir.join("vsock.sock");
     let console_log = vm_dir.join("console.log");
 
-    let mut proc = spawn_piped_draining(ctx.fc_bin, &api_sock, &vm_id, &console_log).await?;
+    // Jail the builder's Firecracker too (ISOPOD_JAIL=1) so its cold boot has the
+    // same second isolation layer as a run. It always networks (it claims a slot).
+    // A setup failure propagates: the caller (run's warm path) then cold-boots the
+    // run itself jailed, so the untrusted path is never left unjailed.
+    let jail_spec = if crate::jail::is_enabled() {
+        // The snapshot output dir (vmstate/memfile) lives under the read-only home
+        // bind, so a jailed Firecracker's write there would EROFS. Create it now
+        // (so the bind source exists) and add an explicit rw bind nested over the
+        // read-only home, exactly like vm_dir.
+        std::fs::create_dir_all(&artifacts.dir)
+            .with_context(|| format!("creating snapshot dir {}", artifacts.dir.display()))?;
+        let mut binds = crate::jail::standard_binds(&vm_dir, ctx.fc_bin)?;
+        binds.push(crate::jail::Bind::rw(&artifacts.dir));
+        let devs = crate::jail::standard_devs(true);
+        Some(crate::jail::setup(&vm_dir, ctx.resources, &binds, &devs)?)
+    } else {
+        None
+    };
+    let jail_prefix = jail_spec.as_ref().map(|s| s.prefix.clone()).unwrap_or_default();
+
+    let mut proc =
+        spawn_piped_draining(ctx.fc_bin, &api_sock, &vm_id, &console_log, jail_prefix).await?;
     let client = proc.client().context("building the API client")?;
 
     // Boot args: the shared optimized set + RAM-upper warm mode + the builder
@@ -527,6 +553,10 @@ async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> 
     if let Err(e) = proc.shutdown(Duration::from_secs(3)).await {
         eprintln!("warmpool build: warning: builder shutdown returned: {e}");
     }
+    // Tear the builder's jail cgroup down (Firecracker is reaped); best-effort.
+    if let Some(spec) = &jail_spec {
+        crate::jail::teardown(spec);
+    }
 
     let (tmp_state, tmp_mem) = snapshot_result?;
 
@@ -600,6 +630,7 @@ pub async fn resume(
     fc_bin: &Path,
     slot: &net::Slot,
     vm_dir: &Path,
+    jail_prefix: Vec<String>,
 ) -> Result<(FcProcess, AgentClient)> {
     let artifacts = artifacts_for(key)?;
     if !artifacts.is_complete() {
@@ -618,7 +649,9 @@ pub async fn resume(
     let vsock_uds = vm_dir.join("vsock.sock");
     let console_log = vm_dir.join("console.log");
 
-    let proc = spawn_piped_draining(fc_bin, &api_sock, &vm_id, &console_log).await?;
+    // The resume runs in the run's own vm_dir, so the run's jail (built in
+    // `run_exec`) wraps it via `jail_prefix`; empty when ISOPOD_JAIL is off.
+    let proc = spawn_piped_draining(fc_bin, &api_sock, &vm_id, &console_log, jail_prefix).await?;
     let client = proc.client().context("building the API client")?;
 
     let params = SnapshotLoadParams::file_backed(

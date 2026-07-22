@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod image;
+pub mod jail;
 pub mod names;
 pub mod net;
 pub mod paths;

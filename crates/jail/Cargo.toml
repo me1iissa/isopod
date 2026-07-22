@@ -1,0 +1,21 @@
+[package]
+name = "isopod-jail"
+description = "Rootless microjail launcher: an exec-prefix that places a child in a delegated cgroup, drops host privilege via a single-id user+pid namespace, and pivot_roots into a minimal chroot before exec'ing Firecracker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "isopod-jail"
+path = "src/main.rs"
+
+[dependencies]
+# The only source of `unsafe` in the crate — every namespace/mount/exec syscall
+# is wrapped in `sys`. Matches the guest-agent's raw-libc style (no `nix`, no
+# async runtime): this is a tiny synchronous exec-prefix.
+libc = "0.2"
+
+[dev-dependencies]
+# The live jail test (ignored by default — needs unprivileged user namespaces)
+# builds a throwaway chroot + rw bind under a temp dir.
+tempfile = "3"

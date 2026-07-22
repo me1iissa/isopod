@@ -384,19 +384,24 @@ async fn spawn_fc_piped(
     api_sock: &Path,
     vm_id: &str,
     console_log: &Path,
+    prefix: Vec<String>,
 ) -> Result<(FcProcess, tokio::process::ChildStdout)> {
     let id = VmId::new(vm_id).map_err(|e| anyhow!("generated an invalid VM id {vm_id:?}: {e}"))?;
     let fc_log = console_log.with_file_name("firecracker.log");
-    let mut proc = FcProcess::spawn(
-        FcProcessConfig::new(&fc.path, api_sock)
-            .id(id)
-            .stdio(StdioMode::Piped)
-            .log_path(&fc_log)
-            .log_level(LogLevel::Warning)
-            .socket_timeout(Duration::from_secs(10)),
-    )
-    .await
-    .context("spawning firecracker")?;
+    let mut config = FcProcessConfig::new(&fc.path, api_sock)
+        .id(id)
+        .stdio(StdioMode::Piped)
+        .log_path(&fc_log)
+        .log_level(LogLevel::Warning)
+        .socket_timeout(Duration::from_secs(10));
+    // Jail exec-prefix (ISOPOD_JAIL=1). Empty when off, so `command_prefix` is
+    // never touched and the argv is byte-identical to the historical path.
+    if !prefix.is_empty() {
+        config = config.command_prefix(prefix);
+    }
+    let mut proc = FcProcess::spawn(config)
+        .await
+        .context("spawning firecracker")?;
     let stdout = proc
         .child_mut()
         .stdout
@@ -565,7 +570,9 @@ async fn drive_vm(
     vm_id: &str,
     opts: &DevBootOptions,
 ) -> Result<(f64, u32)> {
-    let (mut proc, stdout) = spawn_fc_piped(fc, api_sock, vm_id, console_log).await?;
+    // Dev boot is the dev-only path (not the untrusted run path), so it is not
+    // jailed even when ISOPOD_JAIL=1 — pass an empty prefix.
+    let (mut proc, stdout) = spawn_fc_piped(fc, api_sock, vm_id, console_log, Vec::new()).await?;
 
     // Tee guest serial (relayed on FC stdout) to console.log + a marker channel.
     let log = tokio::fs::File::create(console_log)
@@ -846,6 +853,12 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     // Validate the requested scratch size too (default when unset); an
     // out-of-range value errors here with no VM launched.
     let scratch_mib = resolve_scratch_mib(opts.scratch_mib)?;
+    // Fail fast on an unmet jail precondition before any artifact resolution or
+    // disk work — ISOPOD_JAIL=1 is an explicit hardening opt-in, never a silent
+    // best-effort. No-op (and no env read past the flag) when off.
+    if crate::jail::is_enabled() {
+        crate::jail::preflight().context("jail preflight (ISOPOD_JAIL=1)")?;
+    }
     let t_total = Instant::now();
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
@@ -948,6 +961,11 @@ async fn run_exec(
     // before `kill_on_drop` could fire (Ctrl-C, MCP-client timeout, SIGKILL) —
     // otherwise its held tap wedges that network slot (dogfood finding #7).
     registry::reap_orphans();
+    // Reclaim any empty leaf cgroups left by a crashed jailed run (no-op, and no
+    // env read, unless ISOPOD_JAIL=1 — the flag-off path is unchanged).
+    if crate::jail::is_enabled() {
+        crate::jail::sweep_stale_cgroups();
+    }
 
     let vm_id = generate_vm_id()?;
     let vm_dir = paths::vms_dir()?.join(&vm_id);
@@ -1001,6 +1019,19 @@ async fn run_exec(
         None => (None, None),
     };
 
+    // Prepare the rootless jail (ISOPOD_JAIL=1): per-VM cgroup + limits, chroot
+    // dir, and the exec-prefix that wraps both the cold-boot and warm-resume
+    // Firecracker spawns. Preflight already ran in `run_ephemeral`, so a setup
+    // failure here is a hard error — an explicit hardening opt-in must never
+    // silently fall back to running unjailed.
+    let jail_spec = if crate::jail::is_enabled() {
+        let binds = crate::jail::standard_binds(&vm_dir, &fc.path)?;
+        let devs = crate::jail::standard_devs(opts.network);
+        Some(crate::jail::setup(&vm_dir, resources, &binds, &devs)?)
+    } else {
+        None
+    };
+
     let boot = boot_and_exec(BootCtx {
         fc: &fc,
         kernel: &kernel,
@@ -1008,6 +1039,7 @@ async fn run_exec(
         resources,
         scratch_mib,
         warm_key: warm_key.as_ref(),
+        jail: jail_spec.as_ref(),
         net: net_slot.as_ref(),
         api_sock: &api_sock,
         vsock_uds: &vsock_uds,
@@ -1033,6 +1065,13 @@ async fn run_exec(
         if let Some(disk) = &boot.disk {
             cleanup_disk(disk);
         }
+    }
+
+    // Tear the jail's cgroup down (Firecracker is already reaped); the chroot
+    // skeleton goes with the VM dir. Best-effort, so it runs before the commit /
+    // exec results are surfaced below.
+    if let Some(spec) = &jail_spec {
+        crate::jail::teardown(spec);
     }
 
     // Surface a commit failure ahead of the exec result: the user explicitly
@@ -1204,6 +1243,11 @@ pub fn warmpool_build(base: RootfsFlavor, vcpus: u32, mem_mib: u32) -> Result<Wa
     }
     // Building attaches a NIC, so it needs the one-time host networking setup.
     require_network_setup()?;
+    // The builder cold-boots a Firecracker too, which is jailed when enabled;
+    // fail fast on an unmet jail precondition.
+    if crate::jail::is_enabled() {
+        crate::jail::preflight().context("jail preflight (ISOPOD_JAIL=1)")?;
+    }
     let resources = resources::resolve_for_host(vcpus, mem_mib)?;
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
@@ -1454,6 +1498,9 @@ struct BootCtx<'a> {
     /// The warm-pool snapshot key when this run is warm-eligible and its
     /// snapshot is present (`None` ⇒ always cold-boot).
     warm_key: Option<&'a SnapshotKey>,
+    /// The prepared rootless jail (`None` when `ISOPOD_JAIL` is off). Its prefix
+    /// wraps both the cold-boot and warm-resume Firecracker spawns.
+    jail: Option<&'a crate::jail::JailSpec>,
     /// Claimed network slot (`None` for `--no-network`).
     net: Option<&'a net::Slot>,
     api_sock: &'a Path,
@@ -1526,7 +1573,8 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
     // Warm path: resume the snapshot into the claimed slot.
     if let (Some(key), Some(slot)) = (ctx.warm_key, ctx.net) {
         let t_resume = Instant::now();
-        match snapshot::resume(key, &ctx.fc.path, slot, ctx.vm_dir).await {
+        let jail_prefix = ctx.jail.map(|j| j.prefix.clone()).unwrap_or_default();
+        match snapshot::resume(key, &ctx.fc.path, slot, ctx.vm_dir, jail_prefix).await {
             Ok((proc, agent)) => {
                 let resume_ms = t_resume.elapsed().as_millis() as u64;
                 let vm = BootedVm {
@@ -1584,8 +1632,9 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
 /// topology + NIC + hybrid vsock, and start. Returns the running VM plus the
 /// serial-drain handle to await at teardown.
 async fn cold_boot(ctx: &BootCtx<'_>, disk: &DiskConfig) -> Result<BootedVm> {
+    let prefix = ctx.jail.map(|j| j.prefix.clone()).unwrap_or_default();
     let (proc, stdout_pipe) =
-        spawn_fc_piped(ctx.fc, ctx.api_sock, ctx.vm_id, ctx.console_log).await?;
+        spawn_fc_piped(ctx.fc, ctx.api_sock, ctx.vm_id, ctx.console_log, prefix).await?;
 
     // Tee guest serial to console.log (no marker channel — readiness is vsock).
     let log = tokio::fs::File::create(ctx.console_log)

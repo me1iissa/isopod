@@ -69,23 +69,35 @@ The load-bearing controls are configured conservatively:
 - **Stages are immutable.** A committed stage is content-addressed (blake3) and never mutated; the host `cp --sparse`-copies and hashes the guest ext4 image but never mounts, `fsck`s, or `resize2fs`es it.
 - **Resource requests are bounded before boot.** Over-cap memory/vCPU requests are rejected cleanly, without booting a VM.
 - **`commit_as` labels are injection-safe.** Labels are stored as pure metadata; path-traversal, command-substitution, and argument-injection attempts produce content-addressed ids and sanitized names, never a host artifact.
+- **Guest egress is destination-filtered by default.** A networked guest reaches the public internet but **not** the host's private network: tap-sourced traffic to RFC1918, CGNAT (`100.64.0.0/10`), and link-local/metadata (`169.254.0.0/16`) is dropped, per-tap anti-spoofing pins each slot to its own source address, and IPv6 forwarding for guests is denied. (Operators who need LAN reachability opt in explicitly with `isopod setup --allow-lan-egress`.)
+
+---
+
+## Optional second isolation layer — the rootless jail
+
+isopod can wrap each Firecracker in a **rootless microjail** — set **`ISOPOD_JAIL=1`** in the environment of the runtime (CLI or MCP server). With no privileged host component it adds:
+
+- a **user + pid namespace** with a single-id map, so a VMM/KVM escape lands as an **unprivileged, unmapped uid on the host** (no host capabilities), not your account;
+- a **minimal chroot** (built from identity bind mounts) exposing only the VM's own files + `/dev/kvm` + the tap device — **your home directory and the rest of `~/.isopod` are not visible**;
+- a **per-VM cgroup v2 slice** with `memory.max` / `cpu.max` / `pids.max`, so a runaway guest is cgroup-OOM-killed and cannot exhaust host RAM, CPU, or pids.
+
+It requires an environment that supports it: unprivileged user namespaces, a delegated cgroup v2 subtree (a normal systemd user session), and membership in the `kvm` group. When enabled, isopod runs a preflight and **fails closed** with a clear message if any prerequisite is missing (it never silently runs unjailed). It is **opt-in in this release** for portability; enabling it is strongly recommended for untrusted or multi-tenant workloads.
 
 ---
 
 ## Known limitations (v1)
 
-isopod v1 is honest about its posture. State these limitations before running anything genuinely hostile or multi-tenant:
+isopod v1 is honest about its posture. State these before running anything genuinely hostile:
 
-- **Single-layer isolation.** v1 relies on Firecracker's seccomp filter + KVM alone. The second isolation layer — the **jailer** (chroot + dedicated uid + namespaces + cgroup v2 caps) — is planned for **v2**. Until it lands, treat isopod as **single-tenant**: a hypothetical VMM/KVM escape would land as your own user account, with access to the whole `~/.isopod` store.
-- **A networked guest can reach your whole routable network.** NAT egress is currently unrestricted by destination, so a guest with networking on can reach not just the public internet but anything the host can route to — including your **private LAN** (router admin pages, internal services, other machines on the subnet) and, on a cloud host, the instance metadata endpoint. Destination-filtered (public-only) egress is planned. **Until then, run untrusted code with `--no-network` (CLI) / `network=false` (MCP).**
-- **Resource-exhaustion hardening is in progress.** Output-log size caps, an outer run deadline / vsock read timeouts, a concurrent-VM memory governor, and per-drive/NIC rate limiters are still being built. A single untrusted run can currently fill host disk with log output, and many concurrent VMs can over-commit host RAM. Prefer bounded, trusted workloads and prune the store (`vm_gc`) until these land.
+- **Without `ISOPOD_JAIL=1`, isolation is single-layer.** The default path relies on Firecracker's seccomp filter + KVM alone; a hypothetical VMM/KVM escape would land as your own user account with access to the whole `~/.isopod` store. Enable the jail (above) — or treat the host as **single-tenant** — before running mutually distrusting workloads.
+- **Some resource-exhaustion hardening is still in progress.** Exec/serial **output logs are not yet size-capped** (a single run can fill host disk with output), and there is **no global governor across concurrent VMs** (the jail's `memory.max` bounds each VM, but many unjailed VMs can still over-commit host RAM). Per-drive/NIC bandwidth rate limiters are also not yet wired. Prefer bounded workloads and prune the store (`vm_gc`) until these land.
 
 ---
 
 ## Guidance for operators
 
-- **Run untrusted or adversarial code with networking off.** `isopod run --no-network -- …` / `sandbox_run(..., network=false)`.
-- **Keep it single-tenant** on v1 — do not use one isopod host to isolate mutually distrusting tenants from each other.
+- **Enable the jail for untrusted code:** set `ISOPOD_JAIL=1` for the runtime, and/or run adversarial code with networking off (`isopod run --no-network -- …` / `sandbox_run(..., network=false)`).
+- **Keep it single-tenant** unless the jail is enabled — do not rely on one unjailed isopod host to isolate mutually distrusting tenants from each other.
 - **Do not bake secrets into a stage** that will be forked and shared; forks inherit the stage's contents.
 - **Prune regularly.** `vm_gc` reaps orphaned Firecracker processes and old VM record directories; `stage_rm` removes stages you no longer need.
 

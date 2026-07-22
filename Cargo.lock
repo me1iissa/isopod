@@ -905,6 +905,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "isopod-jail"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "isopod-mcp"
 version = "0.1.0"
 dependencies = [
