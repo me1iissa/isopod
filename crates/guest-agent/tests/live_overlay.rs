@@ -457,3 +457,90 @@ async fn live_overlay_stage_chain() {
         outs[0]
     );
 }
+
+/// Boot `base` (ro `/dev/vda`) with `isopod.upper=ram` and **no scratch drive**,
+/// wait for the agent, run one script, halt. Verifies the warm-pool tmpfs-upper
+/// path (M6): the overlay upper lives in guest RAM, so a snapshot needs no
+/// external scratch backing-file whose path could collide across resumes.
+#[tokio::test]
+#[ignore = "requires ISOPOD_FC_BIN/KERNEL, ISOPOD_BASE_SQFS, and /dev/kvm"]
+async fn live_upper_ram_no_scratch() {
+    let (Some(fc_bin), Some(kernel), Some(base)) = (
+        env_path("ISOPOD_FC_BIN"),
+        env_path("ISOPOD_FC_KERNEL"),
+        env_path("ISOPOD_BASE_SQFS"),
+    ) else {
+        eprintln!("SKIP: set ISOPOD_FC_BIN, ISOPOD_FC_KERNEL, ISOPOD_BASE_SQFS");
+        return;
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+    let api_sock = work.path().join("ram-api.sock");
+    let vsock_uds = work.path().join("ram-vsock.sock");
+
+    let mut proc = FcProcess::spawn(
+        FcProcessConfig::new(&fc_bin, &api_sock)
+            .id(VmId::new("iso-upper-ram").expect("valid id"))
+            .stdio(if std::env::var_os("ISOPOD_AGENT_SERIAL").is_some() {
+                StdioMode::Inherit
+            } else {
+                StdioMode::Null
+            })
+            .socket_timeout(Duration::from_secs(10)),
+    )
+    .await
+    .expect("spawn firecracker");
+
+    let client = proc.client().expect("client");
+    client
+        .put_machine_config(&MachineConfig::new(1, 512))
+        .await
+        .expect("machine-config");
+    // upper=ram, NO isopod.layers, and crucially NO scratch drive attached.
+    let cmdline = format!("{BOOT_ARGS} isopod.upper=ram");
+    client
+        .put_boot_source(&BootSource::new(kernel.to_string_lossy(), &cmdline))
+        .await
+        .expect("boot-source");
+    client
+        .put_drive(&Drive::virtio("rootfs", base.to_string_lossy(), true, true))
+        .await
+        .expect("drive base");
+    client
+        .put_vsock(&Vsock::new(GUEST_CID, vsock_uds.to_string_lossy()))
+        .await
+        .expect("vsock");
+    client.instance_start().await.expect("InstanceStart");
+    assert!(
+        wait_running(&client, Duration::from_secs(10)).await,
+        "guest never reached Running"
+    );
+    let pong = wait_for_agent(&vsock_uds, Duration::from_secs(10))
+        .await
+        .expect("agent answered");
+    assert!(matches!(pong.body, ResponseBody::Pong { .. }), "ping ok");
+
+    // No scratch drive was attached (only the ro base), so the overlay upper can
+    // ONLY be the tmpfs: a writable overlay root here IS the proof. (The backing
+    // /overlay tmpfs mount is pinned internally by overlayfs and not visible in
+    // the post-pivot /proc/mounts, same as the scratch drive in the drive path.)
+    let out = run_script(
+        &vsock_uds,
+        1,
+        "grep '^overlay / ' /proc/mounts; echo hi > /root/f && cat /root/f",
+    )
+    .await;
+    eprintln!("upper=ram mounts+write:\n{}", out.stdout);
+    assert_eq!(out.exit_code, Some(0), "exit 0");
+    assert!(out.stdout.contains("overlay / overlay"), "overlay is root");
+    assert!(
+        out.stdout.contains("upperdir=/overlay/upper"),
+        "overlay upper is at the RAM-backed /overlay"
+    );
+    assert!(
+        out.stdout.contains("hi"),
+        "write to the RAM-backed root works"
+    );
+
+    let _ = rpc_single(&vsock_uds, 99, RequestOp::Halt { sync: false }).await;
+    let _ = proc.shutdown(Duration::from_secs(3)).await;
+}

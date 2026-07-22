@@ -29,6 +29,25 @@ pub enum RequestOp {
         /// Nanosecond remainder.
         nanos: u32,
     },
+    /// Reconfigure the guest's IPv4 networking at runtime.
+    ///
+    /// Sent after a snapshot restore retargets the virtio-net backend to a new
+    /// host tap: the restored guest keeps the same NIC *device* but its stale
+    /// boot-time addressing must be replaced with the claimed slot's. The guest
+    /// fully replaces `eth0`'s address, netmask, default route, and resolver
+    /// config (the same ioctl path as boot-time configuration). Replies
+    /// [`ResponseBody::Ok`] on success or [`ResponseBody::Error`] on failure
+    /// (e.g. an unparseable address or a missing NIC).
+    ConfigureNet {
+        /// Guest IPv4 address in CIDR form, e.g. `"10.107.3.2/30"`.
+        ip: String,
+        /// Default gateway, e.g. `"10.107.3.1"`. An empty string means "no
+        /// gateway" (the default route is left cleared).
+        gw: String,
+        /// DNS resolvers (dotted-quad strings) written to `/etc/resolv.conf`;
+        /// malformed entries are dropped. Empty leaves `resolv.conf` untouched.
+        dns: Vec<String>,
+    },
     /// Write a file into the guest (single-frame; fits within `MAX_FRAME_LEN`).
     PutFile {
         /// Absolute destination path in the guest.
@@ -170,6 +189,25 @@ mod tests {
         assert_eq!(
             json,
             r#"{"id":7,"op":{"op":"exec","argv":["echo","hi"],"timeout_ms":1000}}"#
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn configure_net_json_shape_is_stable() {
+        let req = Request {
+            id: 5,
+            op: RequestOp::ConfigureNet {
+                ip: "10.107.3.2/30".into(),
+                gw: "10.107.3.1".into(),
+                dns: vec!["1.1.1.1".into()],
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":5,"op":{"op":"configure_net","ip":"10.107.3.2/30","gw":"10.107.3.1","dns":["1.1.1.1"]}}"#
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);

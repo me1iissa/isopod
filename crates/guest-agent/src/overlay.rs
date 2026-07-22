@@ -1,18 +1,17 @@
-//! Stage overlay-root assembly.
+//! Overlay-root assembly, in two flavors that share the same overlay mount +
+//! `pivot_root` tail.
 //!
-//! When the kernel command line carries `isopod.layers=<N>`, the guest was
-//! booted from the read-only squashfs base at `/dev/vda` with `N` committed
-//! stage layers and one fresh writable scratch drive attached after it. Firecracker
-//! exposes virtio-blk drives as `/dev/vda`, `/dev/vdb`, … in PUT order, so past
-//! the `vda` root the **last** extra device is the scratch and the **first `N`**
-//! are the committed stage layers (bottom-to-top).
+//! **Drive-backed stage mode (`isopod.layers=<N>`).** The guest was booted from
+//! the read-only squashfs base at `/dev/vda` with `N` committed stage layers and
+//! one fresh writable scratch drive attached after it. Firecracker exposes
+//! virtio-blk drives as `/dev/vda`, `/dev/vdb`, … in PUT order, so past the `vda`
+//! root the **last** extra device is the scratch and the **first `N`** are the
+//! committed stage layers (bottom-to-top). Assembly:
 //!
-//! [`assemble_if_requested`] turns that topology into a single writable root:
-//!
-//! 1. Mount the scratch ext4 read-write at `/overlay` and create the overlay
-//!    `upper`/`work` directories on it.
+//! 1. Mount the scratch ext4 read-write at `/overlay`.
 //! 2. Mount each committed stage layer read-only at `/layers/<i>` (1-based).
-//! 3. Perform **one** multi-lowerdir overlay mount at `/mnt`
+//! 3. Create the overlay `upper`/`work` dirs on `/overlay` and perform **one**
+//!    multi-lowerdir overlay mount at `/mnt`
 //!    (`lowerdir=/layers/N/upper:…:/layers/1/upper:/`, topmost first, the
 //!    squashfs base `/` as the bottom layer; `upperdir=/overlay/upper`,
 //!    `workdir=/overlay/work`, `redirect_dir=on`) — never overlay-on-overlay,
@@ -23,8 +22,16 @@
 //! its meaningful tree (files, whiteouts, `trusted.overlay.*` xattrs) lives under
 //! its `/upper` subdirectory — that is what the lowerdir chain points at.
 //!
-//! Absent the `isopod.layers` key the agent boots exactly as before (a writable
-//! ext4 root needs no overlay).
+//! **RAM-upper mode (`isopod.upper=ram`, with no `isopod.layers` or `=0`).** The
+//! warm-pool topology: there is **no scratch drive** at all (a per-VM scratch file
+//! at a shared baked path would collide across concurrent snapshot restores).
+//! Instead the overlay `upper`/`work` live on a **tmpfs** mounted at `/overlay`,
+//! captured inside the memory snapshot, so all writes land in guest RAM (bounded
+//! by `mem_mib`). The overlay is base-only (`lowerdir=/`). Steps 3–4 are shared
+//! with the drive-backed path via [`assemble_overlay_and_pivot`].
+//!
+//! Absent both keys the agent boots exactly as before (a writable ext4 root needs
+//! no overlay).
 
 use std::io;
 
@@ -35,14 +42,22 @@ use crate::sys::{self, MS_NOATIME, MS_RDONLY};
 /// Command-line key whose presence switches the agent into overlay-root mode;
 /// the value is the committed stage-layer count (`>= 0`).
 const LAYERS_KEY: &str = "isopod.layers";
+/// Command-line key selecting the overlay upper-dir backing. The only recognized
+/// value is [`UPPER_RAM`]; any other value (or absence) uses the drive-backed
+/// scratch.
+const UPPER_KEY: &str = "isopod.upper";
+/// [`UPPER_KEY`] value selecting a tmpfs (guest-RAM) overlay upper — the warm-pool
+/// mode with no scratch drive.
+const UPPER_RAM: &str = "ram";
 
 /// Staging mountpoint for the merged overlay before `pivot_root` makes it `/`.
 const STAGING: &str = "/mnt";
-/// Writable scratch (overlay upper backing) mountpoint inside the base image.
+/// Overlay upper-backing mountpoint inside the base image: an ext4 scratch drive
+/// in drive-backed mode, or a tmpfs in RAM-upper mode.
 const SCRATCH_MNT: &str = "/overlay";
-/// Overlay upperdir (on the scratch fs).
+/// Overlay upperdir (on the upper-backing fs).
 const UPPER_DIR: &str = "/overlay/upper";
-/// Overlay workdir (on the scratch fs, sibling of the upperdir).
+/// Overlay workdir (on the upper-backing fs, sibling of the upperdir).
 const WORK_DIR: &str = "/overlay/work";
 
 /// Assemble the stage overlay root **iff** `/proc/cmdline` requests it.
@@ -59,18 +74,56 @@ pub fn assemble_if_requested() {
             return;
         }
     };
-    let Some(n_layers) = parse_layers(&cmdline) else {
-        // Legacy boot: no `isopod.layers` key ⇒ writable ext4 root, no overlay.
-        return;
+    let layers = parse_layers(&cmdline);
+    let upper = parse_upper(&cmdline);
+    // Assemble an overlay root when EITHER the stage topology (`isopod.layers`)
+    // or the RAM-upper warm-pool mode (`isopod.upper=ram`) is requested. With
+    // neither, this is a legacy writable-ext4-root boot and we do nothing.
+    let n_layers = match (layers, upper) {
+        (Some(n), _) => n,
+        (None, UpperMode::Ram) => 0, // warm-pool base: RAM upper, no committed layers
+        (None, UpperMode::Drive) => return,
     };
-    match assemble(n_layers) {
+    match assemble(n_layers, upper) {
         Ok(()) => log(&format!(
-            "overlay: stage root assembled (layers={n_layers})"
+            "overlay: stage root assembled (layers={n_layers}, upper={})",
+            upper.as_str()
         )),
         Err(e) => log(&format!(
-            "overlay: FAILED to assemble stage root (layers={n_layers}): {e}; \
-             continuing on the read-only base root"
+            "overlay: FAILED to assemble stage root (layers={n_layers}, upper={}): {e}; \
+             continuing on the read-only base root",
+            upper.as_str()
         )),
+    }
+}
+
+/// Where the overlay `upper`/`work` dirs live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpperMode {
+    /// A writable ext4 **scratch drive** (the last extra block device) — the
+    /// durable path that can be committed as a stage.
+    Drive,
+    /// A **tmpfs** in guest RAM — the warm-pool path: no scratch drive, so the
+    /// whole VM (upper included) is captured in a memory snapshot and no
+    /// per-VM disk backing-file path can collide across concurrent resumes.
+    Ram,
+}
+
+impl UpperMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpperMode::Drive => "drive",
+            UpperMode::Ram => "ram",
+        }
+    }
+}
+
+/// Parse `isopod.upper=<mode>`; only `ram` selects the tmpfs upper, everything
+/// else (including absence) is the drive-backed scratch.
+fn parse_upper(cmdline: &str) -> UpperMode {
+    match cmdline::value(cmdline, UPPER_KEY) {
+        Some(v) if v == UPPER_RAM => UpperMode::Ram,
+        _ => UpperMode::Drive,
     }
 }
 
@@ -85,7 +138,7 @@ fn parse_layers(cmdline: &str) -> Option<usize> {
 }
 
 /// Do the actual scratch/layer mounts, the single overlay mount, and the pivot.
-fn assemble(n_layers: usize) -> io::Result<()> {
+fn assemble(n_layers: usize, upper: UpperMode) -> io::Result<()> {
     // Private propagation so `pivot_root` is not blocked by shared mounts.
     if let Err(e) = sys::make_root_private() {
         log(&format!(
@@ -93,21 +146,42 @@ fn assemble(n_layers: usize) -> io::Result<()> {
         ));
     }
 
+    // Mount the overlay upper backing at /overlay, and resolve the committed
+    // stage-layer block devices. In drive mode the LAST extra device is the
+    // writable scratch (upper lives on it); in RAM mode there is no scratch
+    // drive at all — the upper is a tmpfs — so every extra device is a layer.
     let extras = enumerate_extra_block_devices()?;
-    let (scratch, layers) = split_scratch_and_layers(&extras, n_layers)?;
-    if extras.len() != n_layers + 1 {
-        log(&format!(
-            "overlay: layers={n_layers} implies {} extra drive(s) but found {} ({extras:?}); \
-             using the last as scratch and the first {} as layers",
-            n_layers + 1,
-            extras.len(),
-            layers.len()
-        ));
-    }
-
-    // Writable scratch → /overlay; the overlay upper/work dirs live on it.
-    sys::mount_with_data(&scratch, SCRATCH_MNT, "ext4", MS_NOATIME, None)
-        .map_err(|e| annotate(e, &format!("mount scratch {scratch} at {SCRATCH_MNT}")))?;
+    let layers: Vec<String> = match upper {
+        UpperMode::Drive => {
+            let (scratch, layers) = split_scratch_and_layers(&extras, n_layers)?;
+            if extras.len() != n_layers + 1 {
+                log(&format!(
+                    "overlay: layers={n_layers} implies {} extra drive(s) but found {} ({extras:?}); \
+                     using the last as scratch and the first {} as layers",
+                    n_layers + 1,
+                    extras.len(),
+                    layers.len()
+                ));
+            }
+            sys::mount_with_data(&scratch, SCRATCH_MNT, "ext4", MS_NOATIME, None)
+                .map_err(|e| annotate(e, &format!("mount scratch {scratch} at {SCRATCH_MNT}")))?;
+            layers
+        }
+        UpperMode::Ram => {
+            if extras.len() != n_layers {
+                log(&format!(
+                    "overlay: upper=ram layers={n_layers} implies {n_layers} layer drive(s) \
+                     but found {} ({extras:?}); using the first {n_layers} as layers",
+                    extras.len(),
+                ));
+            }
+            // A fresh tmpfs upper — no size cap (defaults to half of RAM), which
+            // the guest's mem_mib already bounds. Nothing to enumerate as scratch.
+            sys::mount_with_data("tmpfs", SCRATCH_MNT, "tmpfs", MS_NOATIME, None)
+                .map_err(|e| annotate(e, &format!("mount tmpfs upper at {SCRATCH_MNT}")))?;
+            extras.iter().take(n_layers).cloned().collect()
+        }
+    };
     std::fs::create_dir_all(UPPER_DIR)?;
     std::fs::create_dir_all(WORK_DIR)?;
 

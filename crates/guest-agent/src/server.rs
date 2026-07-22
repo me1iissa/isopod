@@ -13,6 +13,7 @@ use isopod_proto::{
 
 use crate::conn::Conn;
 use crate::exec;
+use crate::net;
 use crate::reaper::Reaper;
 use crate::sys;
 
@@ -84,6 +85,13 @@ fn dispatch(conn: &Conn, req: Request, reaper: &Reaper) {
         RequestOp::SyncClock { unix_secs, nanos } => {
             let res = sys::set_realtime(unix_secs as i64, nanos as i64);
             reply(conn, id, res.map(|()| ResponseBody::Ok));
+        }
+        RequestOp::ConfigureNet { ip, gw, dns } => {
+            reply(
+                conn,
+                id,
+                net::configure(&ip, &gw, &dns).map(|()| ResponseBody::Ok),
+            );
         }
         RequestOp::PutFile {
             path,

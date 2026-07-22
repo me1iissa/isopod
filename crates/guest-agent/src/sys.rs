@@ -478,6 +478,21 @@ pub fn set_if_up(ifname: &str) -> io::Result<()> {
     ioctl_ifreq(libc::SIOCSIFFLAGS as libc::Ioctl, &mut req)
 }
 
+/// Bring interface `ifname` down: read its flags (`SIOCGIFFLAGS`), clear
+/// `IFF_UP | IFF_RUNNING`, and write them back (`SIOCSIFFLAGS`).
+///
+/// The kernel flushes the interface's address-derived and gateway routes when it
+/// goes down, so this is the clean-slate step of a full network *replacement*
+/// (see [`crate::net`]). Returns `ENODEV` when the interface does not exist.
+pub fn set_if_down(ifname: &str) -> io::Result<()> {
+    let mut req = Ifreq::new(ifname)?;
+    ioctl_ifreq(libc::SIOCGIFFLAGS as libc::Ioctl, &mut req)?;
+    let mut flags = i16::from_ne_bytes([req.ifru[0], req.ifru[1]]);
+    flags &= !((libc::IFF_UP | libc::IFF_RUNNING) as i16);
+    req.ifru[0..2].copy_from_slice(&flags.to_ne_bytes());
+    ioctl_ifreq(libc::SIOCSIFFLAGS as libc::Ioctl, &mut req)
+}
+
 /// Add the IPv4 default route via gateway `gw` (`SIOCADDRT` with an
 /// `RTF_UP | RTF_GATEWAY` rtentry; destination and genmask `0.0.0.0`).
 pub fn add_default_route(gw: [u8; 4]) -> io::Result<()> {
@@ -504,6 +519,43 @@ pub fn add_default_route(gw: [u8; 4]) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Delete the IPv4 default route (`SIOCDELRT` with a `dst`/`genmask` of
+/// `0.0.0.0`, no gateway specified so it matches regardless of the current
+/// next-hop). "No such route" (`ESRCH`/`ENOENT`) is treated as success, so this
+/// is a safe clear-then-add primitive: on first boot there is no default route,
+/// and on a runtime reconfigure it removes whichever gateway was previously set.
+pub fn del_default_route() -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `rtentry` is plain-old-data; an all-zero bit pattern is a valid
+    // empty route that we immediately fill in.
+    let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+    rt.rt_dst = sockaddr_v4([0, 0, 0, 0]);
+    rt.rt_genmask = sockaddr_v4([0, 0, 0, 0]);
+    // No RTF_GATEWAY / rt_gateway: the kernel then matches the 0/0 route by
+    // destination alone, deleting it whatever its next-hop.
+    rt.rt_flags = libc::RTF_UP;
+    let sock = inet_dgram_socket()?;
+    // SAFETY: `&mut rt` is a live, fully-initialized `rtentry`; `SIOCDELRT` reads
+    // exactly that struct through the pointer; `sock` is a valid `AF_INET` socket
+    // held for the duration of the call.
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            libc::SIOCDELRT as libc::Ioctl,
+            &mut rt as *mut libc::rtentry,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // No default route present (fresh boot, or already cleared): success.
+        Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(()),
+        _ => Err(err),
     }
 }
 

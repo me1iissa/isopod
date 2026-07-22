@@ -29,7 +29,14 @@ pub const VSOCK_PORT: u32 = 52;
 
 /// Protocol version; bump on any incompatible wire change. Exchanged in
 /// `Ping`/`Pong` so mismatched host/guest pairs fail fast and loud.
-pub const PROTO_VERSION: u32 = 1;
+///
+/// * v1 — initial contract (`Ping`, `Exec`, `SyncClock`, `PutFile`, `GetFile`,
+///   `Halt`).
+/// * v2 — added [`RequestOp::ConfigureNet`] for runtime network reconfiguration
+///   after a warm-pool snapshot restore. Additive on the wire (a new tagged
+///   variant), but the host must know the guest speaks it before retargeting a
+///   restored NIC, so the version is bumped.
+pub const PROTO_VERSION: u32 = 2;
 
 /// Hard cap on a single frame's JSON payload (base64 overhead included).
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
