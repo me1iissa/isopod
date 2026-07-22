@@ -165,3 +165,101 @@ all **warm-resumed from the one shared 512 MiB snapshot**, each claimed a **dist
 with its own `/30`, all exited 0 with NET-OK, and left **zero leaks** (no firecracker procs, no
 held slot locks). The `O_EXCL` slot-claim is race-free under real contention and concurrent
 resume from a single read-only memfile is safe — the core multi-agent model holds under load.
+
+## 2026-07-22 — MCP v2 gauntlet (post-restart, all-MCP) + self-build **via MCP**
+
+Session restart picked up the proto-v2 `isopod-mcp` binary; the whole surface was re-verified
+**through the MCP tools alone**: a 6-agent workflow ran ~37 scenarios (exec semantics, stage
+lifecycle, network/F1, resource caps, toolchain, warm pool) with an adversarial coverage critic,
+plus inline probes. Headline: **the full workspace now builds inside an isopod sandbox driven
+end-to-end over MCP** — clean debug build 2 m 05.9 s (4 vcpu / 3072 MiB / 8 GiB scratch, crates.io
+downloads included), committed as stage `isopod-build` (1.53 GiB layer, +34.3 s commit),
+**incremental rebuild 6.93 s** from a fork, `cargo test -p isopod-proto -p isopod-fc` green in
+39.6 s, release `isopod` in 2 m 35 s, and the binary **extracted byte-exact to the host**
+(stdout log 14,300,661 B complete; decoded 10,585,920 B, sha256 match) where it runs directly —
+`file`: static-pie musl, no loader dependency. Chain: `rust-stable` → `isopod-src` →
+`isopod-build`, both new stages retained for future builds (see `docs/sandbox-build.md`).
+
+**Corrections to the 2026-07-22 self-build entry above:**
+- **cmake was never in base-alpine.** `ALPINE_PACKAGES` (rootfs.rs) never listed it and
+  `git log -S cmake` on the file is empty; `cmake --version` in-guest fails. #15's
+  "python/node/git/gcc/make/cmake" list and the retracted-hypothesis note ("ships cmake for
+  node-gyp") were wrong — aws-lc-sys built via its cc path with **no cmake present**.
+- **The warm pool DOES engage via MCP** — but invisibly, and two gauntlet agents misdiagnosed it
+  as broken (a warm-eligible run's console.log is 121 B: agent re-IP line only, no kernel boot).
+  What looked like a "provably cold" comparator (2 c/1024 MiB) had silently **built its own
+  snapshot on first use** (5.4 s) and warm-resumed afterwards. End-to-end: warm ≈ 430 ms,
+  cold ext4 path ≈ 570–700 ms, first-use-of-a-shape snapshot build ≈ 5.4 s. The M6 "resume
+  52–72 ms" figure is the restore step, not wall time. See #20.
+
+18. **[open] MED — a bad `cwd` fails blaming `/bin/sh`, not the missing directory.**
+    `sandbox_run` with `cwd="/no/such/dir"` returns exit 127 with stderr
+    `isopod-exec: /bin/sh: No such file or directory (os error 2)` — the natural read is "the
+    image has no shell" (and 127 usually means command-not-found), a wrong-way debugging lead.
+    → isopod-exec should check/chdir the cwd first and report `cwd '/no/such/dir': No such
+    file or directory`.
+
+19. **[open] MED — stale-proto guest failure is masked by a tap error on the networked path.**
+    `base-sqfs` (still proto v1, #17) with default networking fails as `Open tap device failed:
+    … Device or resource busy … Invalid TUN/TAP Backend provided by isopod-tap0` (reproduced
+    twice; base-alpine on the same slot works immediately after) — pointing at host networking
+    instead of the real cause. Only `network=false` surfaces the correct `guest agent protocol
+    version 1 does not match host 2`. → surface the proto mismatch before/instead of the tap
+    error; also worth checking whether any cold boot can transiently collide with a
+    warm-pool-held tap.
+
+20. **[open] LOW — MCP result JSON omits boot-path and commit-cost observability.** The CLI
+    result has `path: "cold"|"warm"`; the MCP result doesn't, which is exactly why the warm pool
+    was misdiagnosed mid-gauntlet. `commit_as` runs also fold commit time into `total_ms`
+    (1612 ms total vs 41 ms exec on a trivial commit; ~34 s for a 1.53 GiB layer ≈ 20 s/GiB).
+    → add `path` (incl. distinguishing "snapshot-build" from plain cold) and `commit_ms` to the
+    MCP result.
+
+21. **[open] LOW — no first-class host↔guest file channel.** Payload-in: MCP `stdin` transits
+    model context twice, so the 290 KB source tarball (~75 k tokens) is unusable over MCP —
+    injection had to use CLI `--stdin-file` (which worked perfectly). Artifact-out: base64 over
+    stdout is lossless (log file byte-exact at 14.3 MB) but floods the tool result with a
+    truncated blob. → `sandbox_run` `stdin_file` (host path) + a copy-out parameter (guest path →
+    host file); a git remote will also fix source-in.
+
+22. **[note] — parallel `sandbox_run` tool calls in ONE Claude message execute serially.** Six
+    batched calls all ran on slot 0 at ~3.3 s each (a genuine overlap would force distinct
+    slots). Client-side behavior, not a server bug: concurrent requests from *separate* agent
+    processes interleaved fine during the gauntlet (slots 0/1 held simultaneously), matching the
+    6-way CLI proof. Guidance for agents: fan out via subagents for parallel sandboxes.
+
+23. **[note] — guest hostname is `(none)`.** `$(hostname)` in-guest prints `(none)`; setting it
+    to the vanity VM name (e.g. `lucent-cryptarch`) would improve log/prompt ergonomics.
+
+24. **[note] — rootfs.rs comment implies in-guest `apk add`, but no apk ships.** The
+    keep-parent-dirs comment says "so an online guest can `apk add` more packages later", yet
+    `command -v apk apk.static` finds nothing in-guest (re-verified). Align the comment with
+    however #15 is resolved.
+
+**Positive re-verifications (all via MCP):**
+- **F1 egress proven against a live service**: host connects to its own LAN listener
+  `192.168.3.207:3478` instantly; the guest gets a filtered **timeout** on that same listening
+  port, and on gateway:80, and on RFC1918/link-local probes — while DNS through the gateway
+  works. Drop-not-refused + live-listener evidence closes the "maybe nothing was there" gap.
+- Truncation: 600 KB stdout → in-band string capped, `stdout_truncated=true`, `stdout_bytes`
+  exact, log file complete (verified byte-exact at 14.3 MB during extraction). Binary stdout is
+  lossy U+FFFD in JSON but byte-accurate in the log; `stdout_bytes` counts raw bytes.
+- Resource-cap errors are uniformly self-serve (vcpus 1-or-even w/ examples; host CPU cap;
+  128 MiB mem floor; over-mem shows the full headroom arithmetic; scratch range 128..=65536).
+- Stage model: commit-on-zero only (exit 3 → no stage), chain/parent info correct, whiteouts
+  work, parents immutable, `stage_rm` protection names every dependent by id+label (excellent),
+  child-first removal clean; label + vanity-name + full-id resolution work (id *prefix* is not
+  supported — fine per docs, but docker/git-style unique-prefix ids would be nicer).
+- Timeout shape: `timed_out=true, exit_code=null, signal=9`, partial stdout preserved.
+- `network=false`: no NIC (fields absent from result), exec fine over vsock; offline forks of a
+  pip-carrying stage import the package with no network.
+- Quoting/UTF-8/env/cwd/stdin (12 B and 8 KB) all exact.
+
+**Next-gauntlet checklist** (from the adversarial coverage critic — none ever covered):
+duplicate + concurrent `commit_as` labels; timeout during boot/commit and whether `commit_as`
+fires on `timed_out`; stderr truncation + dual-stream flood (pipe-deadlock class); unconsumed
+stdin (EPIPE) and 64 KB–1 MB stdin; hostile labels (unicode, `../x`, very long) and env names
+(`=`, empty, PATH/HOME override); opaque-dir whiteouts (`rm -rf` + recreate) and 8–16-layer
+chains; `cwd` into stage-created/whiteouted dirs; VM-record/exec-log retention under a
+long-lived MCP server (`vm_gc` semantics, dangling `*_log_path`); ICMP egress; nonexistent
+command via MCP (#3 regression probe).
