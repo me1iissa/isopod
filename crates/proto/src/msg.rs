@@ -64,6 +64,23 @@ pub enum RequestOp {
         /// Refuse to return more than this many raw bytes.
         max_bytes: u64,
     },
+    /// Stream a file out of the guest: `FileChunk`* then exactly one `FileDone`
+    /// (mirrors the Exec streaming contract, so there is no frame-size ceiling
+    /// on the file). An `Error` before the first chunk means nothing was read.
+    CopyOut {
+        /// Absolute source path in the guest.
+        path: String,
+        /// Refuse to stream a file larger than this many raw bytes (checked
+        /// up-front against the file's size, before the first chunk).
+        max_bytes: u64,
+    },
+    /// Set the guest's hostname (the VM's vanity name). Re-sent on every warm
+    /// resume, exactly like `ConfigureNet`, because the snapshot bakes the
+    /// builder VM's name. Replies [`ResponseBody::Ok`].
+    SetHostname {
+        /// The hostname to set (e.g. `lucent-cryptarch`).
+        name: String,
+    },
     /// Sync filesystems and power off the guest.
     Halt {
         /// If true, `sync()` before powering off.
@@ -137,6 +154,18 @@ pub enum ResponseBody {
     File {
         /// File contents, base64.
         data_b64: String,
+        /// Unix mode bits of the source file.
+        mode: u32,
+    },
+    /// One chunk of a `CopyOut` stream (≤ `EXEC_CHUNK_LEN` raw bytes).
+    FileChunk {
+        /// Chunk contents, base64.
+        data_b64: String,
+    },
+    /// `CopyOut` finished; exactly one per copy, always last.
+    FileDone {
+        /// Total raw bytes streamed (the file's size).
+        total_bytes: u64,
         /// Unix mode bits of the source file.
         mode: u32,
     },
@@ -231,6 +260,56 @@ mod tests {
         );
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn copy_out_json_shape_is_stable() {
+        let req = Request {
+            id: 9,
+            op: RequestOp::CopyOut {
+                path: "/root/src/target/release/isopod".into(),
+                max_bytes: 1 << 30,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":9,"op":{"op":"copy_out","path":"/root/src/target/release/isopod","max_bytes":1073741824}}"#
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+
+        let done = Response {
+            id: 9,
+            body: ResponseBody::FileDone {
+                total_bytes: 42,
+                mode: 0o755,
+            },
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":9,"body":{"kind":"file_done","total_bytes":42,"mode":493}}"#
+        );
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, done);
+    }
+
+    #[test]
+    fn set_hostname_json_shape_is_stable() {
+        let req = Request {
+            id: 4,
+            op: RequestOp::SetHostname {
+                name: "lucent-cryptarch".into(),
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":4,"op":{"op":"set_hostname","name":"lucent-cryptarch"}}"#
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

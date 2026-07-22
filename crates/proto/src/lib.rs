@@ -13,7 +13,9 @@
 //!
 //! Exec is streamed: the guest sends any number of `ExecStream` responses
 //! (stdout/stderr chunks, ≤ [`EXEC_CHUNK_LEN`] raw bytes each) followed by
-//! exactly one `ExecDone`.
+//! exactly one `ExecDone`. CopyOut streams likewise: any number of `FileChunk`
+//! responses followed by exactly one `FileDone` (an error before the first
+//! chunk means nothing was read).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -36,7 +38,12 @@ pub const VSOCK_PORT: u32 = 52;
 ///   after a warm-pool snapshot restore. Additive on the wire (a new tagged
 ///   variant), but the host must know the guest speaks it before retargeting a
 ///   restored NIC, so the version is bumped.
-pub const PROTO_VERSION: u32 = 2;
+/// * v3 — added [`RequestOp::SetHostname`] (guest hostname = the VM's vanity
+///   name, re-applied on every warm resume) and the streamed
+///   [`RequestOp::CopyOut`] / [`ResponseBody::FileChunk`] /
+///   [`ResponseBody::FileDone`] guest→host file channel (unlike the
+///   single-frame `GetFile`, it has no `MAX_FRAME_LEN` size ceiling).
+pub const PROTO_VERSION: u32 = 3;
 
 /// Hard cap on a single frame's JSON payload (base64 overhead included).
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;

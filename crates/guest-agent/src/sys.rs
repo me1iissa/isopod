@@ -126,6 +126,20 @@ pub fn set_realtime(secs: i64, nanos: i64) -> io::Result<()> {
     }
 }
 
+/// Set the guest's hostname (`sethostname(2)`). The kernel caps the length at
+/// `HOST_NAME_MAX` (64); an over-long name fails with `EINVAL`.
+pub fn set_hostname(name: &str) -> io::Result<()> {
+    let bytes = name.as_bytes();
+    // SAFETY: the pointer/length pair references a live byte slice for the
+    // duration of the call; the kernel copies at most `len` bytes from it.
+    let rc = unsafe { libc::sethostname(bytes.as_ptr().cast(), bytes.len()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Create, bind, and listen an `AF_VSOCK` stream socket on `port`, bound to
 /// `VMADDR_CID_ANY` so it accepts host-initiated connections.
 pub fn vsock_listener(port: u32) -> io::Result<OwnedFd> {

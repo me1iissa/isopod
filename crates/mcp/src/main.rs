@@ -140,6 +140,22 @@ struct SandboxRunParams {
     /// by warm resumes (which use a RAM upper); passing it forces the disk path.
     #[serde(default)]
     scratch_mib: Option<u32>,
+    /// Guest files to stream to HOST paths after the command finishes — the
+    /// artifact-extraction channel (no size ceiling, binary-safe; use instead
+    /// of base64-over-stdout). Attempted only when the exec completed without
+    /// timing out; a copy failure fails the call. Written files are listed in
+    /// the result's `copied`.
+    #[serde(default)]
+    copy_out: Option<Vec<CopyOutParam>>,
+}
+
+/// One `copy_out` mapping for [`Isopod::sandbox_run`].
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CopyOutParam {
+    /// Absolute source path in the guest.
+    guest: String,
+    /// Host destination path (parent directories are created).
+    host: String,
 }
 
 /// Parameters for [`Isopod::stage_info`] and [`Isopod::stage_rm`].
@@ -229,6 +245,20 @@ struct SandboxRunResult {
     stderr_log_path: String,
     /// Absolute path to the retained guest serial console log on the host.
     serial_log_path: String,
+    /// Files streamed out of the guest via `copy_out` (omitted when none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    copied: Vec<CopiedFileResult>,
+}
+
+/// One file `copy_out` wrote to the host, as listed in [`SandboxRunResult`].
+#[derive(Debug, Serialize, JsonSchema)]
+struct CopiedFileResult {
+    /// Absolute guest source path.
+    guest: String,
+    /// Host destination path the bytes were written to.
+    host: String,
+    /// Raw bytes written (the guest file's size).
+    bytes: u64,
 }
 
 impl From<RunReport> for SandboxRunResult {
@@ -264,6 +294,15 @@ impl From<RunReport> for SandboxRunResult {
             stdout_log_path: r.stdout_log_path.to_string_lossy().into_owned(),
             stderr_log_path: r.stderr_log_path.to_string_lossy().into_owned(),
             serial_log_path: r.serial_log_path.to_string_lossy().into_owned(),
+            copied: r
+                .copied
+                .into_iter()
+                .map(|c| CopiedFileResult {
+                    guest: c.guest,
+                    host: c.host.to_string_lossy().into_owned(),
+                    bytes: c.bytes,
+                })
+                .collect(),
         }
     }
 }
@@ -438,9 +477,10 @@ commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the tool
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
 Networking on by default (network=false for untrusted code). timeout_s covers boot + exec \
 (default 120). Size the VM with vcpus (default 1) and mem_mib (default 512), both host-capped. \
-For large stdin payloads pass stdin_file (a host path) instead of stdin. NOTE: parallel \
-sandbox_run calls batched in one message execute serially; for concurrent sandboxes, issue \
-calls from separate agents.",
+For large stdin payloads pass stdin_file (a host path) instead of stdin; to extract build \
+artifacts pass copy_out (guest->host file mappings, binary-safe, no size ceiling). NOTE: \
+parallel sandbox_run calls batched in one message execute serially; for concurrent sandboxes, \
+issue calls from separate agents.",
         meta = crate::sandbox_run_meta()
     )]
     async fn sandbox_run(
@@ -518,6 +558,15 @@ calls from separate agents.",
             vcpus: p.vcpus.unwrap_or(vm::DEFAULT_VCPUS),
             mem_mib: p.mem_mib.unwrap_or(vm::DEFAULT_MEM_MIB),
             scratch_mib: p.scratch_mib,
+            copy_out: p
+                .copy_out
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| vm::CopyOutSpec {
+                    guest: c.guest,
+                    host: std::path::PathBuf::from(c.host),
+                })
+                .collect(),
         };
 
         // Best-effort idle-timeout keepalive: if the client sent a progressToken,

@@ -8,7 +8,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use isopod_proto::{
-    b64_decode, b64_encode, Request, RequestOp, Response, ResponseBody, PROTO_VERSION, VSOCK_PORT,
+    b64_decode, b64_encode, Request, RequestOp, Response, ResponseBody, EXEC_CHUNK_LEN,
+    PROTO_VERSION, VSOCK_PORT,
 };
 
 use crate::conn::Conn;
@@ -107,6 +108,14 @@ fn dispatch(conn: &Conn, req: Request, reaper: &Reaper) {
         RequestOp::GetFile { path, max_bytes } => {
             reply(conn, id, get_file(&path, max_bytes));
         }
+        RequestOp::CopyOut { path, max_bytes } => copy_out(conn, id, &path, max_bytes),
+        RequestOp::SetHostname { name } => {
+            reply(
+                conn,
+                id,
+                sys::set_hostname(&name).map(|()| ResponseBody::Ok),
+            );
+        }
         RequestOp::Halt { sync } => halt(conn, id, sync),
     }
 }
@@ -148,6 +157,77 @@ fn get_file(path: &str, max_bytes: u64) -> io::Result<ResponseBody> {
         data_b64: b64_encode(&bytes),
         mode: meta.permissions().mode(),
     })
+}
+
+/// Stream a guest file to the host: `FileChunk`* then exactly one `FileDone`
+/// (the CopyOut half of the Exec streaming contract — no frame-size ceiling on
+/// the file). The size gate runs before the first chunk, so an `Error` with no
+/// preceding chunk means nothing was read; an `Error` mid-stream means the file
+/// became unreadable and the host must discard the partial copy.
+fn copy_out(conn: &Conn, id: u64, path: &str, max_bytes: u64) {
+    let (mut file, total_bytes, mode) = match open_for_copy_out(path, max_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            reply(conn, id, Err(e));
+            return;
+        }
+    };
+    let mut buf = vec![0u8; EXEC_CHUNK_LEN];
+    loop {
+        match io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let resp = Response {
+                    id,
+                    body: ResponseBody::FileChunk {
+                        data_b64: b64_encode(&buf[..n]),
+                    },
+                };
+                if conn.send(&resp).is_err() {
+                    return; // dead connection: the host gave up; nothing to say
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                reply(
+                    conn,
+                    id,
+                    Err(io::Error::new(e.kind(), format!("{path}: {e}"))),
+                );
+                return;
+            }
+        }
+    }
+    let _ = conn.send(&Response {
+        id,
+        body: ResponseBody::FileDone { total_bytes, mode },
+    });
+}
+
+/// Open `path` for a `CopyOut` after gating on type and size (regular file,
+/// `len <= max_bytes`), returning the handle plus the metadata `FileDone` needs.
+fn open_for_copy_out(path: &str, max_bytes: u64) -> io::Result<(std::fs::File, u64, u32)> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path} is not a regular file"),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "file {path} is {} bytes, exceeds max_bytes {max_bytes}",
+                meta.len()
+            ),
+        ));
+    }
+    Ok((
+        std::fs::File::open(path)?,
+        meta.len(),
+        meta.permissions().mode(),
+    ))
 }
 
 /// Acknowledge, let the reply drain, then sync + stop the VM. Does not return on

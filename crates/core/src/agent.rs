@@ -471,6 +471,104 @@ impl AgentClient {
         }
     }
 
+    /// Set the guest's hostname to the VM's vanity name. Re-sent on every warm
+    /// resume (exactly like [`configure_net`](Self::configure_net) and
+    /// [`sync_clock_now`](Self::sync_clock_now)) because the snapshot bakes the
+    /// builder VM's name.
+    ///
+    /// # Errors
+    /// [`AgentError::Guest`] on a guest-side failure, or a connect/framing error.
+    pub async fn set_hostname(&self, name: &str) -> Result<(), AgentError> {
+        let op = RequestOp::SetHostname {
+            name: name.to_string(),
+        };
+        self.expect_ok("set_hostname", op).await
+    }
+
+    /// Stream a guest file to `dest` on the host (`FileChunk`* then one
+    /// `FileDone`), refusing guest files larger than `max_bytes`. Unlike
+    /// [`get_file`](Self::get_file) the file never has to fit in one frame, so
+    /// this is the artifact-extraction channel for build outputs (finding #21).
+    /// The guest file's mode bits are applied to the host copy (the exec bit
+    /// matters for binaries).
+    ///
+    /// # Errors
+    /// [`AgentError::Guest`] if the guest refused (missing file, over
+    /// `max_bytes`) or failed mid-stream, [`AgentError::Unexpected`] if the byte
+    /// count disagrees with `FileDone` (file changed mid-copy) or the connection
+    /// died, or a connect/framing/IO error. On any error the partial host file
+    /// is removed.
+    pub async fn copy_out(
+        &self,
+        guest_path: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Result<CopyOutcome, AgentError> {
+        let mut stream = self.connect().await?;
+        let op = RequestOp::CopyOut {
+            path: guest_path.to_string(),
+            max_bytes,
+        };
+        self.write_request(&mut stream, op).await?;
+
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .map_err(io_err(format!("creating copy-out dest {}", dest.display())))?;
+        let mut written: u64 = 0;
+        let result = loop {
+            let frame = frame::aio::read_frame::<_, Response>(&mut stream)
+                .await
+                .map_err(|e| self.frame_err(e));
+            let resp = match frame {
+                Ok(Some(resp)) => resp,
+                Ok(None) => {
+                    break Err(AgentError::Unexpected(format!(
+                        "connection closed mid copy-out after {written} bytes"
+                    )));
+                }
+                Err(e) => break Err(e),
+            };
+            match resp.body {
+                ResponseBody::FileChunk { data_b64 } => {
+                    let bytes = b64_decode(&data_b64).map_err(|e| AgentError::BadChunk {
+                        stream: "file",
+                        detail: e.to_string(),
+                    })?;
+                    match file.write_all(&bytes).await {
+                        Ok(()) => written = written.saturating_add(bytes.len() as u64),
+                        Err(e) => {
+                            break Err(
+                                io_err(format!("writing copy-out dest {}", dest.display()))(e),
+                            );
+                        }
+                    }
+                }
+                ResponseBody::FileDone { total_bytes, mode } => {
+                    if written != total_bytes {
+                        break Err(AgentError::Unexpected(format!(
+                            "copy-out streamed {written} bytes but the guest reported \
+                             {total_bytes} (file changed mid-copy?)"
+                        )));
+                    }
+                    if let Err(e) = file.flush().await {
+                        break Err(io_err(format!("flushing copy-out dest {}", dest.display()))(e));
+                    }
+                    break Ok(CopyOutcome { total_bytes, mode });
+                }
+                ResponseBody::Error { message } => break Err(AgentError::Guest(message)),
+                other => break Err(unexpected("copy_out", &other)),
+            }
+        };
+        if result.is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = result.as_ref().map(|c| c.mode).unwrap_or(0o644);
+            let _ = tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).await;
+        } else {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        result
+    }
+
     // -- internals ----------------------------------------------------------
 
     fn next_id(&self) -> u64 {
@@ -545,8 +643,19 @@ fn body_kind(body: &ResponseBody) -> &'static str {
         ResponseBody::ExecDone { .. } => "exec_done",
         ResponseBody::Ok => "ok",
         ResponseBody::File { .. } => "file",
+        ResponseBody::FileChunk { .. } => "file_chunk",
+        ResponseBody::FileDone { .. } => "file_done",
         ResponseBody::Error { .. } => "error",
     }
+}
+
+/// Result of [`AgentClient::copy_out`]: what landed on the host.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyOutcome {
+    /// Total raw bytes streamed (the guest file's size).
+    pub total_bytes: u64,
+    /// Unix mode bits of the guest source file (applied to the host copy).
+    pub mode: u32,
 }
 
 /// Tees a stream to a log file while retaining a capped in-memory head.

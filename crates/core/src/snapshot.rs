@@ -88,6 +88,11 @@ pub struct SnapshotKey {
     pub cpu_model: String,
     /// Squashfs base-flavor slug the VM boots (`base-sqfs` / `base-alpine`).
     pub base: String,
+    /// Content id of the built base image (the sidecar-recorded sha256, or
+    /// `"unstamped"`). A rebuilt base image — same flavor, new content — must
+    /// key to a different snapshot, or resumes silently reuse a stale guest
+    /// (dogfood finding #25).
+    pub base_sha256: String,
     /// Guest vCPU count (fixed in the saved vmstate).
     pub vcpus: u32,
     /// Guest memory in MiB (the memory file is a byte image of exactly this much
@@ -106,6 +111,7 @@ impl SnapshotKey {
         kernel_id: impl Into<String>,
         cpu_model: impl Into<String>,
         base: impl Into<String>,
+        base_sha256: impl Into<String>,
         resources: Resources,
     ) -> Self {
         Self {
@@ -113,6 +119,7 @@ impl SnapshotKey {
             kernel_id: kernel_id.into(),
             cpu_model: cpu_model.into(),
             base: base.into(),
+            base_sha256: base_sha256.into(),
             vcpus: resources.vcpus,
             mem_mib: resources.mem_mib,
             snapshot_format: SNAPSHOT_FORMAT.to_string(),
@@ -125,11 +132,12 @@ impl SnapshotKey {
     /// concatenation.
     fn key_material(&self) -> String {
         format!(
-            "isopod-snapshot-key-v1\n\
+            "isopod-snapshot-key-v2\n\
              fc_build={}\n\
              kernel_id={}\n\
              cpu_model={}\n\
              base={}\n\
+             base_sha256={}\n\
              vcpus={}\n\
              mem_mib={}\n\
              snapshot_format={}\n",
@@ -137,6 +145,7 @@ impl SnapshotKey {
             self.kernel_id,
             self.cpu_model,
             self.base,
+            self.base_sha256,
             self.vcpus,
             self.mem_mib,
             self.snapshot_format,
@@ -156,8 +165,9 @@ impl SnapshotKey {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "{base} {vcpus}c/{mem}m · {fc} · {kernel} · {cpu} · {fmt}",
+            "{base}@{sha} {vcpus}c/{mem}m · {fc} · {kernel} · {cpu} · {fmt}",
             base = self.base,
+            sha = &self.base_sha256[..self.base_sha256.len().min(8)],
             vcpus = self.vcpus,
             mem = self.mem_mib,
             fc = self.fc_build,
@@ -671,10 +681,13 @@ pub async fn resume(
         host_dev_name: slot.tap_name(),
     }])
     .with_vsock_override(vsock_uds.to_string_lossy());
-    client
-        .load_snapshot(&params)
-        .await
-        .context("PUT /snapshot/load (resume)")?;
+    client.load_snapshot(&params).await.with_context(|| {
+        format!(
+            "PUT /snapshot/load (resume; retarget eth0 -> slot {}, tap {})",
+            slot.index(),
+            slot.tap_name()
+        )
+    })?;
 
     let agent = AgentClient::new(&vsock_uds);
     agent
@@ -813,6 +826,7 @@ mod tests {
             "vmlinux-6.18.36:27680232",
             "13th Gen Intel(R) Core(TM) i7-13620H",
             "base-alpine",
+            "a3f1c2d4e5b60718293a4b5c6d7e8f9012345678901234567890123456789012",
             Resources {
                 vcpus: 1,
                 mem_mib: 512,
@@ -850,6 +864,10 @@ mod tests {
         let mut b = base.clone();
         b.base = "base-sqfs".into();
         assert_ne!(b.keyhash(), h, "base flavor changes the hash");
+
+        let mut bs = base.clone();
+        bs.base_sha256 = "unstamped".into();
+        assert_ne!(bs.keyhash(), h, "base image content id changes the hash");
 
         let mut v = base.clone();
         v.vcpus = 2;

@@ -225,6 +225,9 @@ fn resolve_rootfs(flavor: RootfsFlavor) -> Result<(PathBuf, String)> {
     let images = paths::images_dir()?;
     let dest = images.join(format!("rootfs-{}.ext4", flavor.slug()));
     if dest.exists() {
+        // Fail fast on a proto-stale image before any VM work (finding #17 —
+        // this legacy ext4 path is exactly where the v1 dev-agent rootfs bit).
+        image::check_image_proto(&dest)?;
         return Ok((dest, flavor.slug().to_string()));
     }
     eprintln!(
@@ -553,7 +556,16 @@ async fn configure_run_boot(
         client
             .put_network_interface(&iface)
             .await
-            .context("PUT /network-interfaces/eth0")?;
+            // Name the slot + tap: a tap error here has been observed masking
+            // an unrelated root cause (finding #19), so the context must say
+            // exactly which resource was being attached.
+            .with_context(|| {
+                format!(
+                    "PUT /network-interfaces/eth0 (slot {}, tap {})",
+                    slot.index(),
+                    slot.tap_name()
+                )
+            })?;
     }
     Ok(())
 }
@@ -718,7 +730,37 @@ pub struct RunOptions {
     /// topology and by warm resumes (which use a RAM/tmpfs upper) — passing it
     /// forces the cold ext4 path so the requested size always takes effect.
     pub scratch_mib: Option<u32>,
+    /// Guest files to stream to the host after the command finishes (the
+    /// artifact-extraction channel, dogfood finding #21). Attempted only when
+    /// the exec completed without timing out; any copy failure is a run error
+    /// (the caller explicitly asked for the artifact).
+    pub copy_out: Vec<CopyOutSpec>,
 }
+
+/// One `--copy-out` mapping: a guest source path and its host destination.
+#[derive(Debug, Clone)]
+pub struct CopyOutSpec {
+    /// Absolute source path in the guest.
+    pub guest: String,
+    /// Host destination path (parent directories are created).
+    pub host: PathBuf,
+}
+
+/// One file streamed out of the guest by `--copy-out`, as reported in the
+/// [`RunReport`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CopiedFile {
+    /// Absolute guest source path.
+    pub guest: String,
+    /// Host destination path the bytes were written to.
+    pub host: PathBuf,
+    /// Raw bytes written (the guest file's size).
+    pub bytes: u64,
+}
+
+/// Per-file ceiling for `--copy-out` streams — generous (16 GiB) but finite, so
+/// a runaway guest file cannot fill the host disk unboundedly.
+const COPY_OUT_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Which boot path served a run: a warm snapshot resume or a cold boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -806,6 +848,9 @@ pub struct RunReport {
     /// networking is on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_ip: Option<String>,
+    /// Files streamed out of the guest by `--copy-out` (omitted when none).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copied: Vec<CopiedFile>,
 }
 
 /// Compute the in-guest exec timeout from the outer budget and elapsed time,
@@ -1059,6 +1104,7 @@ async fn run_exec(
         stdout_log: &stdout_log,
         stderr_log: &stderr_log,
         vm_id: &vm_id,
+        vanity: &vanity,
         vm_dir: &vm_dir,
         opts: &opts,
         t_total,
@@ -1124,6 +1170,7 @@ async fn run_exec(
         stage_name: committed.as_ref().map(|m| m.name.clone()),
         slot: slot_index,
         guest_ip,
+        copied: exec.copied,
     })
 }
 
@@ -1174,11 +1221,15 @@ fn build_snapshot_key(
     let fc_build = snapshot::detect_fc_build(&fc.path)?;
     let cpu_model = snapshot::detect_cpu_model()?;
     let kernel_id = snapshot::kernel_identity(kernel)?;
+    // The image's sidecar sha (cheap) keys content into the snapshot, so a
+    // rebuilt base gets fresh snapshots instead of stale resumes (finding #25).
+    let base_sha = image::base_content_id(RootfsFlavor::from_slug(base_flavor)?)?;
     Ok(SnapshotKey::new(
         fc_build,
         kernel_id,
         cpu_model,
         base_flavor,
+        base_sha,
         resources,
     ))
 }
@@ -1528,6 +1579,8 @@ struct BootCtx<'a> {
     stdout_log: &'a Path,
     stderr_log: &'a Path,
     vm_id: &'a str,
+    /// The run's vanity name (becomes the guest hostname; finding #23).
+    vanity: &'a str,
     /// The run's VM directory (the resume path derives its socket paths from it).
     vm_dir: &'a Path,
     opts: &'a RunOptions,
@@ -1541,6 +1594,9 @@ struct ExecParams<'a> {
     console_log: &'a Path,
     stdout_log: &'a Path,
     stderr_log: &'a Path,
+    /// The run's vanity name — pushed into the guest as its hostname on every
+    /// boot AND resume (a snapshot bakes the builder VM's name; finding #23).
+    vanity: &'a str,
     t_total: Instant,
 }
 
@@ -1570,6 +1626,8 @@ struct ExecResult {
     exec_ms: u64,
     stdout: StreamCapture,
     stderr: StreamCapture,
+    /// Files streamed out by `--copy-out` (filled by [`exec_and_teardown`]).
+    copied: Vec<CopiedFile>,
 }
 
 /// Bring a VM up (warm resume or cold boot), run the command, and tear it down.
@@ -1586,6 +1644,7 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
         console_log: ctx.console_log,
         stdout_log: ctx.stdout_log,
         stderr_log: ctx.stderr_log,
+        vanity: ctx.vanity,
         t_total: ctx.t_total,
     };
 
@@ -1681,7 +1740,21 @@ async fn cold_boot(ctx: &BootCtx<'_>, disk: &DiskConfig) -> Result<BootedVm> {
 /// Run the command against a booted-or-resumed VM, then always halt + tear the
 /// VMM down (even on error, backed by the [`FcProcess`] drop guard).
 async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<ExecResult> {
-    let outcome = run_command(&vm.agent, params).await;
+    let mut outcome = run_command(&vm.agent, params).await;
+
+    // Stream requested guest files to the host before halting (finding #21).
+    // Only when the exec completed without timing out — a wedged guest could
+    // stall an unbounded copy. A copy failure fails the run (the caller
+    // explicitly asked for the artifact), surfaced after teardown completes.
+    let mut copy_err: Option<anyhow::Error> = None;
+    if let Ok(exec) = &mut outcome {
+        if !exec.timed_out && !params.opts.copy_out.is_empty() {
+            match copy_out_files(&vm.agent, &params.opts.copy_out).await {
+                Ok(copied) => exec.copied = copied,
+                Err(e) => copy_err = Some(e),
+            }
+        }
+    }
 
     // Best-effort in-guest halt, then wait for FC to exit; force if it hangs.
     let _ = vm.agent.halt(true).await;
@@ -1696,7 +1769,35 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
     if let Some(drain) = vm.drain {
         let _ = drain.await;
     }
+    if let Some(e) = copy_err {
+        return Err(e);
+    }
     outcome
+}
+
+/// Stream each requested guest file to its host destination, in request order,
+/// creating host parent directories as needed. Fails on the first error.
+async fn copy_out_files(agent: &AgentClient, specs: &[CopyOutSpec]) -> Result<Vec<CopiedFile>> {
+    let mut copied = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if let Some(parent) = spec.host.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating copy-out parent dir {}", parent.display())
+                })?;
+            }
+        }
+        let outcome = agent
+            .copy_out(&spec.guest, &spec.host, COPY_OUT_MAX_BYTES)
+            .await
+            .with_context(|| format!("copy-out {} -> {}", spec.guest, spec.host.display()))?;
+        copied.push(CopiedFile {
+            guest: spec.guest.clone(),
+            host: spec.host.clone(),
+            bytes: outcome.total_bytes,
+        });
+    }
+    Ok(copied)
 }
 
 /// Wait for readiness, sync the clock, then exec with a host-side wall-clock
@@ -1719,6 +1820,12 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
         .sync_clock_now()
         .await
         .context("syncing the guest clock over vsock")?;
+    // Cosmetic, so a failure never kills the run: name the guest after the VM
+    // (finding #23). Re-applied on every resume because the snapshot bakes the
+    // builder VM's hostname, same staleness class as the clock and the NIC.
+    if let Err(e) = agent.set_hostname(ctx.vanity).await {
+        eprintln!("run: warning: could not set guest hostname: {e}");
+    }
 
     let outer_ms = ctx.opts.timeout_s.saturating_mul(1000);
     let elapsed_ms = ctx.t_total.elapsed().as_millis() as u64;
@@ -1747,6 +1854,7 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
             exec_ms: o.duration_ms,
             stdout: o.stdout,
             stderr: o.stderr,
+            copied: Vec::new(),
         }),
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("exec over vsock")),
         Err(_elapsed) => {
@@ -1761,6 +1869,7 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
                 exec_ms: t_exec.elapsed().as_millis() as u64,
                 stdout,
                 stderr,
+                copied: Vec::new(),
             })
         }
     }
@@ -1967,6 +2076,7 @@ mod tests {
             stage_name: None,
             slot: None,
             guest_ip: None,
+            copied: Vec::new(),
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
@@ -2071,6 +2181,7 @@ mod tests {
             stage_name: Some("radiant-ghost".into()),
             slot: Some(3),
             guest_ip: Some("10.107.3.2".into()),
+            copied: Vec::new(),
         };
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["rootfs_flavor"], serde_json::json!("base-alpine"));

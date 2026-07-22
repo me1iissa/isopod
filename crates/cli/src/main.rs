@@ -141,6 +141,11 @@ struct RunArgs {
     /// Feed the command's stdin from a file (`-` for the host's stdin).
     #[arg(long = "stdin-file", value_name = "PATH")]
     stdin_file: Option<String>,
+    /// Stream a guest file to the host after the command finishes (repeatable):
+    /// `--copy-out /guest/path:/host/path`. Attempted only when the exec
+    /// completed without timing out; a copy failure fails the run.
+    #[arg(long = "copy-out", value_name = "GUEST:HOST")]
+    copy_out: Vec<String>,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
@@ -210,6 +215,11 @@ enum ImageCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Force-rebuild EVERY guest image together (required after a PROTO_VERSION
+    /// bump so no image is left speaking a stale protocol)
+    BuildAll,
+    /// List every guest image with its stamped proto version and staleness
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -309,6 +319,14 @@ fn run_image(cmd: ImageCommand) -> i32 {
         ImageCommand::BuildRootfs { flavor, force } => {
             emit(RootfsFlavor::from_slug(&flavor).and_then(|f| image::build_rootfs(f, force)))
         }
+        ImageCommand::BuildAll => emit((|| -> anyhow::Result<serde_json::Value> {
+            let mut images = Vec::new();
+            for flavor in RootfsFlavor::ALL {
+                images.push(image::build_rootfs(flavor, true)?);
+            }
+            Ok(serde_json::json!({ "ok": true, "images": images }))
+        })()),
+        ImageCommand::Ls => emit(image::list_images()),
     }
 }
 
@@ -374,6 +392,21 @@ fn run_run(args: RunArgs) -> i32 {
             Some(p) => Some(std::fs::read(p).with_context(|| format!("reading {p}"))?),
             None => None,
         };
+        let copy_out = args
+            .copy_out
+            .iter()
+            .map(|s| match s.split_once(':') {
+                Some((guest, host)) if !guest.is_empty() && !host.is_empty() => {
+                    Ok(vm::CopyOutSpec {
+                        guest: guest.to_string(),
+                        host: std::path::PathBuf::from(host),
+                    })
+                }
+                _ => Err(anyhow::anyhow!(
+                    "invalid --copy-out {s:?}: expected GUEST:HOST (two non-empty paths)"
+                )),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         vm::run_ephemeral(RunOptions {
             argv: args.argv,
             env,
@@ -389,6 +422,7 @@ fn run_run(args: RunArgs) -> i32 {
             vcpus: args.vcpus,
             mem_mib: args.mem_mib,
             scratch_mib: args.scratch_mib,
+            copy_out,
         })
     })();
     emit(result)

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
@@ -59,11 +59,15 @@ const ALPINE_KEYS_VERSION: &str = "2.6-r0";
 const ALPINE_KEYS_SHA256: &str = "dd211936d544f4050924ce8aec078d24e7b1b036ae70b30bd07867349587c708";
 
 /// Packages installed into the `base-alpine` dev rootfs: the base layout + busybox
-/// userland, a Python and Node toolchain, git, and a C build toolchain — the
-/// everyday tools an agent workload builds and runs code with.
+/// userland, a Python and Node toolchain, git, a C build toolchain (make + cmake),
+/// and GNU coreutils — the everyday tools an agent workload builds and runs code
+/// with. GNU coreutils covers the flag surface busybox applets lack (e.g.
+/// `cp --sparse=always`, which isopod's own test suite needs in-guest); cmake was
+/// long *documented* as present but never actually shipped (dogfood finding).
 const ALPINE_PACKAGES: &[&str] = &[
     "alpine-baselayout",
     "busybox",
+    "coreutils",
     "python3",
     "py3-pip",
     "nodejs",
@@ -72,6 +76,7 @@ const ALPINE_PACKAGES: &[&str] = &[
     "gcc",
     "musl-dev",
     "make",
+    "cmake",
 ];
 
 /// Public DNS resolvers baked into the guest `/etc/resolv.conf` (PLAN: DNS is
@@ -113,6 +118,22 @@ pub enum RootfsFlavor {
 }
 
 impl RootfsFlavor {
+    /// Every flavor, in build order — the working set of `isopod image build-all`
+    /// and `isopod image ls`. A `PROTO_VERSION` bump must rebuild all of these
+    /// together (finding #17).
+    pub const ALL: [RootfsFlavor; 4] = [
+        RootfsFlavor::DevBusybox,
+        RootfsFlavor::DevAgent,
+        RootfsFlavor::BaseSqfs,
+        RootfsFlavor::BaseAlpine,
+    ];
+
+    /// `true` for flavors that embed the guest agent (and therefore speak a
+    /// specific `PROTO_VERSION`); `dev-busybox` is the agent-less M1 smoke image.
+    pub fn has_agent(self) -> bool {
+        !matches!(self, RootfsFlavor::DevBusybox)
+    }
+
     /// Stable on-disk / CLI slug for this flavor.
     pub fn slug(self) -> &'static str {
         match self {
@@ -210,6 +231,10 @@ pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutc
     std::fs::rename(&tmp_path, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp_path.display(), dest.display()))?;
 
+    // Stamp the build-metadata sidecar so the run path can refuse a
+    // proto-stale image *before* any VM work (finding #17).
+    write_image_meta(&dest, flavor)?;
+
     outcome_for(&dest, flavor, false)
 }
 
@@ -257,6 +282,8 @@ fn base_image_path_in(images: &Path, flavor: RootfsFlavor) -> Result<PathBuf> {
             flavor.slug()
         );
     }
+    // Fail fast on a proto-stale base before any VM work (findings #17/#19).
+    check_image_proto(&dest)?;
     Ok(dest)
 }
 
@@ -271,6 +298,198 @@ fn outcome_for(dest: &Path, flavor: RootfsFlavor, cached: bool) -> Result<BuildR
         bytes_allocated: meta.blocks() * 512,
         sha256: paths::sha256_file(dest)?,
         cached,
+    })
+}
+
+// ===========================================================================
+// Image build-metadata sidecars (`<image>.meta.json`) — the proto-skew guard
+// (dogfood finding #17) and the warm-pool content id (finding #25).
+// ===========================================================================
+
+/// Build metadata stamped next to every built image as `<image>.meta.json`
+/// (same sidecar convention as `StageMeta` / `SnapshotMeta`). The recorded
+/// proto version lets the run path refuse a stale image before any VM work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageMeta {
+    /// Flavor slug this image was built as.
+    pub flavor: String,
+    /// `isopod_proto::PROTO_VERSION` at build time — what the baked-in guest
+    /// agent speaks. `None` for the agent-less `dev-busybox`.
+    pub proto_version: Option<u32>,
+    /// sha256 of the guest-agent binary baked in (`None` for `dev-busybox`).
+    pub agent_sha256: Option<String>,
+    /// sha256 of the packed image file (the warm-pool content id).
+    pub sha256: String,
+    /// Unix time the image was built.
+    pub built_unix: u64,
+}
+
+/// Sidecar path for an image: `<image>.meta.json`.
+fn image_meta_path(image: &Path) -> PathBuf {
+    let mut s = image.as_os_str().to_owned();
+    s.push(".meta.json");
+    PathBuf::from(s)
+}
+
+/// Stamp `<image>.meta.json` for a freshly built image.
+fn write_image_meta(image: &Path, flavor: RootfsFlavor) -> Result<()> {
+    let (proto_version, agent_sha256) = if flavor.has_agent() {
+        let agent = locate_checked_agent()?;
+        (
+            Some(isopod_proto::PROTO_VERSION),
+            Some(paths::sha256_file(&agent)?),
+        )
+    } else {
+        (None, None)
+    };
+    let meta = ImageMeta {
+        flavor: flavor.slug().to_string(),
+        proto_version,
+        agent_sha256,
+        sha256: paths::sha256_file(image)?,
+        built_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let path = image_meta_path(image);
+    let json = serde_json::to_vec_pretty(&meta).context("serializing image meta")?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Read an image's sidecar. `Ok(None)` when no sidecar exists (an image built
+/// before stamping landed).
+pub fn read_image_meta(image: &Path) -> Result<Option<ImageMeta>> {
+    let path = image_meta_path(image);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))
+        .map(Some)
+}
+
+/// Pre-boot guard: refuse an image whose sidecar records a different guest
+/// protocol than this host build speaks — failing fast with the fix, instead of
+/// the in-boot vsock timeout (or, on the networked path, a masking tap error;
+/// findings #17/#19). A missing or unreadable sidecar only warns: images built
+/// before stamping existed must keep working.
+pub fn check_image_proto(image: &Path) -> Result<()> {
+    match read_image_meta(image) {
+        Ok(Some(meta)) => {
+            if let Some(v) = meta.proto_version {
+                if v != isopod_proto::PROTO_VERSION {
+                    bail!(
+                        "guest image {} was built for protocol v{v}, but this isopod speaks \
+                         v{} — rebuild every guest image together: `isopod image build-all`",
+                        image.display(),
+                        isopod_proto::PROTO_VERSION,
+                    );
+                }
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            eprintln!(
+                "run: warning: {} has no build-metadata sidecar (built by an older isopod); \
+                 rebuild via `isopod image build-all` to enable pre-boot proto checks",
+                image.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "run: warning: unreadable image metadata for {}: {e:#}",
+                image.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Cheap content id for a flavor's built image: the sidecar's recorded sha256,
+/// or `"unstamped"` when no sidecar exists. Keyed into the warm-pool
+/// `SnapshotKey` so a rebuilt base gets fresh snapshots instead of silently
+/// resuming stale ones (finding #25) — without hashing hundreds of MB per run.
+pub fn base_content_id(flavor: RootfsFlavor) -> Result<String> {
+    let images = paths::images_dir()?;
+    let dest = image_dest(&images, flavor);
+    Ok(read_image_meta(&dest)?
+        .map(|m| m.sha256)
+        .unwrap_or_else(|| "unstamped".to_string()))
+}
+
+/// One row of `isopod image ls`.
+#[derive(Debug, Serialize)]
+pub struct ImageEntry {
+    /// Flavor slug.
+    pub flavor: String,
+    /// On-disk image path.
+    pub path: PathBuf,
+    /// Whether the image file exists.
+    pub present: bool,
+    /// Image size in bytes (present images only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_apparent: Option<u64>,
+    /// Proto version stamped in the sidecar (absent for agent-less flavors and
+    /// unstamped images).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proto_version: Option<u32>,
+    /// Present but carrying no sidecar (built before stamping landed).
+    pub unstamped: bool,
+    /// Sidecar proto disagrees with this host build — rebuild required.
+    pub stale: bool,
+    /// Unix build time from the sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_unix: Option<u64>,
+}
+
+/// Result of `isopod image ls`: every flavor with its stamp status.
+#[derive(Debug, Serialize)]
+pub struct ImageList {
+    /// Always `true` on the success path.
+    pub ok: bool,
+    /// The protocol version this host build speaks.
+    pub host_proto: u32,
+    /// One entry per flavor ([`RootfsFlavor::ALL`] order).
+    pub images: Vec<ImageEntry>,
+}
+
+/// Enumerate every flavor's image with its sidecar stamp status (`image ls`).
+pub fn list_images() -> Result<ImageList> {
+    let images_dir = paths::images_dir()?;
+    let mut images = Vec::with_capacity(RootfsFlavor::ALL.len());
+    for flavor in RootfsFlavor::ALL {
+        let path = image_dest(&images_dir, flavor);
+        let present = path.exists();
+        let meta = if present {
+            read_image_meta(&path)?
+        } else {
+            None
+        };
+        let bytes_apparent = present
+            .then(|| std::fs::metadata(&path).map(|m| m.len()).ok())
+            .flatten();
+        let proto_version = meta.as_ref().and_then(|m| m.proto_version);
+        let stale = matches!(proto_version, Some(v) if v != isopod_proto::PROTO_VERSION);
+        images.push(ImageEntry {
+            flavor: flavor.slug().to_string(),
+            path,
+            present,
+            bytes_apparent,
+            proto_version,
+            unstamped: present && meta.is_none(),
+            stale,
+            built_unix: meta.as_ref().map(|m| m.built_unix),
+        });
+    }
+    Ok(ImageList {
+        ok: true,
+        host_proto: isopod_proto::PROTO_VERSION,
+        images,
     })
 }
 
@@ -416,6 +635,7 @@ fn populate_base_alpine(root: &Path) -> Result<()> {
     let apk_static = fetch_apk_static(work.path())?;
     let keys_dir = fetch_alpine_keys(work.path())?;
     run_apk_install(&apk_static, &keys_dir, root)?;
+    retain_apk_runtime(root, &apk_static, &keys_dir)?;
 
     install_busybox_applets(root)?;
     install_agent_init(root, &agent)?;
@@ -625,6 +845,34 @@ fn run_apk_install(apk_static: &Path, keys_dir: &Path, root: &Path) -> Result<()
     Ok(())
 }
 
+/// Keep a working `apk` in the packed image so an online guest can `apk add`
+/// packages at runtime (dogfood finding #15): copy the already-verified static
+/// `apk.static` to `/sbin/apk.static` (with an `/sbin/apk` convenience symlink)
+/// and the repository-signing keys to `/etc/apk/keys`. The repositories file and
+/// the apk database already exist (`write_alpine_runtime_config` /
+/// `run_apk_install`), so in-guest `apk add <pkg>` is fully self-serve.
+fn retain_apk_runtime(root: &Path, apk_static: &Path, keys_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("sbin")).context("mkdir /sbin")?;
+    let dest = root.join("sbin/apk.static");
+    std::fs::copy(apk_static, &dest)
+        .with_context(|| format!("copying {} -> sbin/apk.static", apk_static.display()))?;
+    set_exec(&dest)?;
+    symlink_force(Path::new("apk.static"), &root.join("sbin/apk"))?;
+
+    let keys_dest = root.join("etc/apk/keys");
+    std::fs::create_dir_all(&keys_dest).context("mkdir /etc/apk/keys")?;
+    for entry in std::fs::read_dir(keys_dir)
+        .with_context(|| format!("reading keys dir {}", keys_dir.display()))?
+        .flatten()
+    {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            std::fs::copy(entry.path(), keys_dest.join(entry.file_name()))
+                .with_context(|| format!("copying key {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Install the guest agent as `/sbin/init` (a real ELF PID 1, overwriting any
 /// pre-existing init link) and point `/init -> /sbin/init` so the kernel finds
 /// PID 1 regardless of the `init=` boot arg. `/sbin` already exists (Alpine's
@@ -646,8 +894,9 @@ fn install_agent_init(root: &Path, agent_bin: &Path) -> Result<()> {
 
 /// Write the guest runtime config the Alpine base ships: a public-resolver
 /// `/etc/resolv.conf` and an `/etc/apk/repositories` pointing at the pinned branch
-/// (so an online guest can `apk add` more packages later). Both parent dirs exist
-/// after the apk install.
+/// (the static apk + signing keys are retained by [`retain_apk_runtime`], so an
+/// online guest really can `apk add` more packages at runtime). Both parent dirs
+/// exist after the apk install.
 fn write_alpine_runtime_config(root: &Path) -> Result<()> {
     std::fs::write(root.join("etc/resolv.conf"), RESOLV_CONF)
         .context("writing /etc/resolv.conf")?;
@@ -1075,13 +1324,102 @@ mod tests {
             ALPINE_BRANCH.starts_with('v') && ALPINE_BRANCH.contains('.'),
             "branch pin should look like v3.24: {ALPINE_BRANCH}"
         );
-        // The install set covers the headline toolchain the flavor advertises.
-        for pkg in ["python3", "nodejs", "npm", "git", "gcc", "make"] {
+        // The install set covers the headline toolchain the flavor advertises —
+        // including cmake (long documented, only now shipped) and GNU coreutils
+        // (busybox's cp lacks --sparse, which isopod's own in-guest test runs
+        // need; findings #15 + gauntlet).
+        for pkg in [
+            "python3",
+            "nodejs",
+            "npm",
+            "git",
+            "gcc",
+            "make",
+            "cmake",
+            "coreutils",
+        ] {
             assert!(
                 ALPINE_PACKAGES.contains(&pkg),
                 "base-alpine package set must include {pkg}"
             );
         }
+    }
+
+    #[test]
+    fn retain_apk_runtime_installs_apk_and_keys() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let apk = work.path().join("apk.static");
+        std::fs::write(&apk, b"#!fake-apk").unwrap();
+        let keys = work.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(
+            keys.join("alpine-devel@lists.alpinelinux.org-1.rsa.pub"),
+            b"k",
+        )
+        .unwrap();
+
+        retain_apk_runtime(root.path(), &apk, &keys).unwrap();
+
+        let installed = root.path().join("sbin/apk.static");
+        assert!(installed.is_file(), "apk.static must be copied in");
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "apk.static must be executable");
+        assert_eq!(
+            std::fs::read_link(root.path().join("sbin/apk")).unwrap(),
+            Path::new("apk.static"),
+            "/sbin/apk must be a relative symlink to apk.static"
+        );
+        assert!(root
+            .path()
+            .join("etc/apk/keys/alpine-devel@lists.alpinelinux.org-1.rsa.pub")
+            .is_file());
+    }
+
+    #[test]
+    fn image_meta_sidecar_round_trip_and_proto_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("base-alpine.sqfs");
+        std::fs::write(&img, b"fake image").unwrap();
+
+        // No sidecar: read gives None, check warns-and-passes.
+        assert!(read_image_meta(&img).unwrap().is_none());
+        check_image_proto(&img).unwrap();
+
+        // Current-proto sidecar: passes.
+        let meta = ImageMeta {
+            flavor: "base-alpine".into(),
+            proto_version: Some(isopod_proto::PROTO_VERSION),
+            agent_sha256: Some("ab".repeat(32)),
+            sha256: "cd".repeat(32),
+            built_unix: 1,
+        };
+        std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(
+            read_image_meta(&img).unwrap().unwrap().flavor,
+            "base-alpine"
+        );
+        check_image_proto(&img).unwrap();
+
+        // Stale-proto sidecar: refused, naming the rebuild command.
+        let stale = ImageMeta {
+            proto_version: Some(isopod_proto::PROTO_VERSION + 1),
+            ..meta.clone()
+        };
+        std::fs::write(image_meta_path(&img), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let err = check_image_proto(&img).unwrap_err().to_string();
+        assert!(err.contains("build-all"), "error must name the fix: {err}");
+
+        // Agent-less sidecar (proto None, dev-busybox): always passes.
+        let busybox = ImageMeta {
+            flavor: "dev-busybox".into(),
+            proto_version: None,
+            agent_sha256: None,
+            ..meta
+        };
+        std::fs::write(image_meta_path(&img), serde_json::to_vec(&busybox).unwrap()).unwrap();
+        check_image_proto(&img).unwrap();
     }
 
     #[test]
