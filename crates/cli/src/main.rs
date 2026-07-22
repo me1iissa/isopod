@@ -47,6 +47,11 @@ enum Command {
         #[command(subcommand)]
         command: VmCommand,
     },
+    /// Warm-pool snapshots (build, list, rm)
+    Warmpool {
+        #[command(subcommand)]
+        command: WarmpoolCommand,
+    },
     /// Provision host networking (run once as root via sudo); `--remove` tears it down
     Setup(SetupArgs),
 }
@@ -129,6 +134,34 @@ struct RunArgs {
 }
 
 #[derive(Subcommand)]
+enum WarmpoolCommand {
+    /// Force-build (or reuse) the warm-pool snapshot for a config
+    Build {
+        /// Squashfs base flavor to snapshot (`base-alpine` or `base-sqfs`).
+        #[arg(long, default_value = "base-alpine")]
+        base: String,
+        /// Guest vCPU count the snapshot is captured at (must match runs that
+        /// will resume it).
+        #[arg(long, default_value_t = DEFAULT_VCPUS)]
+        vcpus: u32,
+        /// Guest memory in MiB the snapshot is captured at (a snapshot is bound
+        /// to its exact memory size).
+        #[arg(long = "mem-mib", default_value_t = DEFAULT_MEM_MIB)]
+        mem_mib: u32,
+    },
+    /// List cached snapshots (key summary, sizes, created), newest first
+    List,
+    /// Remove a cached snapshot by keyhash (or `--all`)
+    Rm {
+        /// Snapshot keyhash (or a unique prefix). Omit with `--all`.
+        keyhash: Option<String>,
+        /// Remove every cached snapshot.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum StageCommand {
     /// List committed stages (oldest-first)
     List,
@@ -192,6 +225,7 @@ fn main() {
         Command::Run(args) => run_run(args),
         Command::Stage { command } => run_stage(command),
         Command::Vm { command } => run_vm(command),
+        Command::Warmpool { command } => run_warmpool(command),
         Command::Setup(args) => run_setup(args),
     };
     std::process::exit(code);
@@ -218,6 +252,40 @@ fn run_vm(cmd: VmCommand) -> i32 {
             keep_last,
             std::time::Duration::from_secs(60),
         )),
+    }
+}
+
+/// `isopod warmpool {build,list,rm}` — warm-pool snapshot management. Each
+/// subcommand emits exactly one JSON object.
+fn run_warmpool(cmd: WarmpoolCommand) -> i32 {
+    match cmd {
+        WarmpoolCommand::Build {
+            base,
+            vcpus,
+            mem_mib,
+        } => {
+            emit(RootfsFlavor::from_slug(&base).and_then(|b| vm::warmpool_build(b, vcpus, mem_mib)))
+        }
+        WarmpoolCommand::List => emit(
+            isopod_core::snapshot::list()
+                .map(|snapshots| serde_json::json!({ "ok": true, "snapshots": snapshots })),
+        ),
+        WarmpoolCommand::Rm { keyhash, all } => {
+            if all {
+                emit(
+                    isopod_core::snapshot::remove_all()
+                        .map(|removed| serde_json::json!({ "ok": true, "removed": removed })),
+                )
+            } else if let Some(kh) = keyhash {
+                emit(isopod_core::snapshot::remove(&kh).map(|m| {
+                    serde_json::json!({ "ok": true, "removed": m.keyhash, "summary": m.summary })
+                }))
+            } else {
+                emit::<()>(Err(anyhow::anyhow!(
+                    "warmpool rm requires a <keyhash> argument or --all"
+                )))
+            }
+        }
     }
 }
 

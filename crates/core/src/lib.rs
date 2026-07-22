@@ -10,5 +10,6 @@ pub mod image;
 pub mod names;
 pub mod net;
 pub mod paths;
+pub mod snapshot;
 pub mod stage;
 pub mod vm;

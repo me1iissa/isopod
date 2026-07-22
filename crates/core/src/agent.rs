@@ -294,6 +294,38 @@ impl AgentClient {
         self.expect_ok("sync_clock", op).await
     }
 
+    /// Reconfigure the guest's IPv4 networking at runtime (post snapshot-resume).
+    ///
+    /// A warm-pool snapshot bakes in the *build-time* slot's addressing (slot 0's
+    /// `10.107.0.2/30`). When that snapshot is resumed into a different netns slot
+    /// its NIC backend is retargeted to the claimed slot's host tap via a
+    /// `network_overrides`, but the guest still carries the stale IP — so nothing
+    /// would route (each slot is a distinct `/30`). This pushes the claimed slot's
+    /// `ip`/`gw`/`dns` so the guest re-IPs `eth0` into the correct subnet and NAT
+    /// egress works, exactly analogous to the clock resync
+    /// ([`sync_clock_now`](Self::sync_clock_now)) every resume also performs.
+    ///
+    /// `ip_cidr` is the guest CIDR (`10.107.<i>.2/30`), `gw` the host side
+    /// (`10.107.<i>.1`, empty string ⇒ leave the default route cleared), and `dns`
+    /// the resolver list written to the guest's `/etc/resolv.conf`.
+    ///
+    /// # Errors
+    /// A connect/framing error, or [`AgentError::Guest`] if the guest could not
+    /// apply the config (an unparseable address, or a missing NIC).
+    pub async fn configure_net(
+        &self,
+        ip_cidr: &str,
+        gw: &str,
+        dns: &[String],
+    ) -> Result<(), AgentError> {
+        let op = RequestOp::ConfigureNet {
+            ip: ip_cidr.to_string(),
+            gw: gw.to_string(),
+            dns: dns.to_vec(),
+        };
+        self.expect_ok("configure_net", op).await
+    }
+
     /// Run a command, teeing streamed output to the log files named in `spec`.
     ///
     /// # Errors
@@ -897,6 +929,62 @@ mod tests {
         });
         let client = AgentClient::new(&sock);
         client.sync_clock_now().await.expect("sync ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configure_net_sends_slot_addressing_and_expects_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            match req.op {
+                RequestOp::ConfigureNet { ip, gw, dns } => {
+                    assert_eq!(ip, "10.107.3.2/30");
+                    assert_eq!(gw, "10.107.3.1");
+                    assert_eq!(dns, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+                }
+                other => panic!("expected ConfigureNet, got {other:?}"),
+            }
+            write_resp(&mut conn, req.id, ResponseBody::Ok).await;
+        });
+        let client = AgentClient::new(&sock);
+        client
+            .configure_net(
+                "10.107.3.2/30",
+                "10.107.3.1",
+                &["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            )
+            .await
+            .expect("configure_net ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configure_net_surfaces_guest_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            write_resp(
+                &mut conn,
+                req.id,
+                ResponseBody::Error {
+                    message: "eth0 missing".into(),
+                },
+            )
+            .await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client
+            .configure_net("10.107.3.2/30", "10.107.3.1", &[])
+            .await
+            .expect_err("guest error must surface");
+        assert!(matches!(err, AgentError::Guest(m) if m == "eth0 missing"));
         server.await.unwrap();
     }
 

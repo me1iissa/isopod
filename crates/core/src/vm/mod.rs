@@ -22,6 +22,7 @@ use crate::agent::{AgentClient, ExecSpec, StreamCapture};
 use crate::image::{self, RootfsFlavor};
 use crate::net;
 use crate::paths;
+use crate::snapshot::{self, SnapshotKey};
 use crate::stage::{self, StageMeta};
 
 mod build_fc;
@@ -43,8 +44,8 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Exact optimized boot args (M0 `NOTES-boot.md`): `quiet` plus the i8042
 /// keyboard-probe disables that reclaim ~440 ms of cold boot, matching the
 /// fc-client live test verbatim.
-const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda init=/init quiet \
-     i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd 8250.nr_uarts=1";
+pub(crate) const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda \
+     init=/init quiet i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd 8250.nr_uarts=1";
 
 /// Default bound on how long [`dev_boot`] waits for the boot markers.
 pub const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -705,6 +706,16 @@ pub struct RunOptions {
     pub mem_mib: u32,
 }
 
+/// Which boot path served a run: a warm snapshot resume or a cold boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunPath {
+    /// The VM was resumed from a warm-pool memory snapshot.
+    Warm,
+    /// The VM was cold-booted (not warm-eligible, or a resume fell back).
+    Cold,
+}
+
 /// Result of a [`run_ephemeral`], serialized verbatim as `isopod run`'s JSON.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
@@ -737,6 +748,13 @@ pub struct RunReport {
     pub exec_ms: u64,
     /// Total wall time of the whole run in milliseconds.
     pub total_ms: u64,
+    /// Which boot path served this run (`warm` snapshot resume vs `cold` boot).
+    pub path: RunPath,
+    /// Snapshot-resume duration in milliseconds — the time from spawning the
+    /// fresh Firecracker process through a ready, network-reconfigured guest.
+    /// Present only on the warm path; compare against a cold run's `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_ms: Option<u64>,
     /// Guest vCPU count the VM actually booted with (host-validated).
     pub vcpus: u32,
     /// Guest memory in MiB the VM actually booted with (host-validated).
@@ -935,9 +953,21 @@ async fn run_exec(
     let api_sock = vm_dir.join("api.sock");
     let vsock_uds = vm_dir.join("vsock.sock");
 
-    // Materialize the throwaway disks (the cached base/rootfs stay pristine;
-    // committed layers are shared read-only and never copied).
-    let disk = prepare_disk(&plan, &vm_dir)?;
+    // Warm-pool eligibility + key. Eligible iff `--stage base` (a fresh
+    // base-squashfs overlay, zero layers), no `--commit-as`, and networking on.
+    // Build the snapshot (if missing) BEFORE claiming the run's slot, so the
+    // builder — which claims its own slot — and the run each need only one free
+    // slot. A build failure silently disables warm for this run (cold-boot).
+    let warm_key = match warm_snapshot_key(&fc, &kernel, &plan, resources, &opts) {
+        Some(key) => match ensure_snapshot(&fc, &kernel, &plan, resources, &key).await {
+            Ok(()) => Some(key),
+            Err(e) => {
+                eprintln!("run: warm-pool snapshot build failed ({e:#}); cold-booting");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Claim a network slot (default-on). The slot's Drop releases the lock, so
     // it must outlive the whole boot/exec/teardown — it stays live until this
@@ -952,11 +982,12 @@ async fn run_exec(
         None => (None, None),
     };
 
-    let driven = drive_exec(DriveExecCtx {
+    let boot = boot_and_exec(BootCtx {
         fc: &fc,
         kernel: &kernel,
-        disk: &disk,
+        plan: &plan,
         resources,
+        warm_key: warm_key.as_ref(),
         net: net_slot.as_ref(),
         api_sock: &api_sock,
         vsock_uds: &vsock_uds,
@@ -964,24 +995,30 @@ async fn run_exec(
         stdout_log: &stdout_log,
         stderr_log: &stderr_log,
         vm_id: &vm_id,
+        vm_dir: &vm_dir,
         opts: &opts,
         t_total,
     })
     .await;
 
-    // Commit the scratch into the stage store (only on a clean run) *before*
-    // removing it.
-    let commit_outcome = maybe_commit_stage(&disk, &opts, &driven);
+    // Commit the scratch into the stage store (only a clean cold Stage run has a
+    // scratch; a warm resume has no disk to commit) *before* removing it.
+    let commit_outcome = match &boot.disk {
+        Some(disk) => maybe_commit_stage(disk, &opts, &boot.exec),
+        None => Ok(None),
+    };
 
     // Remove throwaway disk(s) unless --keep; keep every log regardless.
     if !opts.keep {
-        cleanup_disk(&disk);
+        if let Some(disk) = &boot.disk {
+            cleanup_disk(disk);
+        }
     }
 
     // Surface a commit failure ahead of the exec result: the user explicitly
     // asked to persist the stage.
     let committed = commit_outcome?;
-    let exec = driven?;
+    let exec = boot.exec?;
     Ok(RunReport {
         ok: true,
         name: vanity,
@@ -997,6 +1034,8 @@ async fn run_exec(
         stderr_bytes: exec.stderr.total_bytes,
         exec_ms: exec.exec_ms,
         total_ms: t_total.elapsed().as_millis() as u64,
+        path: boot.path,
+        resume_ms: boot.resume_ms,
         vcpus: resources.vcpus,
         mem_mib: resources.mem_mib,
         fc_binary: fc,
@@ -1008,6 +1047,182 @@ async fn run_exec(
         stage_name: committed.as_ref().map(|m| m.name.clone()),
         slot: slot_index,
         guest_ip,
+    })
+}
+
+/// Compute the warm-pool snapshot key for a run, or `None` when the run is not
+/// warm-eligible (or host detection failed — which simply means "cold-boot").
+///
+/// Warm-eligible iff `--stage base` (a fresh base-squashfs overlay with zero
+/// committed layers), no `--commit-as` (the RAM upper has no scratch to commit),
+/// and networking on (resume retargets a NIC and re-IPs the guest). A stage
+/// *fork*, a committing run, or `--no-network` cold-boots unchanged. A legacy
+/// `stage: None` (dev-agent ext4) run is intentionally excluded: its rootfs
+/// differs from the base-squashfs warm shape.
+fn warm_snapshot_key(
+    fc: &FcBinary,
+    kernel: &Path,
+    plan: &BootPlan,
+    resources: Resources,
+    opts: &RunOptions,
+) -> Option<SnapshotKey> {
+    if !matches!(&opts.stage, Some(s) if s == STAGE_BASE) {
+        return None;
+    }
+    if opts.commit_as.is_some() || !opts.network {
+        return None;
+    }
+    let BootPlan::Stage { base_flavor, .. } = plan else {
+        return None;
+    };
+    match build_snapshot_key(fc, kernel, base_flavor, resources) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            eprintln!("run: could not compute the warm-pool key ({e:#}); cold-booting");
+            None
+        }
+    }
+}
+
+/// Assemble a [`SnapshotKey`] from detected host facts plus the run's base flavor
+/// and resource shape.
+fn build_snapshot_key(
+    fc: &FcBinary,
+    kernel: &Path,
+    base_flavor: &str,
+    resources: Resources,
+) -> Result<SnapshotKey> {
+    let fc_build = snapshot::detect_fc_build(&fc.path)?;
+    let cpu_model = snapshot::detect_cpu_model()?;
+    let kernel_id = snapshot::kernel_identity(kernel)?;
+    Ok(SnapshotKey::new(
+        fc_build,
+        kernel_id,
+        cpu_model,
+        base_flavor,
+        resources,
+    ))
+}
+
+/// Build the warm-pool snapshot for `key` (from the run's base-squashfs plan) if
+/// it is not already present. A no-op if the snapshot exists.
+async fn ensure_snapshot(
+    fc: &FcBinary,
+    kernel: &Path,
+    plan: &BootPlan,
+    resources: Resources,
+    key: &SnapshotKey,
+) -> Result<()> {
+    let BootPlan::Stage { base_sqfs, .. } = plan else {
+        bail!("warm-pool build requires the base-squashfs topology");
+    };
+    snapshot::ensure(&snapshot::BuildCtx {
+        fc_bin: &fc.path,
+        kernel,
+        base_sqfs,
+        resources,
+        key,
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Result of `isopod warmpool build`, serialized verbatim as the CLI's stdout
+/// JSON.
+#[derive(Debug, Clone, Serialize)]
+pub struct WarmpoolBuildReport {
+    /// Always `true` on the success path.
+    pub ok: bool,
+    /// The snapshot directory-name hash.
+    pub keyhash: String,
+    /// A one-line human summary of the compatibility key.
+    pub summary: String,
+    /// The squashfs base flavor the snapshot boots.
+    pub base: String,
+    /// Guest vCPU count the snapshot was captured at.
+    pub vcpus: u32,
+    /// Guest memory (MiB) the snapshot was captured at.
+    pub mem_mib: u32,
+    /// `true` if a complete snapshot already existed (no rebuild performed).
+    pub cached: bool,
+    /// Size of the microVM state file in bytes.
+    pub vmstate_bytes: u64,
+    /// Size of the guest-memory file in bytes.
+    pub memfile_bytes: u64,
+    /// The snapshot directory (`~/.isopod/snapshots/<keyhash>`).
+    pub snapshot_dir: PathBuf,
+    /// Firecracker build identity in the key.
+    pub fc_build: String,
+    /// Guest-kernel identity in the key.
+    pub kernel_id: String,
+    /// Host CPU model in the key.
+    pub cpu_model: String,
+    /// Snapshot data-format version in the key.
+    pub snapshot_format: String,
+}
+
+/// Force-build (or reuse) the warm-pool snapshot for a `(base, vcpus, mem_mib)`
+/// configuration — the `isopod warmpool build` entry point.
+///
+/// Synchronous (mirrors [`run_ephemeral`]): resolves the firecracker binary,
+/// guest kernel and base image, host-validates the resources, computes the
+/// snapshot key on this host, then drives [`snapshot::ensure`] on an internal
+/// runtime. Building boots a networked VM, so it requires the one-time host
+/// setup (`sudo isopod setup`).
+///
+/// # Errors
+/// If `base` is not a squashfs base, host setup has not run, an artifact cannot
+/// be resolved, the resource shape is out of range, or the build fails.
+pub fn warmpool_build(base: RootfsFlavor, vcpus: u32, mem_mib: u32) -> Result<WarmpoolBuildReport> {
+    if !base.is_squashfs_base() {
+        bail!(
+            "--base {} is not a squashfs base (use base-sqfs or base-alpine)",
+            base.slug()
+        );
+    }
+    // Building attaches a NIC, so it needs the one-time host networking setup.
+    require_network_setup()?;
+    let resources = resources::resolve_for_host(vcpus, mem_mib)?;
+    let fc = resolve_fc_bin()?;
+    let kernel = resolve_kernel()?;
+    let base_sqfs = image::base_image_path(base)?;
+    let key = build_snapshot_key(&fc, &kernel, base.slug(), resources)?;
+    let artifacts = snapshot::artifacts_for(&key)?;
+    let cached = artifacts.is_complete();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    rt.block_on(snapshot::ensure(&snapshot::BuildCtx {
+        fc_bin: &fc.path,
+        kernel: &kernel,
+        base_sqfs: &base_sqfs,
+        resources,
+        key: &key,
+    }))?;
+
+    let vmstate_bytes = std::fs::metadata(&artifacts.vmstate)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let memfile_bytes = std::fs::metadata(&artifacts.memfile)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Ok(WarmpoolBuildReport {
+        ok: true,
+        keyhash: key.keyhash(),
+        summary: key.summary(),
+        base: base.slug().to_string(),
+        vcpus: resources.vcpus,
+        mem_mib: resources.mem_mib,
+        cached,
+        vmstate_bytes,
+        memfile_bytes,
+        snapshot_dir: artifacts.dir,
+        fc_build: key.fc_build,
+        kernel_id: key.kernel_id,
+        cpu_model: key.cpu_model,
+        snapshot_format: key.snapshot_format,
     })
 }
 
@@ -1168,13 +1383,17 @@ fn maybe_commit_stage(
     Ok(Some(meta))
 }
 
-/// Everything [`drive_exec`] needs (bundled to keep the arg count sane).
-struct DriveExecCtx<'a> {
+/// Everything [`boot_and_exec`] needs (bundled to keep the arg count sane).
+struct BootCtx<'a> {
     fc: &'a FcBinary,
     kernel: &'a Path,
-    disk: &'a DiskConfig,
+    /// The disk topology (materialized lazily on the cold path only).
+    plan: &'a BootPlan,
     /// Host-validated vCPU / memory allocation for this VM.
     resources: Resources,
+    /// The warm-pool snapshot key when this run is warm-eligible and its
+    /// snapshot is present (`None` ⇒ always cold-boot).
+    warm_key: Option<&'a SnapshotKey>,
     /// Claimed network slot (`None` for `--no-network`).
     net: Option<&'a net::Slot>,
     api_sock: &'a Path,
@@ -1183,8 +1402,38 @@ struct DriveExecCtx<'a> {
     stdout_log: &'a Path,
     stderr_log: &'a Path,
     vm_id: &'a str,
+    /// The run's VM directory (the resume path derives its socket paths from it).
+    vm_dir: &'a Path,
     opts: &'a RunOptions,
     t_total: Instant,
+}
+
+/// The subset of a run [`run_command`] / [`exec_and_teardown`] need after the VM
+/// is up (shared by the warm and cold boot paths).
+struct ExecParams<'a> {
+    opts: &'a RunOptions,
+    console_log: &'a Path,
+    stdout_log: &'a Path,
+    stderr_log: &'a Path,
+    t_total: Instant,
+}
+
+/// A booted-or-resumed VM ready for the shared exec tail.
+struct BootedVm {
+    proc: FcProcess,
+    agent: AgentClient,
+    /// Serial-drain task to await at teardown. The cold path spawns one; the
+    /// warm path drains detached inside [`snapshot::resume`], so it is `None`.
+    drain: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Outcome of [`boot_and_exec`]: the exec result plus which path served it and
+/// (cold only) the materialized disk to commit/clean up.
+struct BootOutcome {
+    exec: Result<ExecResult>,
+    path: RunPath,
+    resume_ms: Option<u64>,
+    disk: Option<DiskConfig>,
 }
 
 /// The exec-flow's intermediate result (before it is folded into a [`RunReport`]).
@@ -1197,12 +1446,85 @@ struct ExecResult {
     stderr: StreamCapture,
 }
 
-/// Boot the VM (with a vsock device), wait for the agent, sync the clock, run
-/// the command, then halt. The VMM is always torn down before returning, even
-/// on error (both via this function's explicit halt/shutdown and the
-/// [`FcProcess`] drop guard).
-async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
-    let (mut proc, stdout_pipe) =
+/// Bring a VM up (warm resume or cold boot), run the command, and tear it down.
+///
+/// Warm-eligible runs with a present snapshot resume it into the claimed slot;
+/// **any** resume failure (a stale snapshot after a kernel/FC change, a missing
+/// file, a load error) falls back SILENTLY to a cold boot — a resume problem
+/// must never surface as a run error (WSL2 kernel auto-updates invalidate
+/// snapshots in practice). The exec + halt + teardown tail is shared by both
+/// paths.
+async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
+    let params = ExecParams {
+        opts: ctx.opts,
+        console_log: ctx.console_log,
+        stdout_log: ctx.stdout_log,
+        stderr_log: ctx.stderr_log,
+        t_total: ctx.t_total,
+    };
+
+    // Warm path: resume the snapshot into the claimed slot.
+    if let (Some(key), Some(slot)) = (ctx.warm_key, ctx.net) {
+        let t_resume = Instant::now();
+        match snapshot::resume(key, &ctx.fc.path, slot, ctx.vm_dir).await {
+            Ok((proc, agent)) => {
+                let resume_ms = t_resume.elapsed().as_millis() as u64;
+                let vm = BootedVm {
+                    proc,
+                    agent,
+                    drain: None,
+                };
+                let exec = exec_and_teardown(vm, &params).await;
+                return BootOutcome {
+                    exec,
+                    path: RunPath::Warm,
+                    resume_ms: Some(resume_ms),
+                    disk: None,
+                };
+            }
+            Err(e) => {
+                eprintln!("run: warm resume failed ({e:#}); falling back to a cold boot");
+            }
+        }
+    }
+
+    // Cold path: materialize the disk, cold-boot, run.
+    let disk = match prepare_disk(ctx.plan, ctx.vm_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return BootOutcome {
+                exec: Err(e),
+                path: RunPath::Cold,
+                resume_ms: None,
+                disk: None,
+            };
+        }
+    };
+    let vm = match cold_boot(&ctx, &disk).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            return BootOutcome {
+                exec: Err(e),
+                path: RunPath::Cold,
+                resume_ms: None,
+                disk: Some(disk),
+            };
+        }
+    };
+    let exec = exec_and_teardown(vm, &params).await;
+    BootOutcome {
+        exec,
+        path: RunPath::Cold,
+        resume_ms: None,
+        disk: Some(disk),
+    }
+}
+
+/// Cold-boot: spawn Firecracker, tee serial to `console.log`, configure the disk
+/// topology + NIC + hybrid vsock, and start. Returns the running VM plus the
+/// serial-drain handle to await at teardown.
+async fn cold_boot(ctx: &BootCtx<'_>, disk: &DiskConfig) -> Result<BootedVm> {
+    let (proc, stdout_pipe) =
         spawn_fc_piped(ctx.fc, ctx.api_sock, ctx.vm_id, ctx.console_log).await?;
 
     // Tee guest serial to console.log (no marker channel — readiness is vsock).
@@ -1213,7 +1535,7 @@ async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
 
     // Pre-boot configuration, including the hybrid-vsock device.
     let client = proc.client().context("building the API client")?;
-    configure_run_boot(&client, ctx.kernel, ctx.disk, ctx.resources, ctx.net).await?;
+    configure_run_boot(&client, ctx.kernel, disk, ctx.resources, ctx.net).await?;
     client
         .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
         .await
@@ -1221,29 +1543,40 @@ async fn drive_exec(ctx: DriveExecCtx<'_>) -> Result<ExecResult> {
     client.instance_start().await.context("InstanceStart")?;
 
     let agent = AgentClient::new(ctx.vsock_uds);
+    Ok(BootedVm {
+        proc,
+        agent,
+        drain: Some(drain),
+    })
+}
 
-    // Do the exec inside an async block so we can guarantee halt+teardown runs
-    // regardless of how the exec path resolves.
-    let outcome = run_command(&agent, &ctx).await;
+/// Run the command against a booted-or-resumed VM, then always halt + tear the
+/// VMM down (even on error, backed by the [`FcProcess`] drop guard).
+async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<ExecResult> {
+    let outcome = run_command(&vm.agent, params).await;
 
     // Best-effort in-guest halt, then wait for FC to exit; force if it hangs.
-    let _ = agent.halt(true).await;
-    match tokio::time::timeout(Duration::from_secs(3), proc.wait()).await {
+    let _ = vm.agent.halt(true).await;
+    match tokio::time::timeout(Duration::from_secs(3), vm.proc.wait()).await {
         Ok(Ok(_status)) => {}
         _ => {
-            if let Err(e) = proc.shutdown(Duration::from_secs(2)).await {
+            if let Err(e) = vm.proc.shutdown(Duration::from_secs(2)).await {
                 eprintln!("run: warning: forced shutdown returned: {e}");
             }
         }
     }
-    let _ = drain.await;
-
+    if let Some(drain) = vm.drain {
+        let _ = drain.await;
+    }
     outcome
 }
 
 /// Wait for readiness, sync the clock, then exec with a host-side wall-clock
-/// safety net around the guest's own in-guest timeout.
-async fn run_command(agent: &AgentClient, ctx: &DriveExecCtx<'_>) -> Result<ExecResult> {
+/// safety net around the guest's own in-guest timeout. The warm path already
+/// pinged + resynced + reconfigured the network inside [`snapshot::resume`]; the
+/// redundant ping/clock-sync here are cheap and idempotent, so a single tail
+/// serves both boot paths.
+async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecResult> {
     agent
         .wait_ready(AGENT_READY_TIMEOUT)
         .await
@@ -1466,6 +1799,8 @@ mod tests {
             stderr_bytes: 0,
             exec_ms: 12,
             total_ms: 200,
+            path: RunPath::Cold,
+            resume_ms: None,
             vcpus: 1,
             mem_mib: 512,
             fc_binary: FcBinary {
@@ -1489,6 +1824,12 @@ mod tests {
         assert_eq!(v["stdout_bytes"], serde_json::json!(3));
         assert_eq!(v["vcpus"], serde_json::json!(1));
         assert_eq!(v["mem_mib"], serde_json::json!(512));
+        // Cold path: `path` is "cold" and `resume_ms` is omitted entirely.
+        assert_eq!(v["path"], serde_json::json!("cold"));
+        assert!(
+            v.get("resume_ms").is_none(),
+            "resume_ms must be absent on the cold path"
+        );
         assert_eq!(
             v["fc_binary"]["provenance"],
             serde_json::json!("vendored-build")
@@ -1523,6 +1864,7 @@ mod tests {
             "stderr_bytes",
             "exec_ms",
             "total_ms",
+            "path",
             "vcpus",
             "mem_mib",
             "fc_binary",
@@ -1552,6 +1894,8 @@ mod tests {
             stderr_bytes: 0,
             exec_ms: 3,
             total_ms: 120,
+            path: RunPath::Warm,
+            resume_ms: Some(18),
             vcpus: 2,
             mem_mib: 1024,
             fc_binary: FcBinary {
@@ -1571,6 +1915,9 @@ mod tests {
         assert_eq!(v["rootfs_flavor"], serde_json::json!("base-alpine"));
         assert_eq!(v["vcpus"], serde_json::json!(2));
         assert_eq!(v["mem_mib"], serde_json::json!(1024));
+        // Warm path: `path` is "warm" and `resume_ms` is present.
+        assert_eq!(v["path"], serde_json::json!("warm"));
+        assert_eq!(v["resume_ms"], serde_json::json!(18));
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
         assert_eq!(v["slot"], serde_json::json!(3));
