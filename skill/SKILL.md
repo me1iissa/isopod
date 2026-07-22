@@ -91,6 +91,16 @@ route out.
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
+## Big inputs and parallelism
+
+- `stdin` is for small text. For anything beyond a few KiB (tarballs, datasets,
+  archives) pass `stdin_file="/abs/host/path"` instead — the server reads the
+  file directly, so large payloads never transit the model context.
+- Parallel `sandbox_run` calls batched in **one** assistant message execute
+  serially, one VM after another. For genuinely concurrent sandboxes, issue the
+  calls from separate agents/processes — the server and its network-slot pool
+  handle real concurrency fine (verified 6-way).
+
 ## Timeouts
 
 `timeout_s` (default 120) is an **outer wall-clock budget that includes VM
@@ -100,13 +110,14 @@ hundred ms rather than assuming the full value is exec-only.
 
 ## Housekeeping
 
-isopod accumulates state under `~/.isopod` across runs — nothing auto-prunes
-by default:
+isopod accumulates state under `~/.isopod` across runs. The MCP server
+auto-prunes **VM records** (at startup and every ~20 runs, keeping the newest
+20), so read any `*_log_path` you care about promptly. **Stages are never
+auto-pruned**:
 
-- `vm_gc(keep_last=20)` — reaps orphaned Firecracker processes and prunes old
-  VM record directories (logs, throwaway disk copies), keeping the newest N.
-  Safe to call periodically; a good habit after a batch of `sandbox_run`
-  calls.
+- `vm_gc(keep_last=20)` — the same sweep on demand: reaps orphaned Firecracker
+  processes and prunes old VM record directories (logs, throwaway disk
+  copies), keeping the newest N.
 - `stage_rm(reference="myproj/old-attempt")` — removes a stage by id, vanity
   name, or unique label. Refuses if another stage's chain still forks from it
   (delete leaf stages first, or just leave unreferenced ones — they're cheap).

@@ -334,13 +334,17 @@ pub struct BuildCtx<'a> {
 /// If no network slot is free, the builder fails to boot or become ready, or the
 /// snapshot cannot be written. All errors are recoverable by the caller (cold
 /// boot instead).
-pub async fn ensure(ctx: &BuildCtx<'_>) -> Result<SnapshotArtifacts> {
+///
+/// The returned bool is `true` iff this call built the snapshot (vs reusing a
+/// complete cached one) — callers surface it so a first-use run can explain why
+/// its `total_ms` includes seconds of one-time build cost (dogfood finding #20).
+pub async fn ensure(ctx: &BuildCtx<'_>) -> Result<(SnapshotArtifacts, bool)> {
     let artifacts = artifacts_for(ctx.key)?;
     if artifacts.is_complete() {
-        return Ok(artifacts);
+        return Ok((artifacts, false));
     }
     build(ctx, &artifacts).await?;
-    Ok(artifacts)
+    Ok((artifacts, true))
 }
 
 /// Generate a `dev-<8 hex>` VM id (shares the `dev-` prefix so the orphan reaper
@@ -463,7 +467,10 @@ async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> 
     } else {
         None
     };
-    let jail_prefix = jail_spec.as_ref().map(|s| s.prefix.clone()).unwrap_or_default();
+    let jail_prefix = jail_spec
+        .as_ref()
+        .map(|s| s.prefix.clone())
+        .unwrap_or_default();
 
     let mut proc =
         spawn_piped_draining(ctx.fc_bin, &api_sock, &vm_id, &console_log, jail_prefix).await?;

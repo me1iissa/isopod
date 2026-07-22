@@ -18,6 +18,8 @@
 //! to **stderr** — writing logs to stdout would corrupt the protocol stream.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -113,9 +115,17 @@ struct SandboxRunParams {
     #[serde(default)]
     commit_as: Option<String>,
     /// Text piped to the command's stdin (then closed). Use for feeding a script
-    /// or data to the command instead of embedding it in `cmd`.
+    /// or data to the command instead of embedding it in `cmd`. For payloads
+    /// beyond a few KiB prefer `stdin_file` — inline text transits the model's
+    /// context twice.
     #[serde(default)]
     stdin: Option<String>,
+    /// HOST-side file whose bytes are piped to the command's stdin (then
+    /// closed). The server reads the file, so large payloads never transit the
+    /// model context (dogfood finding #21). Mutually exclusive with `stdin`;
+    /// `"-"` is rejected (the server's stdin is the MCP transport itself).
+    #[serde(default)]
+    stdin_file: Option<String>,
     /// Guest vCPU count (default 1). Must be 1 or an even number, at most the
     /// host CPU count; an over-cap value errors without booting.
     #[serde(default)]
@@ -177,6 +187,20 @@ struct SandboxRunResult {
     duration_ms: u64,
     /// Total wall time of the whole run (boot + exec + teardown) in ms.
     total_ms: u64,
+    /// Which boot path served this run: `"warm"` (snapshot resume) or `"cold"`
+    /// (full boot — not warm-eligible, or the resume fell back).
+    path: String,
+    /// Snapshot-resume duration in ms; present only on the `"warm"` path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_ms: Option<u64>,
+    /// `true` iff this run built the warm-pool snapshot as a side effect (first
+    /// use of a warm-eligible shape) — that one-time build cost (~seconds) is
+    /// inside `total_ms` even though the run itself then resumed warm.
+    snapshot_built: bool,
+    /// Stage-commit duration in ms; present only when `commit_as` committed a
+    /// stage this run (roughly seconds per GiB of layer, inside `total_ms`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_ms: Option<u64>,
     /// Guest vCPU count the sandbox booted with (host-validated).
     vcpus: u32,
     /// Guest memory in MiB the sandbox booted with (host-validated).
@@ -221,6 +245,13 @@ impl From<RunReport> for SandboxRunResult {
             stderr_bytes: r.stderr_bytes,
             duration_ms: r.exec_ms,
             total_ms: r.total_ms,
+            path: match r.path {
+                vm::RunPath::Warm => "warm".to_string(),
+                vm::RunPath::Cold => "cold".to_string(),
+            },
+            resume_ms: r.resume_ms,
+            snapshot_built: r.snapshot_built,
+            commit_ms: r.commit_ms,
             vcpus: r.vcpus,
             mem_mib: r.mem_mib,
             vm_id: r.vm_id,
@@ -341,12 +372,41 @@ struct VmGcResult {
 // Server.
 // ===========================================================================
 
-/// The isopod MCP server: a stateless shim holding only the generated tool
-/// router. All durable state lives under `~/.isopod` (file-locked), so a crashed
-/// server leaves nothing to clean up beyond a `vm_gc` sweep.
+/// The isopod MCP server: a near-stateless shim holding the generated tool
+/// router and a run counter for the periodic auto-GC sweep. All durable state
+/// lives under `~/.isopod` (file-locked), so a crashed server leaves nothing to
+/// clean up beyond a `vm_gc` sweep.
 #[derive(Debug, Clone)]
 struct Isopod {
     tool_router: ToolRouter<Self>,
+    /// Total `sandbox_run` calls served — drives the every-Nth auto-GC.
+    runs: Arc<AtomicU64>,
+}
+
+/// How many newest VM record dirs the automatic sweeps keep (matches the
+/// `vm_gc` tool's default).
+const AUTO_GC_KEEP_LAST: usize = 20;
+/// Auto-GC cadence: sweep after every Nth `sandbox_run`.
+const AUTO_GC_EVERY: u64 = 20;
+
+/// Fire-and-forget GC sweep on the blocking pool: reap orphaned firecracker
+/// processes and prune old VM record dirs (keeping [`AUTO_GC_KEEP_LAST`] plus
+/// anything under a minute old). A long-lived server otherwise accretes VM dirs
+/// and exec logs without bound; note this means `*_log_path` values from runs
+/// older than the newest ~20 eventually dangle.
+fn spawn_auto_gc(trigger: &'static str) {
+    tokio::task::spawn_blocking(move || {
+        match vm::vm_gc(AUTO_GC_KEEP_LAST, Duration::from_secs(60)) {
+            Ok(r) => tracing::info!(
+                trigger,
+                removed = r.removed.len(),
+                kept = r.kept,
+                freed_bytes = r.freed_bytes,
+                "auto vm_gc"
+            ),
+            Err(e) => tracing::warn!(trigger, "auto vm_gc failed: {e:#}"),
+        }
+    });
 }
 
 #[tool_router(router = tool_router)]
@@ -355,6 +415,7 @@ impl Isopod {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            runs: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -376,7 +437,10 @@ commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the tool
 (Python/Node/git/gcc); pass `stage` to fork a committed stage, `commit_as` to persist the result \
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
 Networking on by default (network=false for untrusted code). timeout_s covers boot + exec \
-(default 120). Size the VM with vcpus (default 1) and mem_mib (default 512), both host-capped.",
+(default 120). Size the VM with vcpus (default 1) and mem_mib (default 512), both host-capped. \
+For large stdin payloads pass stdin_file (a host path) instead of stdin. NOTE: parallel \
+sandbox_run calls batched in one message execute serially; for concurrent sandboxes, issue \
+calls from separate agents.",
         meta = crate::sandbox_run_meta()
     )]
     async fn sandbox_run(
@@ -412,6 +476,32 @@ Networking on by default (network=false for untrusted code). timeout_s covers bo
         let stage = Some(p.stage.unwrap_or_else(|| "base".to_string()));
         let env: Vec<(String, String)> = p.env.unwrap_or_default().into_iter().collect();
 
+        // Resolve stdin: inline text, or a host-side file read here so large
+        // payloads never round-trip through the model context (finding #21).
+        let stdin = match (p.stdin, p.stdin_file) {
+            (Some(_), Some(_)) => {
+                return Err(ErrorData::invalid_params(
+                    "pass either `stdin` or `stdin_file`, not both",
+                    None,
+                ));
+            }
+            (Some(text), None) => Some(text.into_bytes()),
+            (None, Some(path)) => {
+                if path == "-" {
+                    return Err(ErrorData::invalid_params(
+                        "stdin_file \"-\" is not supported over MCP: the server's own stdin is \
+                         the JSON-RPC transport; pass a regular file path",
+                        None,
+                    ));
+                }
+                let bytes = tokio::fs::read(&path).await.map_err(|e| {
+                    ErrorData::invalid_params(format!("reading stdin_file {path:?}: {e}"), None)
+                })?;
+                Some(bytes)
+            }
+            (None, None) => None,
+        };
+
         let opts = RunOptions {
             argv: vec!["/bin/sh".to_string(), "-c".to_string(), p.cmd],
             env,
@@ -423,7 +513,7 @@ Networking on by default (network=false for untrusted code). timeout_s covers bo
             stage,
             commit_as: p.commit_as,
             base,
-            stdin: p.stdin.map(String::into_bytes),
+            stdin,
             // Defaults resolved by the core resolver, which also host-validates.
             vcpus: p.vcpus.unwrap_or(vm::DEFAULT_VCPUS),
             mem_mib: p.mem_mib.unwrap_or(vm::DEFAULT_MEM_MIB),
@@ -460,6 +550,13 @@ Networking on by default (network=false for untrusted code). timeout_s covers bo
 
         if let Some(handle) = keepalive {
             handle.abort();
+        }
+
+        // Periodic background retention sweep (see `spawn_auto_gc`); counted per
+        // attempt so failed runs still advance the cadence.
+        let served = self.runs.fetch_add(1, Ordering::Relaxed) + 1;
+        if served % AUTO_GC_EVERY == 0 {
+            spawn_auto_gc("periodic");
         }
 
         match outcome {
@@ -590,7 +687,9 @@ bytes. These are the per-run directories holding serial and exec logs."
     #[tool(
         name = "vm_gc",
         description = "Reap orphaned firecracker processes and prune old VM directories, keeping the \
-newest `keep_last` (default 20) and anything under a minute old."
+newest `keep_last` (default 20) and anything under a minute old. The server also runs this \
+sweep automatically (at startup and every 20 sandbox runs), so *_log_path files from old runs \
+eventually disappear — read logs you care about promptly."
     )]
     async fn vm_gc(&self, params: Parameters<VmGcParams>) -> Result<Json<VmGcResult>, ErrorData> {
         let keep_last = params.0.keep_last.unwrap_or(20);
@@ -637,6 +736,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("isopod-mcp starting (rmcp stdio transport)");
+    // Sweep leftovers from previous sessions (orphaned firecrackers, old VM
+    // dirs) without delaying server readiness.
+    spawn_auto_gc("startup");
     let service = Isopod::new().serve(rmcp::transport::stdio()).await?;
     let reason = service.waiting().await?;
     tracing::info!(?reason, "isopod-mcp shutting down");

@@ -769,6 +769,14 @@ pub struct RunReport {
     /// Present only on the warm path; compare against a cold run's `total_ms`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_ms: Option<u64>,
+    /// `true` iff this run built the warm-pool snapshot as a side effect (first
+    /// use of a warm-eligible shape). The one-time build cost (~seconds) is
+    /// inside `total_ms` even though the run itself then resumed `warm`.
+    pub snapshot_built: bool,
+    /// Stage-commit duration in milliseconds (present only when `--commit-as`
+    /// committed a stage this run; included in `total_ms`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_ms: Option<u64>,
     /// Guest vCPU count the VM actually booted with (host-validated).
     pub vcpus: u32,
     /// Guest memory in MiB the VM actually booted with (host-validated).
@@ -995,9 +1003,13 @@ async fn run_exec(
     // Build the snapshot (if missing) BEFORE claiming the run's slot, so the
     // builder — which claims its own slot — and the run each need only one free
     // slot. A build failure silently disables warm for this run (cold-boot).
+    let mut snapshot_built = false;
     let warm_key = match warm_snapshot_key(&fc, &kernel, &plan, resources, &opts) {
         Some(key) => match ensure_snapshot(&fc, &kernel, &plan, resources, &key).await {
-            Ok(()) => Some(key),
+            Ok(built) => {
+                snapshot_built = built;
+                Some(key)
+            }
             Err(e) => {
                 eprintln!("run: warm-pool snapshot build failed ({e:#}); cold-booting");
                 None
@@ -1054,11 +1066,15 @@ async fn run_exec(
     .await;
 
     // Commit the scratch into the stage store (only a clean cold Stage run has a
-    // scratch; a warm resume has no disk to commit) *before* removing it.
+    // scratch; a warm resume has no disk to commit) *before* removing it. The
+    // commit's wall time is measured so a committing run's `total_ms` is
+    // explainable (~seconds per GiB of layer; dogfood finding #20).
+    let t_commit = Instant::now();
     let commit_outcome = match &boot.disk {
         Some(disk) => maybe_commit_stage(disk, &opts, &boot.exec),
         None => Ok(None),
     };
+    let commit_elapsed_ms = t_commit.elapsed().as_millis() as u64;
 
     // Remove throwaway disk(s) unless --keep; keep every log regardless.
     if !opts.keep {
@@ -1095,6 +1111,8 @@ async fn run_exec(
         total_ms: t_total.elapsed().as_millis() as u64,
         path: boot.path,
         resume_ms: boot.resume_ms,
+        snapshot_built,
+        commit_ms: committed.as_ref().map(|_| commit_elapsed_ms),
         vcpus: resources.vcpus,
         mem_mib: resources.mem_mib,
         fc_binary: fc,
@@ -1166,14 +1184,15 @@ fn build_snapshot_key(
 }
 
 /// Build the warm-pool snapshot for `key` (from the run's base-squashfs plan) if
-/// it is not already present. A no-op if the snapshot exists.
+/// it is not already present. A no-op if the snapshot exists. Returns `true` iff
+/// the snapshot was built by this call (surfaced as `snapshot_built`).
 async fn ensure_snapshot(
     fc: &FcBinary,
     kernel: &Path,
     plan: &BootPlan,
     resources: Resources,
     key: &SnapshotKey,
-) -> Result<()> {
+) -> Result<bool> {
     let BootPlan::Stage { base_sqfs, .. } = plan else {
         bail!("warm-pool build requires the base-squashfs topology");
     };
@@ -1185,7 +1204,7 @@ async fn ensure_snapshot(
         key,
     })
     .await
-    .map(|_| ())
+    .map(|(_, built)| built)
 }
 
 /// Result of `isopod warmpool build`, serialized verbatim as the CLI's stdout
@@ -1771,7 +1790,10 @@ mod tests {
     #[test]
     fn scratch_mib_resolves_default_and_enforces_bounds() {
         // Unset -> the module default.
-        assert_eq!(resolve_scratch_mib(None).unwrap(), stage::DEFAULT_SCRATCH_MIB);
+        assert_eq!(
+            resolve_scratch_mib(None).unwrap(),
+            stage::DEFAULT_SCRATCH_MIB
+        );
         // In-range values pass through unchanged (as u64).
         assert_eq!(
             resolve_scratch_mib(Some(MIN_SCRATCH_MIB)).unwrap(),
@@ -1929,6 +1951,8 @@ mod tests {
             total_ms: 200,
             path: RunPath::Cold,
             resume_ms: None,
+            snapshot_built: false,
+            commit_ms: None,
             vcpus: 1,
             mem_mib: 512,
             fc_binary: FcBinary {
@@ -1957,6 +1981,13 @@ mod tests {
         assert!(
             v.get("resume_ms").is_none(),
             "resume_ms must be absent on the cold path"
+        );
+        // Observability fields (#20): the bool is always present; commit_ms is
+        // omitted when no stage was committed.
+        assert_eq!(v["snapshot_built"], serde_json::json!(false));
+        assert!(
+            v.get("commit_ms").is_none(),
+            "commit_ms must be absent when no stage was committed"
         );
         assert_eq!(
             v["fc_binary"]["provenance"],
@@ -2024,6 +2055,8 @@ mod tests {
             total_ms: 120,
             path: RunPath::Warm,
             resume_ms: Some(18),
+            snapshot_built: true,
+            commit_ms: Some(1450),
             vcpus: 2,
             mem_mib: 1024,
             fc_binary: FcBinary {
@@ -2046,6 +2079,8 @@ mod tests {
         // Warm path: `path` is "warm" and `resume_ms` is present.
         assert_eq!(v["path"], serde_json::json!("warm"));
         assert_eq!(v["resume_ms"], serde_json::json!(18));
+        assert_eq!(v["snapshot_built"], serde_json::json!(true));
+        assert_eq!(v["commit_ms"], serde_json::json!(1450));
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
         assert_eq!(v["slot"], serde_json::json!(3));
