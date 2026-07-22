@@ -14,7 +14,7 @@
 | Diff snapshot + `snapshot-editor` rebase + restore of merged result | ✅ PASS | resumes at diff point; diff memfile ~892 KiB sparse vs 256 MiB full |
 | Snapshot format version (for cache keys) | **v10.0.0** | `snapshot-editor info-vmstate version` |
 | Kernel-forwarded NAT egress under mirrored networking | ✅ **PASS** (2026-07-21, user-run) | netns→veth→MASQUERADE→eth0: ping 3/3 to 1.1.1.1, HTTPS-by-IP 301, DNS via 1.1.1.1 resolved, `https://api.github.com` HTTP 200. WSL#10842 does not bite this host — **no `.wslconfig` change needed; NAT design proceeds** |
-| Unprivileged open of root-created tap | ✅ **PASS** (2026-07-21, user-run, `--tap-only`) | `melissa` opened `/dev/net/tun` + bound root-created tap via `TUNSETIFF (IFF_TAP\|IFF_NO_PI)` — the root-only-at-setup / no-root-at-runtime design holds. (First run was invalid: 17-char ifname vs `IFNAMSIZ` 15 — script bug, fixed) |
+| Unprivileged open of root-created tap | ✅ **PASS** (2026-07-21, user-run, `--tap-only`) | the unprivileged user opened `/dev/net/tun` + bound root-created tap via `TUNSETIFF (IFF_TAP\|IFF_NO_PI)` — the root-only-at-setup / no-root-at-runtime design holds. (First run was invalid: 17-char ifname vs `IFNAMSIZ` 15 — script bug, fixed) |
 
 ## Latency baselines (256 MiB / 1 vCPU guest, nested EPT, medians)
 

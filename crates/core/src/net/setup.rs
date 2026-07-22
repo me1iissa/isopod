@@ -357,7 +357,7 @@ fn detect_default_iface() -> Result<String> {
         );
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    // First line, token after "dev": `default via 192.168.3.1 dev eth0 ...`.
+    // First line, token after "dev": `default via 192.0.2.1 dev eth0 ...`.
     let iface = text
         .lines()
         .next()
