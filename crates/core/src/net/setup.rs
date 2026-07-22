@@ -10,10 +10,22 @@
 //! 1. **Taps** — for each slot `i`, a persistent `isopod-tap<i>` owned by the
 //!    invoking (non-root) user, addressed `10.107.<i>.1/30`, brought up.
 //! 2. **One nftables table `inet isopod`** — masquerade for `10.107.0.0/16` out
-//!    the default-route interface, a forward chain that lets guests reach the WAN
-//!    (and established replies back) but **drops tap↔tap** (inter-VM isolation)
-//!    and any other tap-sourced forwarding, and an input chain that **drops new
-//!    guest→host connections** (host services are unreachable from guests).
+//!    the default-route interface, and a forward chain that confines guests to
+//!    **public-only egress**:
+//!    - **drops tap↔tap** (inter-VM isolation);
+//!    - **anti-spoof** — pins each `isopod-tap<i>` to its slot's exact guest IP
+//!      (`10.107.<i>.2`), so a root guest cannot forge a source address onto the
+//!      LAN/WAN or blind-spoof a sibling slot;
+//!    - **IPv6 default-deny** for tap-sourced forwarding (there is no v6 NAT or
+//!      routable v6 address, so no v6 egress path exists to permit);
+//!    - **drops RFC1918 / CGNAT / link-local destinations** so a guest reaches
+//!      the public internet but not the host's private LAN or cloud metadata
+//!      (opt out with `--allow-lan-egress`);
+//!    - lets guests reach the WAN (and established replies back) and **drops any
+//!      other tap-sourced forwarding**.
+//!
+//!    An input chain **drops new guest→host connections** (host services are
+//!    unreachable from guests).
 //! 3. **`net.ipv4.ip_forward=1`** — set live and persisted to
 //!    `/etc/sysctl.d/90-isopod.conf`.
 //! 4. **The manifest** `~/.isopod/net/slots.json`, `chown`ed (with the net state
@@ -33,12 +45,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use super::{
-    host_cidr, net_dir, tap_name, write_manifest_in, Manifest, DEFAULT_SLOT_COUNT,
+    guest_ip, host_cidr, net_dir, tap_name, write_manifest_in, Manifest, DEFAULT_SLOT_COUNT,
     MANIFEST_VERSION, MAX_SLOT_COUNT, SLOT_SUPERNET,
 };
 
 /// The single nftables table isopod owns.
 const NFT_TABLE: &str = "inet isopod";
+
+/// RFC1918 + CGNAT + link-local/metadata destinations a guest must never reach
+/// (public-only egress). 10.107.0.0/16 (isopod's own supernet) is inside
+/// 10.0.0.0/8, so cross-slot forwards and guest→gateway forwards are covered too.
+/// Per RFC1918 / RFC6598 (100.64.0.0/10 CGNAT) / RFC3927 (169.254.0.0/16).
+const PRIVATE_V4_DESTS: &str =
+    "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10";
 /// Where `ip_forward=1` is persisted across reboots.
 const SYSCTL_CONF: &str = "/etc/sysctl.d/90-isopod.conf";
 /// The live sysctl knob for IPv4 forwarding.
@@ -53,6 +72,10 @@ pub struct SetupOptions {
     pub remove: bool,
     /// Override the auto-detected default-route egress interface.
     pub iface: Option<String>,
+    /// Permit guest egress to RFC1918 / CGNAT / link-local destinations (the
+    /// host's private LAN and cloud metadata). INSECURE — enables lateral
+    /// movement / SSRF from untrusted guests; off by default (public-only egress).
+    pub allow_lan_egress: bool,
 }
 
 impl Default for SetupOptions {
@@ -61,6 +84,7 @@ impl Default for SetupOptions {
             slots: DEFAULT_SLOT_COUNT,
             remove: false,
             iface: None,
+            allow_lan_egress: false,
         }
     }
 }
@@ -138,7 +162,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     }
 
     // 2. nftables — one table, rebuilt atomically so re-runs converge.
-    apply_nft(&build_nft_ruleset(&iface))?;
+    apply_nft(&build_nft_ruleset(&iface, slot_count, opts.allow_lan_egress))?;
 
     // 3. ip_forward — live now, persisted for reboots.
     set_ip_forward(true)?;
@@ -155,6 +179,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         slot_count,
         default_iface: iface.clone(),
         created_unix: now_unix(),
+        allow_lan_egress: opts.allow_lan_egress,
     };
     write_manifest_in(&root, &manifest)?;
     chown_recursive(&user, &root)?;
@@ -227,8 +252,46 @@ fn teardown() -> Result<SetupReport> {
 /// on a first run, then the table is rebuilt from scratch in the same
 /// transaction. All chains use `policy accept` so unrelated host/Docker traffic
 /// at the same hooks is never disturbed; isolation comes from explicit `drop`s.
+///
+/// The forward chain confines guests to **public-only egress** (evaluated
+/// top-to-bottom, first terminal verdict wins):
+///
+/// 1. tap↔tap drop (inter-VM isolation);
+/// 2. per-tap anti-spoof — one rule per provisioned slot pins `isopod-tap<i>` to
+///    its exact guest IP `10.107.<i>.2`, so a root guest cannot forge a source
+///    address (a guest cannot change which tap its packets arrive on);
+/// 3. IPv6 default-deny for tap-sourced forwarding (no v6 NAT / route exists);
+/// 4. RFC1918 / CGNAT / link-local **destination** drop (public-only egress),
+///    omitted when `allow_lan_egress` is set;
+/// 5. WAN→tap established/related reply accept (unchanged);
+/// 6. tap→WAN egress accept (unchanged);
+/// 7. tap-sourced default-deny (unchanged).
+///
+/// Public destinations — including the `DEFAULT_DNS` resolvers 1.1.1.1 / 8.8.8.8
+/// — are outside all five private CIDRs, so they fall through to the egress
+/// accept + masquerade. A guest reaching its own gateway `10.107.<i>.1` is local
+/// delivery (input hook), not forwarding, so the destination guard never touches
+/// it. In an `inet` table, `ip saddr`/`ip daddr` match IPv4 only and
+/// `meta nfproto ipv6` matches IPv6 only, so the v4 and v6 rules never overlap.
 #[must_use]
-pub fn build_nft_ruleset(wan: &str) -> String {
+pub fn build_nft_ruleset(wan: &str, slots: usize, allow_lan_egress: bool) -> String {
+    // Per-tap anti-spoof: pin every tap to its slot's guest IP (one rule/slot).
+    // A literal `isopod-tap<i>` name (not the `isopod-tap*` wildcard) is required
+    // because each rule pins a different address.
+    let mut antispoof = String::new();
+    for i in 0..slots {
+        antispoof.push_str(&format!(
+            "\t\tiifname \"isopod-tap{i}\" ip saddr != {gip} drop\n",
+            gip = guest_ip(i),
+        ));
+    }
+    // Public-only egress unless the operator explicitly opts out: drop guest
+    // packets destined for the host's private LAN / cloud metadata.
+    let dst_guard = if allow_lan_egress {
+        String::new()
+    } else {
+        format!("\t\tiifname \"isopod-tap*\" ip daddr {{ {PRIVATE_V4_DESTS} }} drop\n")
+    };
     format!(
         "add table inet isopod\n\
          delete table inet isopod\n\
@@ -240,6 +303,9 @@ pub fn build_nft_ruleset(wan: &str) -> String {
          \tchain forward {{\n\
          \t\ttype filter hook forward priority filter; policy accept;\n\
          \t\tiifname \"isopod-tap*\" oifname \"isopod-tap*\" drop\n\
+         {antispoof}\
+         \t\tiifname \"isopod-tap*\" meta nfproto ipv6 drop\n\
+         {dst_guard}\
          \t\tiifname \"{wan}\" oifname \"isopod-tap*\" ct state established,related accept\n\
          \t\tiifname \"isopod-tap*\" oifname \"{wan}\" accept\n\
          \t\tiifname \"isopod-tap*\" drop\n\
@@ -251,6 +317,8 @@ pub fn build_nft_ruleset(wan: &str) -> String {
          }}\n",
         net = SLOT_SUPERNET,
         wan = wan,
+        antispoof = antispoof,
+        dst_guard = dst_guard,
     )
 }
 
@@ -557,7 +625,7 @@ mod tests {
 
     #[test]
     fn nft_ruleset_has_masquerade_isolation_and_input_drop() {
-        let rs = build_nft_ruleset("eth0");
+        let rs = build_nft_ruleset("eth0", 4, false);
         // Atomic rebuild idiom.
         assert!(rs.contains("add table inet isopod"));
         assert!(rs.contains("delete table inet isopod"));
@@ -574,13 +642,60 @@ mod tests {
         // saddr: a guest running root code can spoof its source IP, but cannot
         // change which tap its packets arrive on.
         assert!(rs.contains("iifname \"isopod-tap*\" ct state new drop"));
+
+        // F1: public-only egress — private/CGNAT/link-local destinations dropped.
+        assert!(rs.contains(
+            "iifname \"isopod-tap*\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, \
+             192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop"
+        ));
+        // F1: IPv6 default-deny for tap-sourced forwarding (no v6 NAT exists).
+        assert!(rs.contains("iifname \"isopod-tap*\" meta nfproto ipv6 drop"));
+        // F1: per-tap anti-spoof pins each tap to its slot's guest IP.
+        assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
+        assert!(rs.contains("iifname \"isopod-tap3\" ip saddr != 10.107.3.2 drop"));
+        // Public destinations (DNS resolvers) are NOT in the drop set.
+        assert!(!rs.contains("1.1.1.1"));
+        assert!(!rs.contains("8.8.8.8"));
+        // Ordering: the new drops precede the egress accept.
+        let egress = rs.find("oifname \"eth0\" accept").unwrap();
+        assert!(rs.find("ip daddr {").unwrap() < egress);
+        assert!(rs.find("ip saddr != 10.107.0.2").unwrap() < egress);
+        assert!(rs.find("meta nfproto ipv6 drop").unwrap() < egress);
     }
 
     #[test]
     fn nft_ruleset_interpolates_the_named_iface() {
-        let rs = build_nft_ruleset("wlp3s0");
+        let rs = build_nft_ruleset("wlp3s0", 8, false);
         assert!(rs.contains("oifname \"wlp3s0\" masquerade"));
         assert!(!rs.contains("eth0"));
+    }
+
+    #[test]
+    fn nft_ruleset_allow_lan_egress_omits_dest_drops() {
+        let rs = build_nft_ruleset("eth0", 4, true);
+        assert!(!rs.contains("ip daddr {"), "opt-out must omit the destination guard");
+        // Anti-spoof and v6 default-deny remain even when LAN egress is allowed.
+        assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
+        assert!(rs.contains("meta nfproto ipv6 drop"));
+        // Egress + isolation still present.
+        assert!(rs.contains("iifname \"isopod-tap*\" oifname \"eth0\" accept"));
+        assert!(rs.contains("iifname \"isopod-tap*\" oifname \"isopod-tap*\" drop"));
+    }
+
+    #[test]
+    fn nft_ruleset_antispoof_is_per_provisioned_slot() {
+        let rs = build_nft_ruleset("eth0", 3, false);
+        for i in 0..3 {
+            assert!(rs.contains(&format!(
+                "iifname \"isopod-tap{i}\" ip saddr != 10.107.{i}.2 drop"
+            )));
+        }
+        // No rule for an unprovisioned slot.
+        assert!(!rs.contains("isopod-tap3"));
+        // Zero slots ⇒ no anti-spoof lines, but the rest of the chain is intact.
+        let none = build_nft_ruleset("eth0", 0, false);
+        assert!(!none.contains("ip saddr !="));
+        assert!(none.contains("iifname \"isopod-tap*\" oifname \"eth0\" accept"));
     }
 
     #[test]

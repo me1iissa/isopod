@@ -67,6 +67,11 @@ struct SetupArgs {
     /// Override the auto-detected default-route egress interface to NAT out of.
     #[arg(long)]
     iface: Option<String>,
+    /// Permit guest egress to RFC1918 / CGNAT / link-local destinations (the
+    /// host LAN and cloud metadata). INSECURE: allows lateral movement / SSRF
+    /// from untrusted guests. Default off (public-only egress).
+    #[arg(long = "allow-lan-egress")]
+    allow_lan_egress: bool,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +250,7 @@ fn run_setup(args: SetupArgs) -> i32 {
             slots: args.slots,
             remove: args.remove,
             iface: args.iface,
+            allow_lan_egress: args.allow_lan_egress,
         },
     ))
 }

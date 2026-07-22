@@ -151,6 +151,12 @@ pub struct Manifest {
     pub default_iface: String,
     /// When `setup` wrote this manifest (Unix seconds).
     pub created_unix: u64,
+    /// Whether setup was run with `--allow-lan-egress` (guest→private-LAN egress
+    /// permitted). Informational/audit; the live nftables ruleset is
+    /// authoritative. `#[serde(default)]` keeps pre-existing on-disk manifests
+    /// (which lack the field) deserializable without a `MANIFEST_VERSION` bump.
+    #[serde(default)]
+    pub allow_lan_egress: bool,
 }
 
 /// A claimed network slot. Holds an `O_EXCL` lockfile for its lifetime;
@@ -476,10 +482,17 @@ mod tests {
             slot_count: 8,
             default_iface: "eth0".into(),
             created_unix: 1_700_000_000,
+            allow_lan_egress: false,
         };
         write_manifest_in(dir.path(), &m).unwrap();
         assert!(manifest_path_in(dir.path()).is_file());
         assert_eq!(read_manifest_in(dir.path()).unwrap(), m);
+
+        // Back-compat: a manifest written before allow_lan_egress existed parses
+        // with the field defaulting to false (serde(default)).
+        let legacy = r#"{"version":1,"slot_count":8,"default_iface":"eth0","created_unix":1}"#;
+        let parsed: Manifest = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.allow_lan_egress);
     }
 
     #[test]
