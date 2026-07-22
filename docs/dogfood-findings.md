@@ -138,24 +138,32 @@ model + M5.5 flex resources carry a real heavy workload. Five gaps fell out.
     tmpfs upper), so the requested size always takes effect; `--mem-mib` remains the lever for a
     bigger RAM upper on warm runs.
 
-15. **[open] MED — no Rust toolchain in any base, and `base-alpine` has no `apk`.** The squashfs
+15. **[fixed] MED — no Rust toolchain in any base, and `base-alpine` has no `apk`.** The squashfs
     base bakes in python/node/git/gcc/make/cmake but strips the package manager, so you can't
     `apk add` a toolchain at runtime. `curl`/`xz`/`bash` also absent (`wget`/`gzip`/`tar`/`base64`
     present). rustup-over-`wget` works fine. → for a system whose own dogfood is "build yourself",
     consider a toolchain-bearing base flavor, or keep `apk` available in base-alpine.
+    → FIXED (2026-07-22 wave): base-alpine retains the verified static `apk` + signing keys
+    (in-guest `apk add jq` verified live) and adds `cmake` + GNU `coreutils`; Rust toolchains
+    stay stages (`rust-stable`), which the self-build proved out.
 
-16. **[open] LOW/footgun — `--base X` without `--stage` silently boots the legacy `dev-agent`
+16. **[fixed] LOW/footgun — `--base X` without `--stage` silently boots the legacy `dev-agent`
     ext4 rootfs, ignoring `--base`.** The flag appears to do nothing — and, mid-M6, that legacy
     rootfs still carried the old proto v1 guest, surfacing a confusing "guest 1 does not match
     host 2" until you realise `--base` only applies with `--stage`. → warn/error when `--base` is
     passed without `--stage`, or make `--base` imply the squashfs/overlay topology.
+    → FIXED (2026-07-22 wave): a lone `--base` is now a hard error naming both valid spellings.
 
-17. **[note] proto-version skew across guest images after a `PROTO_VERSION` bump.** Bumping to v2
+17. **[fixed] proto-version skew across guest images after a `PROTO_VERSION` bump.** Bumping to v2
     for `ConfigureNet` (M6) requires rebuilding **every** guest image (base-sqfs, base-alpine
     squashfs, legacy dev-agent) *and* restarting any long-lived `isopod-mcp` server, or the guest
     baked into one image (or the stale server binary) mismatches. Credit: the error is clear and
     names both versions. → build tooling should rebuild all guest images together + stamp their
     proto version; surface per-image proto version in a status command.
+    → FIXED (2026-07-22 wave): every build stamps `<image>.meta.json` (flavor, proto, agent
+    sha256, image sha256); run paths refuse a stale image *pre-boot* naming the fix;
+    `isopod image build-all` force-rebuilds every flavor together and `image ls` shows
+    per-image proto + stale/unstamped. Exercised for real by the v2→v3 bump.
 
 *Hypothesis retracted:* I expected `aws-lc-sys` to fail for want of cmake — it built cleanly
 (base-alpine ships cmake for node-gyp, and aws-lc-sys has a cc path). Not a finding.
@@ -192,14 +200,14 @@ downloads included), committed as stage `isopod-build` (1.53 GiB layer, +34.3 s 
   cold ext4 path ≈ 570–700 ms, first-use-of-a-shape snapshot build ≈ 5.4 s. The M6 "resume
   52–72 ms" figure is the restore step, not wall time. See #20.
 
-18. **[open] MED — a bad `cwd` fails blaming `/bin/sh`, not the missing directory.**
+18. **[fixed] MED — a bad `cwd` fails blaming `/bin/sh`, not the missing directory.**
     `sandbox_run` with `cwd="/no/such/dir"` returns exit 127 with stderr
     `isopod-exec: /bin/sh: No such file or directory (os error 2)` — the natural read is "the
     image has no shell" (and 127 usually means command-not-found), a wrong-way debugging lead.
     → isopod-exec should check/chdir the cwd first and report `cwd '/no/such/dir': No such
     file or directory`.
 
-19. **[open] MED — stale-proto guest failure is masked by a tap error on the networked path.**
+19. **[fixed¹] MED — stale-proto guest failure is masked by a tap error on the networked path.**
     `base-sqfs` (still proto v1, #17) with default networking fails as `Open tap device failed:
     … Device or resource busy … Invalid TUN/TAP Backend provided by isopod-tap0` (reproduced
     twice; base-alpine on the same slot works immediately after) — pointing at host networking
@@ -208,30 +216,30 @@ downloads included), committed as stage `isopod-build` (1.53 GiB layer, +34.3 s 
     error; also worth checking whether any cold boot can transiently collide with a
     warm-pool-held tap.
 
-20. **[open] LOW — MCP result JSON omits boot-path and commit-cost observability.** The CLI
+20. **[fixed] LOW — MCP result JSON omits boot-path and commit-cost observability.** The CLI
     result has `path: "cold"|"warm"`; the MCP result doesn't, which is exactly why the warm pool
     was misdiagnosed mid-gauntlet. `commit_as` runs also fold commit time into `total_ms`
     (1612 ms total vs 41 ms exec on a trivial commit; ~34 s for a 1.53 GiB layer ≈ 20 s/GiB).
     → add `path` (incl. distinguishing "snapshot-build" from plain cold) and `commit_ms` to the
     MCP result.
 
-21. **[open] LOW — no first-class host↔guest file channel.** Payload-in: MCP `stdin` transits
+21. **[fixed] LOW — no first-class host↔guest file channel.** Payload-in: MCP `stdin` transits
     model context twice, so the 290 KB source tarball (~75 k tokens) is unusable over MCP —
     injection had to use CLI `--stdin-file` (which worked perfectly). Artifact-out: base64 over
     stdout is lossless (log file byte-exact at 14.3 MB) but floods the tool result with a
     truncated blob. → `sandbox_run` `stdin_file` (host path) + a copy-out parameter (guest path →
     host file); a git remote will also fix source-in.
 
-22. **[note] — parallel `sandbox_run` tool calls in ONE Claude message execute serially.** Six
+22. **[documented] — parallel `sandbox_run` tool calls in ONE Claude message execute serially.** Six
     batched calls all ran on slot 0 at ~3.3 s each (a genuine overlap would force distinct
     slots). Client-side behavior, not a server bug: concurrent requests from *separate* agent
     processes interleaved fine during the gauntlet (slots 0/1 held simultaneously), matching the
     6-way CLI proof. Guidance for agents: fan out via subagents for parallel sandboxes.
 
-23. **[note] — guest hostname is `(none)`.** `$(hostname)` in-guest prints `(none)`; setting it
+23. **[fixed] — guest hostname is `(none)`.** `$(hostname)` in-guest prints `(none)`; setting it
     to the vanity VM name (e.g. `lucent-cryptarch`) would improve log/prompt ergonomics.
 
-24. **[note] — rootfs.rs comment implies in-guest `apk add`, but no apk ships.** The
+24. **[fixed] — rootfs.rs comment implies in-guest `apk add`, but no apk ships.** The
     keep-parent-dirs comment says "so an online guest can `apk add` more packages later", yet
     `command -v apk apk.static` finds nothing in-guest (re-verified). Align the comment with
     however #15 is resolved.
@@ -263,3 +271,35 @@ stdin (EPIPE) and 64 KB–1 MB stdin; hostile labels (unicode, `../x`, very long
 chains; `cwd` into stage-created/whiteouted dirs; VM-record/exec-log retention under a
 long-lived MCP server (`vm_gc` semantics, dangling `*_log_path`); ICMP egress; nonexistent
 command via MCP (#3 regression probe).
+
+## 2026-07-22 — findings-fix wave: #15–#25 closed, proto v3, images rebuilt
+
+One coordinated pass (plan-mode designed, code-explorer-mapped) closed every open finding.
+Host-only wins first (#20 observability fields, #16 `--base` hard error, MCP `stdin_file`,
+auto-GC at startup + every 20 runs, #22 docs), then a proto-v3 wave: `SetHostname` (#23),
+streamed `CopyOut` (#21, CLI `--copy-out` / MCP `copy_out`), #18 cwd error fix, apk + cmake +
+coreutils in base-alpine (#15/#24), image sidecars + `image build-all`/`image ls` + pre-boot
+skew guard (#17, unmasks #19), and SnapshotKey v2 keyed on the base image's content id:
+
+25. **[fixed] MED — `SnapshotKey` ignored image content, so warm snapshots survived image
+    rebuilds as silent stale resumes** (surfaced by plan-mode exploration; almost certainly
+    bit the v1→v2 bump too). Key material v2 adds the sidecar-recorded image sha256, cheap to
+    read per run. A rebuilt base now simply keys to fresh snapshots.
+
+**Verified live post-cutover (all four images rebuilt + stamped proto v3, warmpool cleared):**
+guest hostname == vanity name on cold boot *and* warm resume; first warm-eligible run reports
+`snapshot_built:true` with the ~4 s build visible in `total_ms`, next run `path:"warm"`,
+`resume_ms:56`, 406 ms total; bad cwd → `isopod-exec: cwd '/no/such/dir': No such file or
+directory`; `--copy-out` extracted a 0755 artifact byte-exact; in-guest `apk add jq` → jq
+1.8.1; cmake 4.2.3 + GNU coreutils 9.11 present; **base-sqfs boots networked and
+warm-resumes** (the #19 mask scenario is gone); `image ls` shows all images proto 3, none
+stale. **Milestone: the full workspace test suite now runs inside a sandbox — 132/132 core
+tests in-guest** (GNU cp closed the last host-only gap).
+
+¹ #19's *masking* is fixed and NIC errors now name slot + tap; the original tap-busy
+collision itself was never reproduced (static analysis cleared the slot claim, FC restore
+override, and shutdown ordering) — a live repro attempt is queued for the next gauntlet.
+
+**Caveat:** the long-lived `isopod-mcp` server must restart to pick up proto v3 — until then
+the MCP tools fail fast against v3 guests (by design, and now pre-boot). Full MCP-side
+re-verification + the checklist gauntlet run after the restart.
