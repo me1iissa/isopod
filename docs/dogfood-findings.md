@@ -104,3 +104,50 @@ byte-identical. Three fixes fell out of running it:
    Reasonable semantics for an outer wall clock, but must be documented in the
    CLI help and the eventual MCP tool description (whose default timeout should
    account for it).
+
+## 2026-07-22 — self-build dogfood (isopod builds its own workspace) + M6 warm-pool verification
+
+**Headline positive:** isopod compiled its **own full 6-crate workspace — 182 crates including
+rustls / aws-lc-sys / reqwest / tokio / rmcp — in 96 s inside an isopod sandbox**, and the
+freshly-built `isopod` binary ran (`isopod 0.1.0`) *inside the sandbox*. Recipe exercised the
+stage-fork model end to end: stage the toolchain once (rustup stable-musl 1.97.1 → `rust-stable`
+stage in 22 s), then fork it and build with `target/` on a guest tmpfs. Proof the stage/fork
+model + M5.5 flex resources carry a real heavy workload. Five gaps fell out.
+
+13. **[open] HIGH — sandbox networking doesn't survive a WSL2/host restart, and the failure is
+    cryptic.** The user-owned `isopod-tap0..7` are non-persistent; after the WSL utility VM
+    recycles they vanish and every networked `run`/`sandbox_run` fails with a raw Firecracker
+    string — `Open tap device failed: Operation not permitted ... Invalid TUN/TAP Backend
+    provided by isopod-tap0` — with **no hint** the fix is `sudo isopod setup`. Hit both the MCP
+    path and the M6 agent this session. → pre-boot, verify the claimed tap exists and emit a
+    clear "host restarted? re-run `sudo isopod setup`" message; optionally auto-reprovision when
+    we hold CAP_NET_ADMIN. (PLAN networking risk #3, made concrete.)
+
+14. **[open] MED — writable scratch (overlay upper) is fixed at ~1 GiB with no size knob.** A
+    *minimal* rustup toolchain (799 MiB) nearly fills it (98 MiB free, 89 %); a real build
+    (`target/` reached 1.5 GiB) can't fit at all. Workaround that unblocked the self-build: mount
+    a tmpfs in the guest and point `CARGO_TARGET_DIR`/`RUSTUP_HOME`/`CARGO_HOME` at it (trades RAM
+    for space). → add a `--scratch-mib` knob (size the ext4 upper) and/or document the tmpfs
+    pattern for builds. isopod targets dev workloads; 1 GiB is too small for many.
+
+15. **[open] MED — no Rust toolchain in any base, and `base-alpine` has no `apk`.** The squashfs
+    base bakes in python/node/git/gcc/make/cmake but strips the package manager, so you can't
+    `apk add` a toolchain at runtime. `curl`/`xz`/`bash` also absent (`wget`/`gzip`/`tar`/`base64`
+    present). rustup-over-`wget` works fine. → for a system whose own dogfood is "build yourself",
+    consider a toolchain-bearing base flavor, or keep `apk` available in base-alpine.
+
+16. **[open] LOW/footgun — `--base X` without `--stage` silently boots the legacy `dev-agent`
+    ext4 rootfs, ignoring `--base`.** The flag appears to do nothing — and, mid-M6, that legacy
+    rootfs still carried the old proto v1 guest, surfacing a confusing "guest 1 does not match
+    host 2" until you realise `--base` only applies with `--stage`. → warn/error when `--base` is
+    passed without `--stage`, or make `--base` imply the squashfs/overlay topology.
+
+17. **[note] proto-version skew across guest images after a `PROTO_VERSION` bump.** Bumping to v2
+    for `ConfigureNet` (M6) requires rebuilding **every** guest image (base-sqfs, base-alpine
+    squashfs, legacy dev-agent) *and* restarting any long-lived `isopod-mcp` server, or the guest
+    baked into one image (or the stale server binary) mismatches. Credit: the error is clear and
+    names both versions. → build tooling should rebuild all guest images together + stamp their
+    proto version; surface per-image proto version in a status command.
+
+*Hypothesis retracted:* I expected `aws-lc-sys` to fail for want of cmake — it built cleanly
+(base-alpine ships cmake for node-gyp, and aws-lc-sys has a cc path). Not a finding.

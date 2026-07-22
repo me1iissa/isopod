@@ -345,6 +345,8 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   `RunOptions`/`sandbox_run`/CLI params, host-aware caps (≤ host nproc; mem leaves host headroom),
   clear clamp errors, reported in `RunReport`. Default bumped to 1 vCPU / 512 MiB (256 OOMs on
   bigger installs). Foundational for M6 — the warm-pool key includes the resource shape.
+  *[✅ COMPLETE 2026-07-22 (e348201) — shipped and dogfooded; supplies the resource-shape
+  dimension of the M6 warm-pool key.]*
 - **M6 — Warm pool.** Full-snapshot save/resume so a fresh `sandbox_run` (no stage layers)
   hot-resumes in ~ms instead of a ~400 ms cold boot. Snapshot a booted-idle, network-less VM per
   **(fc build hash, host kernel, cpu model, base flavor, vcpus, mem_mib, snapshot format)** key;
@@ -356,6 +358,23 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   Cache invalidation on any key change (WSL2 kernel auto-updates WILL fire it → silent cold-boot
   fallback). `stage_info`/a `warmpool` status command shows cache state; resume-latency benchmark
   vs the M0 baseline.
+  *[✅ COMPLETE 2026-07-22 (fea8895 guest half + ffb4bae host half) — `core::snapshot` keyed on
+  (fc build, kernel id, cpu model, base flavor, vcpus, mem_mib, snapshot format); guest boots a
+  **tmpfs (RAM) overlay upper** (`isopod.upper=ram`) so a resume needs no external scratch drive
+  (dodges FC's no-drive-path-override-on-load limit); on resume the NIC is retargeted via
+  `network_overrides` and the guest re-IP'd + clock-synced over vsock (proto v2 `ConfigureNet`).
+  Warm-eligible = `--stage base` + network on + no `--commit-as`; stage forks / `--no-network` /
+  legacy dev-agent stay cold. The MCP `sandbox_run` fast path sends `stage:"base"`, so it gets
+  warm automatically. Verified live two independent ways: snapshot baked at slot 0, warm run
+  landed slot 1 → guest `eth0` = `10.107.1.2` + NET-OK (proves the re-IP); resume_ms ~52–72 ms
+  (~2.5× faster than cold boot's ~126 ms kernel phase); resource-shape keys distinct (512 vs 768)
+  with cached dedup; clippy clean, full suite green (core 114/fc 40/guest 37/mcp 3/proto 7).
+  End-to-end `total_ms` win is modest for a trivial exec (~390 warm vs ~460 cold) because FC's
+  lazy File-backed restore defers guest-RAM page-in into the first exec and the halt/teardown
+  tail is shared — the boot phase is genuinely eliminated and the win grows for real workloads
+  (backlog: UFFD prefault / balloon-shrink). First resume after build pays a one-time ~9 s
+  memfile page-cache fault. Implemented by a dispatched agent; committed + independently
+  re-verified in the main thread.]*
 
 **Backlog (v2+):** jailer hardening; UFFD lazy restore + snapshot compression; `stage flatten`;
 PTY exec; host→guest port forwarding; plugin marketplace packaging; systemd user service +
