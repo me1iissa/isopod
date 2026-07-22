@@ -324,8 +324,7 @@ pub fn sweep_stale_cgroups() {
 fn create_cgroup(vm_id: &str, resources: Resources) -> Result<PathBuf> {
     let deleg = delegated_cgroup_root()?;
     let slice = deleg.join(ISOPOD_SLICE);
-    std::fs::create_dir_all(&slice)
-        .with_context(|| format!("creating {}", slice.display()))?;
+    std::fs::create_dir_all(&slice).with_context(|| format!("creating {}", slice.display()))?;
     // Enable controllers for the slice's children (idempotent if already set).
     // The slice holds no processes, so this is legal under the cgroup-v2
     // "no internal processes" rule.
@@ -344,8 +343,11 @@ fn create_cgroup(vm_id: &str, resources: Resources) -> Result<PathBuf> {
 
     // memory.max: guest RAM + VMM overhead. A runaway guest hits its own cap and
     // is cgroup-OOM-killed (only Firecracker dies; the host is unaffected) — F4.
-    std::fs::write(leaf.join("memory.max"), mem_max_bytes(resources).to_string())
-        .with_context(|| format!("setting memory.max on {}", leaf.display()))?;
+    std::fs::write(
+        leaf.join("memory.max"),
+        mem_max_bytes(resources).to_string(),
+    )
+    .with_context(|| format!("setting memory.max on {}", leaf.display()))?;
     // cpu.max: `<vcpus * period> <period>` — a busy guest cannot starve the host.
     std::fs::write(leaf.join("cpu.max"), cpu_max_value(resources))
         .with_context(|| format!("setting cpu.max on {}", leaf.display()))?;
@@ -507,7 +509,8 @@ fn check_kvm() -> Result<()> {
 
 /// Read the real uid/gid from `/proc/self/status`.
 fn real_uid_gid() -> Result<(u32, u32)> {
-    let status = std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
+    let status =
+        std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
     let uid = parse_status_id(&status, "Uid:")
         .ok_or_else(|| anyhow!("no parseable Uid line in /proc/self/status"))?;
     let gid = parse_status_id(&status, "Gid:")
@@ -549,7 +552,11 @@ fn mem_max_bytes(resources: Resources) -> u64 {
 
 /// `cpu.max` value: `<vcpus * period> <period>` (full CPUs).
 fn cpu_max_value(resources: Resources) -> String {
-    format!("{} {}", u64::from(resources.vcpus) * CPU_PERIOD_US, CPU_PERIOD_US)
+    format!(
+        "{} {}",
+        u64::from(resources.vcpus) * CPU_PERIOD_US,
+        CPU_PERIOD_US
+    )
 }
 
 /// Resolve the `isopod-jail` binary: `$ISOPOD_JAIL_BIN`, then a sibling of the
@@ -640,7 +647,10 @@ mod tests {
         );
         // No delegation unit present (e.g. WSL2 init context).
         assert_eq!(truncate_through_user_service("/init.scope"), None);
-        assert_eq!(truncate_through_user_service("/system.slice/foo.service"), None);
+        assert_eq!(
+            truncate_through_user_service("/system.slice/foo.service"),
+            None
+        );
     }
 
     #[test]
@@ -653,7 +663,11 @@ mod tests {
 
     #[test]
     fn default_overhead_is_floor_256_then_quarter() {
-        assert_eq!(default_overhead_mib(256), 256, "floor binds for small guests");
+        assert_eq!(
+            default_overhead_mib(256),
+            256,
+            "floor binds for small guests"
+        );
         assert_eq!(default_overhead_mib(512), 256, "512/4=128 < 256 floor");
         assert_eq!(default_overhead_mib(2048), 512, "2048/4 = 512");
         assert_eq!(default_overhead_mib(4096), 1024, "4096/4 = 1024");
@@ -677,7 +691,10 @@ mod tests {
     #[test]
     fn bind_arg_encodes_mode() {
         assert_eq!(Bind::ro("/home/u/.isopod").arg(), "/home/u/.isopod:ro");
-        assert_eq!(Bind::rw("/home/u/.isopod/vms/dev-1").arg(), "/home/u/.isopod/vms/dev-1:rw");
+        assert_eq!(
+            Bind::rw("/home/u/.isopod/vms/dev-1").arg(),
+            "/home/u/.isopod/vms/dev-1:rw"
+        );
     }
 
     #[test]

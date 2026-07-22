@@ -36,7 +36,10 @@ fn real_id(prefix: &str) -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status
         .lines()
-        .find_map(|l| l.strip_prefix(prefix).and_then(|r| r.split_whitespace().next()))
+        .find_map(|l| {
+            l.strip_prefix(prefix)
+                .and_then(|r| r.split_whitespace().next())
+        })
         .unwrap()
         .to_string()
 }

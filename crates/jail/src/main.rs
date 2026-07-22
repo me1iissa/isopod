@@ -231,8 +231,7 @@ fn child_setup(args: &Args) -> io::Result<()> {
     let root_s = path_str(root)?;
     // `pivot_root(2)` requires the new root to be a mount point; bind it onto
     // itself first, before the nested binds so they layer on top of it.
-    sys::bind_mount(root_s, root_s)
-        .map_err(|e| sys::annotate(e, "bind new root onto itself"))?;
+    sys::bind_mount(root_s, root_s).map_err(|e| sys::annotate(e, "bind new root onto itself"))?;
 
     // Identity bind mounts, in the order given (a read-only parent is bound
     // before any read-write child nested under it, whose mountpoint then already
@@ -336,7 +335,10 @@ fn ensure_file(dst: &Path) -> io::Result<()> {
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            sys::annotate(e, &format!("creating parent of mountpoint {}", dst.display()))
+            sys::annotate(
+                e,
+                &format!("creating parent of mountpoint {}", dst.display()),
+            )
         })?;
     }
     std::fs::File::create(dst)
@@ -429,9 +431,7 @@ mod tests {
         let args = Args::parse(&raw).expect("parses");
         assert_eq!(
             args.cgroup.as_deref(),
-            Some(Path::new(
-                "/sys/fs/cgroup/user.slice/isopod.slice/dev-1/"
-            ))
+            Some(Path::new("/sys/fs/cgroup/user.slice/isopod.slice/dev-1/"))
         );
         assert_eq!(args.root, PathBuf::from("/vm/dev-1/jail-root"));
         assert_eq!(args.uid, 1000);
@@ -463,7 +463,17 @@ mod tests {
 
     #[test]
     fn cgroup_is_optional() {
-        let raw = ["--root", "/r", "--uid", "0", "--gid", "0", "--", "/bin/true"].map(String::from);
+        let raw = [
+            "--root",
+            "/r",
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+            "--",
+            "/bin/true",
+        ]
+        .map(String::from);
         let args = Args::parse(&raw).expect("parses without --cgroup");
         assert!(args.cgroup.is_none());
         assert_eq!(args.program, vec!["/bin/true".to_string()]);

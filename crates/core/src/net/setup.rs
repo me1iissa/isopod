@@ -162,7 +162,11 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     }
 
     // 2. nftables — one table, rebuilt atomically so re-runs converge.
-    apply_nft(&build_nft_ruleset(&iface, slot_count, opts.allow_lan_egress))?;
+    apply_nft(&build_nft_ruleset(
+        &iface,
+        slot_count,
+        opts.allow_lan_egress,
+    ))?;
 
     // 3. ip_forward — live now, persisted for reboots.
     set_ip_forward(true)?;
@@ -673,7 +677,10 @@ mod tests {
     #[test]
     fn nft_ruleset_allow_lan_egress_omits_dest_drops() {
         let rs = build_nft_ruleset("eth0", 4, true);
-        assert!(!rs.contains("ip daddr {"), "opt-out must omit the destination guard");
+        assert!(
+            !rs.contains("ip daddr {"),
+            "opt-out must omit the destination guard"
+        );
         // Anti-spoof and v6 default-deny remain even when LAN egress is allowed.
         assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
         assert!(rs.contains("meta nfproto ipv6 drop"));

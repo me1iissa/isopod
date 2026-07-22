@@ -66,7 +66,15 @@ pub fn fork() -> io::Result<i32> {
 pub fn set_pdeathsig_kill() -> io::Result<()> {
     // SAFETY: `PR_SET_PDEATHSIG` reads only the second argument (a signal number);
     // the remaining prctl arguments are ignored for this option.
-    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {
