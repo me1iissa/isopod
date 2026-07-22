@@ -32,7 +32,9 @@ const DEFAULT_CWD: &str = "/root";
 /// outcome, not an infrastructure fault: it reports shell convention
 /// `exit_code: 127` with the reason on stderr, so callers can distinguish "your
 /// command is wrong" from "the sandbox broke" (dogfood finding #3). `Error`
-/// frames are reserved for malformed requests (e.g. empty argv).
+/// frames are reserved for malformed requests (e.g. empty argv). The failing
+/// *subject* (the program, or the cwd) is embedded by [`run_exec`] so a missing
+/// working directory is never misattributed to the shell (dogfood finding #18).
 pub fn handle_exec(conn: &Conn, id: u64, req: ExecRequest, reaper: &Reaper) {
     if let Err(e) = run_exec(conn, id, &req, reaper) {
         if req.argv.is_empty() {
@@ -44,7 +46,7 @@ pub fn handle_exec(conn: &Conn, id: u64, req: ExecRequest, reaper: &Reaper) {
             });
             return;
         }
-        let reason = format!("isopod-exec: {}: {e}\n", req.argv[0]);
+        let reason = format!("isopod-exec: {e}\n");
         let _ = conn.send(&Response {
             id,
             body: ResponseBody::ExecStream {
@@ -82,7 +84,25 @@ fn run_exec(conn: &Conn, id: u64, req: &ExecRequest, reaper: &Reaper) -> io::Res
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
-    cmd.current_dir(req.cwd.as_deref().unwrap_or(DEFAULT_CWD));
+    // Validate the working directory up front: `spawn` reports a missing cwd as
+    // a bare ENOENT indistinguishable from a missing program, which used to get
+    // blamed on argv[0] ("/bin/sh: No such file or directory") — a wrong-way
+    // debugging lead (dogfood finding #18). TOCTOU with the spawn below is
+    // acceptable; it mirrors the program-lookup race that already exists.
+    let cwd = req.cwd.as_deref().unwrap_or(DEFAULT_CWD);
+    match std::fs::metadata(cwd) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("cwd '{cwd}': not a directory"),
+            ));
+        }
+        Err(e) => {
+            return Err(io::Error::new(e.kind(), format!("cwd '{cwd}': {e}")));
+        }
+    }
+    cmd.current_dir(cwd);
 
     let has_stdin = req.stdin_b64.is_some();
     cmd.stdin(if has_stdin {
@@ -95,7 +115,11 @@ fn run_exec(conn: &Conn, id: u64, req: &ExecRequest, reaper: &Reaper) -> io::Res
     // Own process group so a timeout can SIGKILL the whole tree with kill(-pgid).
     cmd.process_group(0);
 
-    let mut child = cmd.spawn()?;
+    // Name the program in a spawn failure so the 127 report stays self-locating
+    // now that `handle_exec` no longer prefixes argv[0] itself.
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("{program}: {e}")))?;
     let pid = child.id() as i32;
     // Register with the reaper *immediately* after spawn, before we do anything
     // slower; the reaper's stash closes the residual race for instant exits.
