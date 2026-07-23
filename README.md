@@ -4,7 +4,7 @@
 
 **A Firecracker-microVM sandbox for Claude Code — run a command in a fast, hardware-isolated microVM that is destroyed after every call.**
 
-isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM in roughly **0.4 s** (with a warm pool, resume is milliseconds), execs one command inside it over vsock, and tears the VM down. Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
+isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM, execs one command inside it over vsock, and tears the VM down — end to end in **~0.4 s** at p50, with a warm-pool resume in **~49 ms** ([measured](BENCHMARKS.md)). Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
 
 > **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels). Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
 
@@ -320,6 +320,7 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 | [docs/mcp-usage.md](docs/mcp-usage.md) | MCP server registration (local scope and plugin), the tool list, `sandbox_run` parameters and result shape. |
 | [skill/SKILL.md](skill/SKILL.md) | The workflow skill loaded into Claude's context — also the best short conceptual intro to the stage model for humans. |
 | [SECURITY.md](SECURITY.md) | The security model: threat model, what holds, the jail, known limitations, operator guidance. |
+| [BENCHMARKS.md](BENCHMARKS.md) | Real boot→exec→destroy latency numbers (p50 ~0.4 s, ~49 ms warm resume) and the reproducible harness (`scripts/bench.py`). |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, crate map, coding conventions, versioning policy. |
 | [CHANGELOG.md](CHANGELOG.md) | Release history. |
 | [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
