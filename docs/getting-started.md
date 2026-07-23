@@ -45,7 +45,34 @@ Firecracker binary, kernel, and images (`base-alpine` is ~150 MiB; committed
 stages and warm-pool snapshots add what you put in them). Each running VM
 takes 512 MiB of RAM by default (`--mem-mib` to change).
 
-## 2. Build the workspace
+## 2. Install a package — or build the workspace
+
+### 2a. From a release package (recommended)
+
+Every release on the [releases page](https://github.com/me1iissa/isopod/releases)
+ships a `.deb`, an `.rpm`, and a plain tarball for x86_64 Linux, with
+checksums in `SHA256SUMS`:
+
+```bash
+sudo apt install ./isopod_*_amd64.deb     # Debian/Ubuntu
+sudo dnf install ./isopod-*.x86_64.rpm    # Fedora/RHEL-family
+```
+
+The package installs `isopod`, `isopod-mcp`, and `isopod-jail` into
+`/usr/bin`, plus **prebuilt Firecracker and guest-agent binaries** under
+`/usr/lib/isopod/` — so you skip the Rust toolchain, the submodule, and the
+`dev build-fc` step entirely. Continue at §3 (you still build guest images
+and run `setup`; `image fetch-kernel` + `image build-all` + `sudo isopod
+setup` is your whole remaining path). A source build in your home directory,
+if you later make one, takes precedence over the packaged Firecracker.
+
+The tarball is the same content in a directory (`isopod-<ver>-x86_64-linux/`
+with the three binaries at top level and `lib/` holding Firecracker + the
+guest agent) for hosts without a package manager; put the binaries on your
+`PATH` and set `ISOPOD_FC_BIN` and `ISOPOD_GUEST_AGENT_BIN` to the two
+`lib/` files.
+
+### 2b. From source
 
 ```bash
 git clone https://github.com/me1iissa/isopod.git
@@ -82,10 +109,14 @@ The rest of this doc writes `isopod` for brevity; substitute
 All of this is unprivileged and idempotent. Artifacts land under `~/.isopod/`,
 and each command prints a JSON object on success telling you what it produced.
 
+**Package installs skip `dev build-fc`** — the packaged Firecracker at
+`/usr/lib/isopod/firecracker` is found automatically. Start at
+`fetch-kernel`.
+
 ```bash
-# Compile the vendored Firecracker v1.16.1 and install it to ~/.isopod/bin.
-# This is the slowest step (a full Rust release build — typically a few
-# minutes). Verify afterwards: ~/.isopod/bin/firecracker --version
+# (Source builds only.) Compile the vendored Firecracker v1.16.1 and install
+# it to ~/.isopod/bin. This is the slowest step (a full Rust release build —
+# typically a few minutes). Verify: ~/.isopod/bin/firecracker --version
 isopod dev build-fc
 
 # Download the pinned guest kernel — a few tens of MiB from Firecracker's

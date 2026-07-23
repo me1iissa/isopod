@@ -12,25 +12,31 @@ isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microV
 
 ## Quick start
 
-Prerequisites: Linux x86_64 with `/dev/kvm` (your user in the `kvm` group), Rust via rustup, and `nftables iproute2 e2fsprogs squashfs-tools` plus a C toolchain. Full details, WSL2 notes, and troubleshooting: **[docs/getting-started.md](docs/getting-started.md)**.
+Prerequisites: Linux x86_64 with `/dev/kvm` (your user in the `kvm` group). Full details, WSL2 notes, and troubleshooting: **[docs/getting-started.md](docs/getting-started.md)**.
+
+**Option A — install a release package.** Grab the `.deb`, `.rpm`, or tarball from the [releases page](https://github.com/me1iissa/isopod/releases); it ships the CLI, the MCP server, the jail helper, and prebuilt Firecracker + guest-agent binaries, so no Rust toolchain or source build is needed:
 
 ```bash
-# 1. Clone and build (toolchain is pinned by rust-toolchain.toml).
+sudo apt install ./isopod_*_amd64.deb   # or: sudo dnf install ./isopod-*.x86_64.rpm
+
+isopod image fetch-kernel   # pinned, digest-verified guest kernel
+isopod image build-all      # guest rootfs images (unprivileged)
+sudo isopod setup           # one-time host networking — the only root step
+isopod run --stage base --base base-alpine -- python3 -c 'print("hello from a microVM")'
+```
+
+**Option B — build from source** (needs Rust via rustup, `nftables iproute2 e2fsprogs squashfs-tools`, and a C toolchain):
+
+```bash
 git clone https://github.com/me1iissa/isopod.git
 cd isopod
 git submodule update --init --recursive     # vendored Firecracker v1.16.1
 cargo build --release
 
-# 2. Build Firecracker and the guest images (all unprivileged).
-./target/release/isopod dev build-fc        # ~/.isopod/bin/firecracker
-./target/release/isopod image fetch-kernel  # pinned, digest-verified guest kernel
-./target/release/isopod image build-all     # every guest rootfs image
-
-# 3. One-time host networking — the only step that needs root.
-#    (Skip it entirely if you will only ever run with --no-network.)
+./target/release/isopod dev build-fc        # build Firecracker -> ~/.isopod/bin
+./target/release/isopod image fetch-kernel
+./target/release/isopod image build-all
 sudo ./target/release/isopod setup
-
-# 4. Run something.
 ./target/release/isopod run --stage base --base base-alpine -- \
   python3 -c 'print("hello from a microVM")'
 ```
@@ -38,7 +44,8 @@ sudo ./target/release/isopod setup
 To drive it from **Claude Code**, register the MCP server and restart your session:
 
 ```bash
-claude mcp add --scope local isopod -- "$PWD/target/release/isopod-mcp"
+claude mcp add --scope local isopod -- /usr/bin/isopod-mcp            # package install
+claude mcp add --scope local isopod -- "$PWD/target/release/isopod-mcp"  # source checkout
 # then, inside Claude Code:  sandbox_run(cmd="echo hi")
 ```
 

@@ -1062,13 +1062,20 @@ fn locate_guest_agent() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"));
     let bin = target_dir.join(REL);
-    if !bin.exists() {
-        bail!(
-            "guest-agent musl binary not found at {}; build it first: {BUILD_HINT}",
-            bin.display()
-        );
+    if bin.exists() {
+        return Ok(bin);
     }
-    Ok(bin)
+    // Installed layout: the distro package ships the prebuilt static agent.
+    let system = PathBuf::from("/usr/lib/isopod/isopod-guest-agent");
+    if system.exists() {
+        return Ok(system);
+    }
+    bail!(
+        "guest-agent musl binary not found at {} or {}; build it first ({BUILD_HINT}) \
+         or install the isopod package",
+        bin.display(),
+        system.display()
+    );
 }
 
 /// Absolute path to the workspace root, derived from this crate's manifest dir

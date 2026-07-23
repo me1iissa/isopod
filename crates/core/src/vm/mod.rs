@@ -61,9 +61,14 @@ pub enum FcProvenance {
     Env,
     /// From `~/.isopod/bin/firecracker` (produced by `isopod dev build-fc`).
     VendoredBuild,
+    /// From `/usr/lib/isopod/firecracker` (shipped by the distro package).
+    SystemPackage,
     /// From `~/.isopod/m0/bin/firecracker` (the M0 spike release binary).
     M0Release,
 }
+
+/// Where the distro package installs its prebuilt firecracker.
+const SYSTEM_FC_BIN: &str = "/usr/lib/isopod/firecracker";
 
 /// A resolved firecracker binary and where it came from.
 #[derive(Debug, Clone, Serialize)]
@@ -148,7 +153,8 @@ pub fn dev_boot(opts: DevBootOptions) -> Result<DevBootReport> {
 }
 
 /// Resolve the firecracker binary path and provenance, honouring the
-/// `$ISOPOD_FC_BIN` override then the vendored-build and M0-release locations.
+/// `$ISOPOD_FC_BIN` override, then the vendored-build, system-package, and
+/// M0-release locations.
 fn resolve_fc_bin() -> Result<FcBinary> {
     let home = paths::isopod_home()?;
     let env = std::env::var_os("ISOPOD_FC_BIN")
@@ -157,6 +163,7 @@ fn resolve_fc_bin() -> Result<FcBinary> {
     resolve_fc_bin_from(
         env,
         home.join("bin/firecracker"),
+        PathBuf::from(SYSTEM_FC_BIN),
         home.join("m0/bin/firecracker"),
         &|p| p.exists(),
     )
@@ -166,10 +173,12 @@ fn resolve_fc_bin() -> Result<FcBinary> {
 /// unit-testable without touching the filesystem or process environment.
 ///
 /// Precedence: an explicit `$ISOPOD_FC_BIN` wins (and must exist), then the
-/// vendored build, then the M0 release binary.
+/// vendored build (so a dev tree beats an installed package), then the
+/// distro-package binary, then the M0 release binary.
 fn resolve_fc_bin_from(
     env: Option<PathBuf>,
     vendored: PathBuf,
+    system: PathBuf,
     m0: PathBuf,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Result<FcBinary> {
@@ -191,6 +200,12 @@ fn resolve_fc_bin_from(
             provenance: FcProvenance::VendoredBuild,
         });
     }
+    if exists(&system) {
+        return Ok(FcBinary {
+            path: system,
+            provenance: FcProvenance::SystemPackage,
+        });
+    }
     if exists(&m0) {
         return Ok(FcBinary {
             path: m0,
@@ -199,7 +214,8 @@ fn resolve_fc_bin_from(
     }
     bail!(
         "no firecracker binary found: set $ISOPOD_FC_BIN, run `isopod dev build-fc`, \
-         or provide {} or {}",
+         install the isopod package (provides {}), or provide {} or {}",
+        system.display(),
         vendored.display(),
         m0.display()
     )
@@ -1993,10 +2009,12 @@ mod tests {
         let bin = resolve_fc_bin_from(
             Some(PathBuf::from("/opt/fc")),
             PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
             PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
             &exists_set(&[
                 "/opt/fc",
                 "/home/u/.isopod/bin/firecracker",
+                "/usr/lib/isopod/firecracker",
                 "/home/u/.isopod/m0/bin/firecracker",
             ]),
         )
@@ -2010,6 +2028,7 @@ mod tests {
         let err = resolve_fc_bin_from(
             Some(PathBuf::from("/opt/fc")),
             PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
             PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
             &exists_set(&["/home/u/.isopod/m0/bin/firecracker"]),
         )
@@ -2022,9 +2041,11 @@ mod tests {
         let bin = resolve_fc_bin_from(
             None,
             PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
             PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
             &exists_set(&[
                 "/home/u/.isopod/bin/firecracker",
+                "/usr/lib/isopod/firecracker",
                 "/home/u/.isopod/m0/bin/firecracker",
             ]),
         )
@@ -2034,10 +2055,28 @@ mod tests {
     }
 
     #[test]
+    fn system_package_preferred_over_m0() {
+        let bin = resolve_fc_bin_from(
+            None,
+            PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
+            PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
+            &exists_set(&[
+                "/usr/lib/isopod/firecracker",
+                "/home/u/.isopod/m0/bin/firecracker",
+            ]),
+        )
+        .expect("system package resolves");
+        assert_eq!(bin.provenance, FcProvenance::SystemPackage);
+        assert_eq!(bin.path, PathBuf::from("/usr/lib/isopod/firecracker"));
+    }
+
+    #[test]
     fn falls_back_to_m0_when_only_m0_present() {
         let bin = resolve_fc_bin_from(
             None,
             PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
             PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
             &exists_set(&["/home/u/.isopod/m0/bin/firecracker"]),
         )
@@ -2050,6 +2089,7 @@ mod tests {
         let err = resolve_fc_bin_from(
             None,
             PathBuf::from("/home/u/.isopod/bin/firecracker"),
+            PathBuf::from("/usr/lib/isopod/firecracker"),
             PathBuf::from("/home/u/.isopod/m0/bin/firecracker"),
             &exists_set(&[]),
         )

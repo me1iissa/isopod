@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build & publish packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Host packaging deps
+        run: sudo apt-get update && sudo apt-get install -y musl-tools rpm
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build host binaries
+        run: cargo build --release --workspace --locked
+
+      - name: Build the static guest agent
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p isopod-guest-agent
+
+      - name: Build vendored Firecracker
+        run: |
+          ./target/release/isopod dev build-fc
+          mkdir -p dist
+          install -m755 "$HOME/.isopod/bin/firecracker" dist/firecracker
+
+      - name: Install packagers
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: Package .deb
+        run: cargo deb -p isopod-cli --no-build -o dist/
+
+      - name: Package .rpm
+        run: cargo generate-rpm -p crates/cli -o dist/
+
+      - name: Package tarball
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          stage="isopod-${ver}-x86_64-linux"
+          mkdir -p "$stage/lib"
+          install -m755 target/release/isopod target/release/isopod-mcp target/release/isopod-jail "$stage/"
+          install -m755 dist/firecracker target/x86_64-unknown-linux-musl/release/isopod-guest-agent "$stage/lib/"
+          cp README.md LICENSE CHANGELOG.md "$stage/"
+          tar czf "dist/${stage}.tar.gz" "$stage"
+
+      - name: Verify package contents
+        run: |
+          echo "== deb contents =="
+          dpkg -c dist/*.deb
+          for f in usr/bin/isopod usr/bin/isopod-mcp usr/bin/isopod-jail \
+                   usr/lib/isopod/firecracker usr/lib/isopod/isopod-guest-agent; do
+            dpkg -c dist/*.deb | grep -q "$f" || { echo "::error::$f missing from .deb"; exit 1; }
+          done
+          echo "== rpm contents =="
+          rpm -qlp dist/*.rpm
+          for f in /usr/bin/isopod /usr/bin/isopod-mcp /usr/bin/isopod-jail \
+                   /usr/lib/isopod/firecracker /usr/lib/isopod/isopod-guest-agent; do
+            rpm -qlp dist/*.rpm | grep -qx "$f" || { echo "::error::$f missing from .rpm"; exit 1; }
+          done
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Release notes from CHANGELOG
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v ver="$ver" '/^## \[/{p = index($0, "[" ver "]") > 0} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md

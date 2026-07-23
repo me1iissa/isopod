@@ -11,6 +11,10 @@ and skip ahead to the tool list.
 
 ## Build
 
+If you installed a release package, the server is already at
+`/usr/bin/isopod-mcp` — use that path in the registrations below and skip
+the build. From a source checkout:
+
 ```bash
 cargo build --release -p isopod-mcp
 ```

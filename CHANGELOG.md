@@ -6,6 +6,19 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.8.0] — 2026-07-23
+
+- **Formal installation.** Every `v*` tag now publishes a GitHub Release with
+  a `.deb`, an `.rpm`, a plain tarball, and `SHA256SUMS` (built by the new
+  release workflow). Packages install `isopod`, `isopod-mcp`, and
+  `isopod-jail` to `/usr/bin` plus **prebuilt Firecracker and guest-agent
+  binaries** under `/usr/lib/isopod/`, so package installs need no Rust
+  toolchain and skip `dev build-fc` entirely.
+- Resolution now knows the installed layout: Firecracker resolves
+  env override → `~/.isopod/bin` (dev build) → `/usr/lib/isopod` (package,
+  new `system-package` provenance) → M0; the guest agent resolves
+  env override → workspace target dir → `/usr/lib/isopod`.
+
 ## [0.7.3] — 2026-07-23
 
 - CLI polish from an external docs review: `stage ls` and `vm list` now work
