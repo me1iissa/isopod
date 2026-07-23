@@ -859,6 +859,30 @@ fn exec_budget(outer_ms: u64, elapsed_ms: u64) -> u64 {
     outer_ms.saturating_sub(elapsed_ms).max(1)
 }
 
+/// Validate exec environment pairs before any VM work (dogfood finding #27):
+/// names must be non-empty and free of `=`/NUL (a `FO=O` name would land in the
+/// guest environ as the ambiguous `FO=O=bar`; the guest agent forwards names
+/// verbatim to `execve`), and values must be NUL-free. The CLI's
+/// [`parse_env_kv`] cannot produce these, but the MCP server's free-form map
+/// can — this is the shared choke point for both.
+///
+/// # Errors
+/// Returns an error naming the offending pair.
+pub fn validate_env(env: &[(String, String)]) -> Result<()> {
+    for (k, v) in env {
+        if k.is_empty() {
+            bail!("invalid environment variable: name must not be empty");
+        }
+        if k.contains('=') || k.contains('\0') {
+            bail!("invalid environment variable name {k:?}: must not contain '=' or NUL");
+        }
+        if v.contains('\0') {
+            bail!("invalid value for environment variable {k}: must not contain NUL");
+        }
+    }
+    Ok(())
+}
+
 /// Parse repeated `KEY=VALUE` env arguments (splitting on the first `=`; the
 /// value may itself contain `=`). Rejects a missing `=` or an empty key.
 ///
@@ -895,6 +919,8 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     if opts.argv.is_empty() {
         bail!("run_ephemeral requires a non-empty argv");
     }
+    // Malformed env names/values must error here, before any VM work (#27).
+    validate_env(&opts.env)?;
     // Fail fast, before any artifact resolution or disk copy, if a networked run
     // was asked for but the host has not been set up.
     if opts.network {
@@ -1811,8 +1837,8 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
         .await
         .with_context(|| {
             format!(
-                "guest agent did not answer a vsock ping within {AGENT_READY_TIMEOUT:?}; \
-                 serial log at {}",
+                "guest agent readiness check failed (vsock ping, {AGENT_READY_TIMEOUT:?} \
+                 budget); serial log at {}",
                 ctx.console_log.display()
             )
         })?;
@@ -2030,6 +2056,28 @@ mod tests {
         assert!(parse_env_kv(&["NOEQUALS".into()]).is_err());
         assert!(parse_env_kv(&["=value".into()]).is_err());
     }
+
+    #[test]
+    fn validate_env_accepts_normal_pairs() {
+        let ok = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            ("EMPTY".to_string(), String::new()),
+            ("V".to_string(), "a=b=c".to_string()), // '=' in values is fine
+        ];
+        assert!(validate_env(&ok).is_ok());
+        assert!(validate_env(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_env_rejects_malformed_names_and_nul() {
+        // The #27 shapes: a '='-carrying name and an empty name (reachable via
+        // the MCP env map, which parse_env_kv never sees).
+        assert!(validate_env(&[("FO=O".into(), "bar".into())]).is_err());
+        assert!(validate_env(&[(String::new(), "bar".into())]).is_err());
+        assert!(validate_env(&[("NUL\0KEY".into(), "x".into())]).is_err());
+        assert!(validate_env(&[("K".into(), "nul\0value".into())]).is_err());
+    }
+
 
     #[test]
     fn exec_budget_subtracts_elapsed_and_floors_at_one() {

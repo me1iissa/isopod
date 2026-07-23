@@ -57,6 +57,14 @@ pub enum AgentError {
         /// The version the guest agent reported.
         got: u32,
     },
+    /// The guest was asked to assemble a stage-overlay root at boot and failed:
+    /// it is running on the read-only base root, so any exec would see the
+    /// wrong filesystem (dogfood finding #26). Fatal, like a proto mismatch.
+    #[error(
+        "guest stage-overlay root failed to assemble ({0}); the guest is running \
+         on the read-only base root, refusing to run on the wrong rootfs"
+    )]
+    OverlayDegraded(String),
     /// The guest returned a response that does not fit the operation.
     #[error("guest agent returned an unexpected response: {0}")]
     Unexpected(String),
@@ -225,19 +233,24 @@ impl AgentClient {
     ///
     /// This is the boot/resume readiness signal: the guest agent may not be
     /// listening on the vsock port yet during early boot, so connection refusals
-    /// are retried. A [`AgentError::ProtoMismatch`] is fatal and returned
-    /// immediately (the agent *is* up, just incompatible).
+    /// are retried. A [`AgentError::ProtoMismatch`] or
+    /// [`AgentError::OverlayDegraded`] is fatal and returned immediately (the
+    /// agent *is* up — just incompatible, or on the wrong rootfs).
     ///
     /// # Errors
-    /// [`AgentError::NotReady`] if no successful ping lands within `timeout`, or
-    /// [`AgentError::ProtoMismatch`] on a version disagreement.
+    /// [`AgentError::NotReady`] if no successful ping lands within `timeout`,
+    /// [`AgentError::ProtoMismatch`] on a version disagreement, or
+    /// [`AgentError::OverlayDegraded`] if the guest's stage-overlay root failed
+    /// to assemble.
     pub async fn wait_ready(&self, timeout: Duration) -> Result<Pong, AgentError> {
         const BACKOFF: Duration = Duration::from_millis(50);
         let deadline = Instant::now() + timeout;
         loop {
             match self.ping().await {
                 Ok(pong) => return Ok(pong),
-                Err(e @ AgentError::ProtoMismatch { .. }) => return Err(e),
+                Err(e @ (AgentError::ProtoMismatch { .. } | AgentError::OverlayDegraded(_))) => {
+                    return Err(e)
+                }
                 Err(_) => {}
             }
             if Instant::now() >= deadline {
@@ -251,19 +264,26 @@ impl AgentClient {
     ///
     /// # Errors
     /// [`AgentError::ProtoMismatch`] if the guest speaks a different protocol
-    /// version, or a connect/framing error.
+    /// version, [`AgentError::OverlayDegraded`] if the guest reports it failed
+    /// to assemble its stage-overlay root (it is running on the read-only base
+    /// root — executing there would hit the wrong filesystem, finding #26), or
+    /// a connect/framing error.
     pub async fn ping(&self) -> Result<Pong, AgentError> {
         match self.request_one(RequestOp::Ping).await? {
             ResponseBody::Pong {
                 agent_version,
                 proto_version,
                 uptime_s,
+                overlay_error,
             } => {
                 if proto_version != PROTO_VERSION {
                     return Err(AgentError::ProtoMismatch {
                         expected: PROTO_VERSION,
                         got: proto_version,
                     });
+                }
+                if let Some(message) = overlay_error {
+                    return Err(AgentError::OverlayDegraded(message));
                 }
                 Ok(Pong {
                     agent_version,
@@ -775,6 +795,7 @@ mod tests {
                     agent_version: "9.9.9".into(),
                     proto_version: PROTO_VERSION,
                     uptime_s: 1.5,
+                    overlay_error: None,
                 },
             )
             .await;
@@ -803,6 +824,7 @@ mod tests {
                     agent_version: "x".into(),
                     proto_version: bad,
                     uptime_s: 0.0,
+                    overlay_error: None,
                 },
             )
             .await;
@@ -815,6 +837,35 @@ mod tests {
                 assert_eq!(got, bad);
             }
             other => panic!("expected ProtoMismatch, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_degraded_overlay_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            write_resp(
+                &mut conn,
+                req.id,
+                ResponseBody::Pong {
+                    agent_version: "x".into(),
+                    proto_version: PROTO_VERSION,
+                    uptime_s: 0.4,
+                    overlay_error: Some("mount layer /dev/vdk at /layers/10: ENOENT".into()),
+                },
+            )
+            .await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client.ping().await.expect_err("degraded root must error");
+        match err {
+            AgentError::OverlayDegraded(msg) => assert!(msg.contains("/layers/10"), "{msg}"),
+            other => panic!("expected OverlayDegraded, got {other:?}"),
         }
         server.await.unwrap();
     }
@@ -838,6 +889,7 @@ mod tests {
                     agent_version: "ok".into(),
                     proto_version: PROTO_VERSION,
                     uptime_s: 0.1,
+                    overlay_error: None,
                 },
             )
             .await;

@@ -82,6 +82,10 @@ fn run_exec(conn: &Conn, id: u64, req: &ExecRequest, reaper: &Reaper) -> io::Res
         cmd.env(k, v);
     }
     for (k, v) in &req.env {
+        // Defense in depth behind the host's pre-boot validation: `Command::env`
+        // forwards names verbatim, so a `FO=O` name would land in the child's
+        // environ as the ambiguous `FO=O=bar` (dogfood finding #27).
+        validate_env_pair(k, v).map_err(|m| io::Error::new(io::ErrorKind::InvalidInput, m))?;
         cmd.env(k, v);
     }
     // Validate the working directory up front: `spawn` reports a missing cwd as
@@ -201,6 +205,25 @@ fn run_exec(conn: &Conn, id: u64, req: &ExecRequest, reaper: &Reaper) -> io::Res
     Ok(())
 }
 
+/// Check one environment pair for names/values `execve` cannot faithfully
+/// represent: an empty or `=`/NUL-carrying name, or a NUL-carrying value.
+fn validate_env_pair(k: &str, v: &str) -> Result<(), String> {
+    if k.is_empty() {
+        return Err("environment variable name must not be empty".to_string());
+    }
+    if k.contains('=') || k.contains('\0') {
+        return Err(format!(
+            "invalid environment variable name {k:?}: must not contain '=' or NUL"
+        ));
+    }
+    if v.contains('\0') {
+        return Err(format!(
+            "invalid value for environment variable {k}: must not contain NUL"
+        ));
+    }
+    Ok(())
+}
+
 /// Pump one output stream: read raw bytes (≤ [`EXEC_CHUNK_LEN`] per read) and
 /// forward each non-empty chunk as a base64 `ExecStream` frame. Stops on EOF or
 /// the first send failure (dead connection).
@@ -224,5 +247,25 @@ fn stream_reader<R: Read>(mut r: R, conn: &Conn, id: u64, stream: ExecStreamKind
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_env_pair_accepts_normal_pairs() {
+        assert!(validate_env_pair("PATH", "/bin").is_ok());
+        assert!(validate_env_pair("EMPTY_VALUE", "").is_ok());
+        assert!(validate_env_pair("V", "a=b=c").is_ok()); // '=' in values is fine
+    }
+
+    #[test]
+    fn validate_env_pair_rejects_malformed_names_and_nul() {
+        assert!(validate_env_pair("", "x").is_err());
+        assert!(validate_env_pair("FO=O", "bar").is_err());
+        assert!(validate_env_pair("NUL\0KEY", "x").is_err());
+        assert!(validate_env_pair("K", "nul\0value").is_err());
     }
 }

@@ -79,6 +79,7 @@ fn dispatch(conn: &Conn, req: Request, reaper: &Reaper) {
                     agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     proto_version: PROTO_VERSION,
                     uptime_s: read_uptime(),
+                    overlay_error: crate::overlay::assembly_error().map(str::to_string),
                 },
             });
         }

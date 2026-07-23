@@ -536,8 +536,8 @@ async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> 
             .await
             .with_context(|| {
                 format!(
-                    "snapshot builder agent not ready within {AGENT_READY_TIMEOUT:?}; \
-                     serial log at {}",
+                    "snapshot builder agent readiness check failed (vsock ping, \
+                     {AGENT_READY_TIMEOUT:?} budget); serial log at {}",
                     console_log.display()
                 )
             })?;
@@ -695,8 +695,8 @@ pub async fn resume(
         .await
         .with_context(|| {
             format!(
-                "resumed guest agent not ready within {AGENT_READY_TIMEOUT:?}; \
-                 serial log at {}",
+                "resumed guest agent readiness check failed (vsock ping, \
+                 {AGENT_READY_TIMEOUT:?} budget); serial log at {}",
                 console_log.display()
             )
         })?;

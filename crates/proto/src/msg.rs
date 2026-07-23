@@ -129,6 +129,13 @@ pub enum ResponseBody {
         proto_version: u32,
         /// Guest uptime in seconds (restore-continuity diagnostics).
         uptime_s: f64,
+        /// Present iff the guest was asked to assemble a stage-overlay root at
+        /// boot and FAILED — it is running on the read-only base root instead,
+        /// so any exec would see the wrong filesystem. The host must treat this
+        /// as fatal for the run rather than trust a clean exit code (dogfood
+        /// finding #26). Absent/`None` = healthy (additive within proto v3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overlay_error: Option<String>,
     },
     /// One chunk of exec output.
     ExecStream {
@@ -310,6 +317,42 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn pong_overlay_error_is_additive() {
+        // A healthy Pong serializes without the field (byte-identical to the
+        // pre-#26 shape) and a field-less Pong from an older agent parses.
+        let healthy = Response {
+            id: 1,
+            body: ResponseBody::Pong {
+                agent_version: "0.1.0".into(),
+                proto_version: 3,
+                uptime_s: 2.5,
+                overlay_error: None,
+            },
+        };
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":1,"body":{"kind":"pong","agent_version":"0.1.0","proto_version":3,"uptime_s":2.5}}"#
+        );
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, healthy);
+
+        // A degraded Pong round-trips the message.
+        let degraded = Response {
+            id: 2,
+            body: ResponseBody::Pong {
+                agent_version: "0.1.0".into(),
+                proto_version: 3,
+                uptime_s: 2.5,
+                overlay_error: Some("mount layer /dev/vdk at /layers/10: ENOENT".into()),
+            },
+        };
+        let json = serde_json::to_string(&degraded).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, degraded);
     }
 
     #[test]

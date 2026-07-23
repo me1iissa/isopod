@@ -230,12 +230,17 @@ async fn live_agent_exec_rpc() {
         proto_version,
         uptime_s,
         agent_version,
+        overlay_error,
     } = &pong.body
     else {
         panic!("expected Pong, got {:?}", pong.body);
     };
     assert_eq!(*proto_version, PROTO_VERSION, "proto_version must be 1");
     assert!(!agent_version.is_empty(), "agent_version present");
+    assert_eq!(
+        *overlay_error, None,
+        "a healthy boot must report no overlay-assembly error"
+    );
     assert!(
         *uptime_s > 0.0 && *uptime_s < 120.0,
         "uptime {uptime_s} should be a plausible fresh-boot value"

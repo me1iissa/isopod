@@ -9,7 +9,9 @@
 //! committed stage layers (bottom-to-top). Assembly:
 //!
 //! 1. Mount the scratch ext4 read-write at `/overlay`.
-//! 2. Mount each committed stage layer read-only at `/layers/<i>` (1-based).
+//! 2. Mount a tmpfs at `/layers` (the squashfs base root is read-only, so
+//!    mountpoints must be creatable elsewhere), then mount each committed stage
+//!    layer read-only at `/layers/<i>` (1-based).
 //! 3. Create the overlay `upper`/`work` dirs on `/overlay` and perform **one**
 //!    multi-lowerdir overlay mount at `/mnt`
 //!    (`lowerdir=/layers/N/upper:…:/layers/1/upper:/`, topmost first, the
@@ -34,10 +36,22 @@
 //! no overlay).
 
 use std::io;
+use std::sync::OnceLock;
 
 use crate::cmdline;
 use crate::server::log;
 use crate::sys::{self, MS_NOATIME, MS_RDONLY};
+
+/// Set iff a requested overlay-root assembly FAILED (the guest is running on
+/// the read-only base root instead). Reported in every `Pong` so the host can
+/// refuse to exec on the wrong rootfs instead of trusting a clean exit code
+/// (dogfood finding #26).
+static ASSEMBLY_ERROR: OnceLock<String> = OnceLock::new();
+
+/// The overlay-assembly failure recorded at boot, if any.
+pub fn assembly_error() -> Option<&'static str> {
+    ASSEMBLY_ERROR.get().map(String::as_str)
+}
 
 /// Command-line key whose presence switches the agent into overlay-root mode;
 /// the value is the committed stage-layer count (`>= 0`).
@@ -52,6 +66,10 @@ const UPPER_RAM: &str = "ram";
 
 /// Staging mountpoint for the merged overlay before `pivot_root` makes it `/`.
 const STAGING: &str = "/mnt";
+/// Parent of the per-layer mountpoints. A tmpfs is mounted here before the
+/// layer mounts so mountpoints can be created for any chain depth — the base
+/// root is a read-only squashfs, on which nothing can be created directly.
+const LAYERS_DIR: &str = "/layers";
 /// Overlay upper-backing mountpoint inside the base image: an ext4 scratch drive
 /// in drive-backed mode, or a tmpfs in RAM-upper mode.
 const SCRATCH_MNT: &str = "/overlay";
@@ -62,10 +80,12 @@ const WORK_DIR: &str = "/overlay/work";
 
 /// Assemble the stage overlay root **iff** `/proc/cmdline` requests it.
 ///
-/// Best-effort by design: a failure here leaves the guest on the read-only base
-/// root (read-only execs and the vsock RPC still work, so the host can diagnose)
-/// rather than panicking PID 1. Must be called after the pseudo-filesystems are
-/// mounted (it reads `/proc/cmdline` and the `/dev/vd*` nodes).
+/// A failure leaves the guest on the read-only base root rather than panicking
+/// PID 1 (the vsock RPC still works, so the host can diagnose) — but it is
+/// **recorded** and reported in every `Pong`, and the host refuses to run on a
+/// degraded root; executing on the wrong rootfs with a clean exit code was
+/// dogfood finding #26. Must be called after the pseudo-filesystems are mounted
+/// (it reads `/proc/cmdline` and the `/dev/vd*` nodes).
 pub fn assemble_if_requested() {
     let cmdline = match std::fs::read_to_string("/proc/cmdline") {
         Ok(s) => s,
@@ -89,11 +109,14 @@ pub fn assemble_if_requested() {
             "overlay: stage root assembled (layers={n_layers}, upper={})",
             upper.as_str()
         )),
-        Err(e) => log(&format!(
-            "overlay: FAILED to assemble stage root (layers={n_layers}, upper={}): {e}; \
-             continuing on the read-only base root",
-            upper.as_str()
-        )),
+        Err(e) => {
+            let msg = format!(
+                "overlay-root assembly failed (layers={n_layers}, upper={}): {e}",
+                upper.as_str()
+            );
+            log(&format!("overlay: {msg}; continuing on the read-only base root"));
+            let _ = ASSEMBLY_ERROR.set(msg);
+        }
     }
 }
 
@@ -185,9 +208,21 @@ fn assemble(n_layers: usize, upper: UpperMode) -> io::Result<()> {
     std::fs::create_dir_all(UPPER_DIR)?;
     std::fs::create_dir_all(WORK_DIR)?;
 
+    // Layer mountpoints live on a fresh tmpfs over /layers: the base root is a
+    // read-only squashfs, so mountpoints cannot be created directly on it — the
+    // fixed set baked into the image silently capped chains at 9 layers
+    // (dogfood finding #26). The base image must ship a /layers directory (all
+    // stamped images do) for the tmpfs to mount over.
+    if !layers.is_empty() {
+        sys::mount_with_data("tmpfs", LAYERS_DIR, "tmpfs", MS_NOATIME, None)
+            .map_err(|e| annotate(e, &format!("mount tmpfs for layer mountpoints at {LAYERS_DIR}")))?;
+    }
+
     // Each committed stage layer → /layers/<i> (1-based; PUT order is bottom→top).
     for (i, dev) in layers.iter().enumerate() {
         let mnt = layer_mountpoint(i + 1);
+        std::fs::create_dir_all(&mnt)
+            .map_err(|e| annotate(e, &format!("create layer mountpoint {mnt}")))?;
         sys::mount_with_data(dev, &mnt, "ext4", MS_RDONLY | MS_NOATIME, None)
             .map_err(|e| annotate(e, &format!("mount layer {dev} at {mnt}")))?;
     }
@@ -353,6 +388,10 @@ mod tests {
     fn layer_mountpoint_is_one_based() {
         assert_eq!(layer_mountpoint(1), "/layers/1");
         assert_eq!(layer_mountpoint(9), "/layers/9");
+        // Depth 10 — the last depth MAX_CHAIN_DEPTH permits — must work too:
+        // the base image only baked /layers/0..9, which silently broke the
+        // 1-based 10th mountpoint until the tmpfs fix (finding #26).
+        assert_eq!(layer_mountpoint(10), "/layers/10");
     }
 
     #[test]

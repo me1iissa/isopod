@@ -303,3 +303,194 @@ override, and shutdown ordering) — a live repro attempt is queued for the next
 **Caveat:** the long-lived `isopod-mcp` server must restart to pick up proto v3 — until then
 the MCP tools fail fast against v3 guests (by design, and now pre-boot). Full MCP-side
 re-verification + the checklist gauntlet run after the restart.
+
+## 2026-07-22 (post-restart) — proto-v3 MCP verification gauntlet (the "Next-gauntlet checklist")
+
+The `isopod-mcp` server was restarted onto proto v3 and the whole never-covered checklist
+was run **through the MCP tools alone**, orchestrated as a phased workflow: a reachability
+canary → 8 parallel scenario buckets → an isolated concurrent-same-label commit race → the
+queued #19 tap-busy live repro (4 agents) → `vm_gc`/retention → **adversarial verification of
+every candidate finding** (to kill probe artifacts) → a coverage critic. **49 scenarios, 23
+agents, ~843 k tokens, ~17 min.** Result: **1 HIGH and 2 LOW confirmed; 2 candidate findings
+refuted on verification.** Everything else PASS/INFO, including the full F1 re-verification.
+
+26. **[fixed] HIGH — forking a stage with ≥10 overlay layers silently breaks and boots on the
+    wrong rootfs.** *(Fix + live verification: see the 2026-07-23 fix-wave section below.)* `sandbox_run` happily commits a 10th layer (exit 0), but forking any
+    depth-≥10 stage boots onto the **read-only squashfs base root** with *all committed layer
+    state invisible*, writes failing — and **the MCP result returns a normal exit 0 with no
+    error field** (a command that happens to exit 0 could even `commit_as` a bogus stage).
+    Live repro: `gaunt-chain-10` fork → `/bin/sh: can't create /root/chain/l11: nonexistent
+    directory`; `/proc/mounts` shows `/dev/root / squashfs ro` (no overlay), `/dev/vdb..vdj`
+    mounted at `/layers/1..9`, but `/layers/10` absent; console: `[isopod-agent] overlay:
+    FAILED to assemble stage root (layers=10, upper=drive): mount layer /dev/vdk at
+    /layers/10: No such file or directory (os error 2); continuing on the read-only base
+    root`. **Root cause** (`crates/guest-agent/src/overlay.rs:189-193`): the layer-mount loop
+    mounts each drive at `/layers/<i+1>` but **never `create_dir_all`s the mountpoint** (unlike
+    `UPPER_DIR`/`WORK_DIR` at `:185-186`); it relies on mountpoints pre-baked into the base
+    image, which only ship `/layers/0..9`, so the 10th layer's `/layers/10` doesn't exist →
+    `mount(2)` ENOENT. Practical cap is **9 committed layers**. The unit tests
+    (`overlay.rs:354-355`) only assert `layer_mountpoint(1)` and `(9)` — never 10, so the cap
+    was never caught. **The silent half** (`overlay.rs:65, 87-96`): an assembly failure is
+    logged to the console only and boot proceeds on the base root ("best-effort by design");
+    nothing propagates to the host / MCP result. → **FIX** (two parts): (a) one-liner —
+    `std::fs::create_dir_all(&mnt)?;` before the `mount` in the `:189` loop, which removes the
+    pre-baked-mountpoint dependency and lifts the cap entirely (add an integration test forking
+    a 16-layer chain); (b) **surface overlay-assembly failure as a run error** (or at least a
+    `overlay_degraded: true` flag in the exec result) instead of silently booting on the wrong
+    rootfs — otherwise a broken deep fork masquerades as a healthy exit-0 run. (b) is a design
+    call — making it fatal changes boot behavior — so worth an explicit decision. Requires a
+    guest-agent rebuild + re-stamp of all images and a gauntlet re-run to close.
+
+27. **[fixed] LOW — env keys are forwarded to the guest `execve` environment without
+    validation.** *(Fix + live verification: see the 2026-07-23 fix-wave section below.)* `env={"FO=O":"bar"}` is accepted silently and lands in the guest environ as
+    the ambiguous entry `FO=O=bar` (any parser reads it as `FO="O=bar"`, *not* the requested
+    name); `env={"":"bar"}` lands as a nameless `=bar` entry. Verified at the raw
+    `/proc/self/environ` level (not a busybox `env` display quirk). Neither crashes or wedges
+    the guest agent, and later runs are unaffected — POSIX env names must be nonempty and
+    `=`-free, but `execve` doesn't enforce it and the passthrough is faithful, so this is a
+    minor input-validation gap, not a malfunction. Source: `crates/guest-agent/src/exec.rs:84`
+    (`for (k, v) in &req.env { cmd.env(k, v); }` — no key check). → **FIX**: reject keys
+    matching `/=|^$/` with a clear pre-boot error (host-side in the MCP/CLI param validation,
+    mirroring the `stdin`/`stdin_file` -32602 style), or skip+warn in `exec.rs`.
+
+**Refuted on verification (recorded so they aren't re-raised):**
+- *Commit runs return `stage_id`/`stage_name`, not the "documented" `commit_id`* (G5, first
+  raised LOW) — **refuted**: the string `commit_id` exists nowhere in the repo; `stage_id` +
+  `stage_name` **are** the interface. No drift. (The workflow schema I wrote carried the wrong
+  field name in from the checklist prose — the verifier caught it.)
+- *`sandbox_run` doesn't return the committed stage's vanity name, so callers misreport it*
+  (R2, first raised LOW) — **refuted**: the result **does** carry `stage_name`; both race
+  agents simply reported `vm_name` by mistake. The committed name is directly available and
+  can't be confused with the VM name.
+
+**Positive re-verifications (all via MCP, all PASS):**
+- **F1 egress hardening holds after the restart** — all 7 RFC1918/link-local probes
+  (incl. `169.254.169.254`) **DROP** with a full ~3 s socket timeout (no `CONNECTED`, no fast
+  `ConnectionRefused` = pure drop semantics), while public ICMP (`1.1.1.1`), DNS, and HTTP
+  (`example.com` → 200) all work — destination-scoped, not a blanket kill. `network=false` is
+  airtight (no `guest_ip`/`slot` fields, instant `OSError`, exec still over vsock).
+- **#3** nonexistent-command and **#18** cwd-error stay closed (structured exit 127, correct
+  `isopod-exec: cwd '…': No such file or directory`).
+- **stderr truncation** (first stderr-side probe): 200 000 B → 64 KiB in-band cap,
+  `stderr_truncated=true`, `stderr_bytes` exact, on-disk log complete at 200 000 B.
+- **dual-stream 8 MB+8 MB interleaved flood** (the pipe-deadlock probe): **no deadlock** —
+  completed in 176 ms, both streams truncated in-band with exact `*_bytes`, both logs complete
+  at 8 000 000 B each.
+- **stdin**: unconsumed 1 MiB `stdin_file` → clean exit 0 (host writer tolerates EPIPE); 64 KiB
+  and 1 MiB delivered byte-exact (`wc -c` = 65536 / 1048576); `stdin`+`stdin_file` together and
+  `stdin_file="-"` both rejected pre-boot (-32602).
+- **hostile labels** (unicode `😀-café-Ω`, `../../../etc/passwd-pwned`, 410-char) all safe:
+  labels are pure metadata, stage dirs are always `st-<hex>`, nothing written outside
+  `~/.isopod/stages` (host-checked). **Duplicate labels** → clean ambiguity error naming all
+  candidates (-32603), no silent pick.
+- **opaque-dir whiteout** (`rm -rf /data` + recreate): only the new file visible, no lower-layer
+  bleed. **cwd into a stage-created / whiteout-recreated dir**: works.
+- **proto-v3 fixes**: hostname == vanity name on cold **and** warm; `copy_out` byte-exact
+  (sha match, mode 0755); in-guest `apk add jq` → jq 1.8.1; cmake 4.2.3 + GNU coreutils cp
+  9.11; observability fields (`path`/`resume_ms`/`snapshot_built`/`commit_ms`) all present.
+- **timeout**: exec-timeout → `timed_out=true, exit_code=null, signal=9`, partial stdout kept;
+  **`commit_as` on a timed-out run correctly commits NOTHING** (the key never-tested
+  interaction); boot-timeout edge leaks no slot.
+- **concurrent same-label commit race**: store fully consistent — both stages present, all 29
+  vanity names unique, both forkable with distinct uncontaminated content, metadata survived
+  the server restart. (Commits landed 2 s apart — batched MCP calls serialize — so a truly
+  simultaneous index write wasn't forced; behavior nonetheless correct.)
+- **#19 tap-busy**: **NOT reproduced** across 12 networked `base-sqfs` runs (cold→warm→warm on
+  slot 0, egress live each time). *Caveat — under-powered:* the workflow cap is 2 agents and
+  each agent's runs were sequential, so the concurrent / crashed-owner tap-reclaim paths
+  (`crates/core/src/net.rs` slot allocator) were **not** exercised. Absence here ≠ absence.
+- **`vm_gc`/retention**: `keep_last=5` keeps exactly the 5 newest ∪ sub-60 s records (the 62 s
+  record was correctly pruned — the 1-minute grace is a hard cutoff), disk physically freed
+  (39→5 dirs), no over-prune, and pruned runs' `*_log_path` become dangling **by design**
+  (matches the docstring warning).
+
+**Note — a security-heuristic false positive during the run:** the R2 verifier was flagged for
+`stage_rm "solar-psion"` "with no evidence it was created this session". Investigated and
+**cleared**: `solar-psion` was that agent's own throwaway — it ran
+`commit_as="r2-verify-commit-name-probe"` (which returned `stage_name=solar-psion`) to check
+whether the result exposes the stage name, then deleted its own test stage. All 9 pre-existing
+stages remained intact; no real stage was lost.
+
+**Next-gauntlet checklist** (from the coverage critic — genuinely open):
+- **Post-#26-fix boundary sweep**: chains at exactly 9/10/11/16 layers; assert layer-1 content
+  is visible at layer 16 and writes land. Plus a **silent-fallback guard probe** that asserts
+  overlay-assembly failure surfaces as a run ERROR, not exit-0 on the base root.
+- **cwd into a WHITEOUTED dir** (fork a stage where the cwd target was `rm -rf`'d in a later
+  layer) — #18-style clean spawn error expected; only the stage-*created* case was covered.
+- **Deep opaque-dir whiteout** (recreate at layer ~8 through a long lowerdir chain) — blocked by
+  #26 today.
+- **Deterministic timeout-DURING-commit** (dirty 2–4 GB of *incompressible* scratch so the
+  commit genuinely runs multi-second; assert `timed_out`, no partial/orphan stage, store
+  integrity). H4 sparsified to ~632 KB so this stayed unobserved.
+- **Concurrent tap gauntlet**: N>slot-count simultaneous networked runs (expect graceful
+  slot-exhaustion, not EBUSY) and SIGKILL-a-networked-VM-then-relaunch (crashed-owner tap
+  reclaim) — the actual #19 failure class, still unexercised.
+- **Warm-vs-cold matrix**: record the `path` field per scenario and force both; the RAM-upper
+  (warm) vs drive-scratch (cold) overlay paths diverge, and big-write behavior on the RAM upper
+  (ENOSPC/OOM within `mem_mib`) is uncovered.
+- **`vm_gc` racing a live run**: invoke `vm_gc keep_last=1` mid-`sandbox_run`; assert the live
+  record + its `*_log_path` survive.
+- **Regression probes** once #26/#27 land (env-name rejection; the deep-chain fix).
+
+## 2026-07-23 — #26/#27 fix wave (built in-sandbox, verified live)
+
+**Root-cause refinement for #26**: the intended chain-depth cap was always **10**
+(`stage.rs MAX_CHAIN_DEPTH`, derived from Firecracker's virtio-MMIO IRQ slot budget and
+enforced at both `commit` and `chain_paths`) — the bug was an **off-by-one between the baked
+mountpoints and the 1-based layer indexing**: base images shipped `/layers/0..9` while a
+depth-10 chain needs `/layers/1..10`, so exactly the *last permitted depth* broke. (The
+gauntlet's "≥10 layers" phrasing was thus really "the depth-10 boundary"; depths >10 were
+always refused loudly by the cap.)
+
+**Fixes landed:**
+- **#26a (guest, `overlay.rs`)** — layer mountpoints now live on a **tmpfs mounted over
+  `/layers`** and are `create_dir_all`'d per layer. The base root is a read-only squashfs, so
+  the naive `create_dir_all` fix would have EROFS'd; the tmpfs removes the baked-mountpoint
+  dependency for any depth the cap permits.
+- **#26b (proto + guest + host)** — overlay-assembly failure is no longer silent: the guest
+  records it and reports it in every `Pong` (additive `overlay_error` field, proto stays v3);
+  the host's `ping()` turns it into a fatal `AgentError::OverlayDegraded` (exactly parallel to
+  `ProtoMismatch`), so **all** readiness paths — run, snapshot build, warm resume — refuse to
+  proceed on a wrong rootfs instead of returning exit 0. A degraded snapshot can never be
+  cached. The guest still boots to the base root for serial-log diagnosability (PID 1 must not
+  die), but no exec is served by a run.
+- **#27 (host + guest)** — env validation at two levels: `core::vm::validate_env` rejects
+  empty/`=`/NUL names and NUL values **pre-boot** (the shared choke point covering the MCP
+  map, which `parse_env_kv` never sees), and the guest agent independently rejects the same
+  shapes before `execve` (defense in depth, exit 127 + `isopod-exec:` stderr).
+- Readiness error contexts reworded ("readiness check failed" instead of "did not answer a
+  ping") so an `OverlayDegraded`/`ProtoMismatch` cause isn't wrapped in a misleading message.
+- *Not* landed: a redundant 24-layer "vdz naming ceiling" guard drafted during the fix was
+  removed on review — `MAX_CHAIN_DEPTH = 10` already governs strictly tighter at both commit
+  and resolve, so the device-naming ceiling is unreachable.
+
+**Build**: full workspace built + tested **inside an isopod sandbox** (`isopod-build` stage,
+offline — taps were down, see below; `stdin_file` source injection + `copy_out` extraction).
+All tests green (135 core + 42 + 39 + guest/proto/cli suites, 0 failures) including new units:
+`layer_mountpoint(10)`, Pong `overlay_error` additive-shape round-trip, host
+`ping_rejects_degraded_overlay_root`, `validate_env`, guest `validate_env_pair`. Warmed build
+cache committed as stage `isopod-build/2026-07-23-fix26`. All four images re-stamped (proto 3,
+agent `6b7d85db52c3…`); stale warm-pool snapshots (old base ids) cleared.
+
+**Live verification (new CLI + images):**
+- **Depth matrix at the real boundary**: depth 9 fork OK (regression); **depth-10 fork of
+  `gaunt-chain-10` now works** — all 10 markers visible, writes land, `/proc/mounts` shows the
+  10-deep overlay root (`lowerdir=/layers/10/upper:…:/layers/1/upper:/`); depth-11 commit
+  refused pre-emptively with the clear MMIO-budget error. (The checklist's "16-layer" probe is
+  moot — 16 was never bootable by design.)
+- **MCP path, no server restart needed for the guest side**: `sandbox_run` forking
+  `gaunt-chain-10` through the *running* server → 10 markers, overlay root, exit 0 (images are
+  read per run). `env={"FO=O":"bar"}` → exit 127, `invalid environment variable name "FO=O"`;
+  `env={"":"bar"}` → exit 127, `name must not be empty` (the guest-side defense; host-side
+  pre-boot rejection activates on the next MCP server restart).
+- The **silent-fallback guard** (#26b) is covered by unit + proto-shape tests; a live
+  forced-assembly-failure probe would need a deliberately broken image and stays on the
+  checklist.
+
+**Environment notes**: WSL2 was restarted since the gauntlet — tap slots are gone, so
+networked runs fail with the correct #13 guidance until `sudo isopod setup` is re-run (all of
+the above verified with `--no-network`; warm-pool paths therefore unexercised this wave). The
+long-lived MCP server still runs the pre-fix host code: guest-side fixes are already effective
+through it (images re-read per run); `validate_env`, `OverlayDegraded`, and the reworded
+contexts engage on its next restart (binaries at `target/release/{isopod-mcp,isopod-jail}` are
+already the fixed builds).
