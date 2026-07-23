@@ -6,6 +6,9 @@ This doc covers building the server, registering it two ways (project-scope
 `.mcp.json` and the bundled plugin), the tool list, and a few end-to-end
 example prompts.
 
+**TL;DR:** for local development, use Option 1 (local-scope registration)
+and skip ahead to the tool list.
+
 ## Build
 
 ```bash
@@ -119,7 +122,7 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | Param | Default | Notes |
 |---|---|---|
 | `cmd` | — | Required. Run via `/bin/sh -c`, so pipes/redirects/`&&` all work. |
-| `stage` | `"base"` | A committed stage's id/vanity-name/label to fork from, or the reserved word `"base"` for a fresh VM with zero committed layers. This is *not* the same as omitting the param entirely at the `isopod-core` level (which boots the legacy toolchain-less ext4 image) — the MCP tool defaults to `"base"` specifically so the toolchain image is what you get without having to ask. |
+| `stage` | `"base"` | A committed stage's id/vanity-name/label to fork from, or the reserved word `"base"` for a fresh VM with zero committed layers on the toolchain image. |
 | `base` | `"base-alpine"` | Squashfs base for a `stage="base"` run: `base-alpine` (python3/pip, node, git, gcc) or `base-sqfs` (minimal busybox, no toolchain). Ignored when forking an existing stage — forks always reuse the base that stage was built on. |
 | `network` | `true` | Set `false` for untrusted code — no NIC is attached at all; exec still works (control RPC is vsock, not the network). |
 | `timeout_s` | `120` | **Outer wall-clock budget that includes VM boot** (~0.4 s), not exec-only time. |
@@ -138,8 +141,9 @@ stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
 total_ms, path, resume_ms?, snapshot_built, commit_ms?, vcpus, mem_mib,
 vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?, guest_ip?,
 stdout_log_path, stderr_log_path, serial_log_path, copied?}`. Highlights:
-`stdout`/`stderr` are 64 KiB inline heads with exact byte totals alongside
-and full logs at the `*_log_path`s; `path` says whether the run resumed
+`stdout`/`stderr` are 64 KiB **inline** heads with exact byte totals
+alongside and full logs at the `*_log_path`s (the on-disk logs have their
+own, much larger caps — see SECURITY.md); `path` says whether the run resumed
 `"warm"` or booted `"cold"` (with `resume_ms` on warm runs and
 `snapshot_built` flagging the one-time cache build); `stage_*` appear only
 when `commit_as` actually committed; `guest_ip`/`slot` only when networking

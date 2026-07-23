@@ -26,7 +26,7 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // one-shot dispatch value; variant size is irrelevant
 enum Command {
-    /// Guest image pipeline (fetch-kernel, build-rootfs)
+    /// Guest image pipeline (fetch-kernel, build-rootfs, build-all, ls)
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -78,6 +78,7 @@ struct SetupArgs {
 #[derive(Subcommand)]
 enum VmCommand {
     /// List recorded VMs newest-first (id, vanity name, flavor, created, bytes)
+    #[command(visible_alias = "list")]
     Ls,
     /// Remove old VM directories (keeps the newest N and anything under a minute old)
     Gc {
@@ -183,6 +184,7 @@ enum WarmpoolCommand {
 #[derive(Subcommand)]
 enum StageCommand {
     /// List committed stages (oldest-first)
+    #[command(visible_alias = "ls")]
     List,
     /// Show a stage's full metadata and layer chain
     Info {

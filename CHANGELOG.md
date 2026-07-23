@@ -6,6 +6,12 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.7.3] — 2026-07-23
+
+- CLI polish from an external docs review: `stage ls` and `vm list` now work
+  as visible aliases (the `list`/`ls` asymmetry between the two groups was a
+  papercut), and the top-level `image` help text names all four subcommands.
+
 ## [0.7.2] — 2026-07-23
 
 - Formatting fixup missed from the 0.7.1 commit (whitespace only).

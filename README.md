@@ -69,7 +69,7 @@ run + commit  ──►  stage (immutable)  ──►  fork ──► run ──
 
 ### Warm pool
 
-A cold boot is fast (~0.4 s), but a warm resume is faster still. isopod keeps a **full-VM memory snapshot** of a booted-idle, network-less VM, keyed on the exact environment it must match. A fresh `sandbox_run` that qualifies (fresh base image, network on, no commit) **hot-resumes** that snapshot into a free network slot in tens of milliseconds instead of cold-booting, then re-applies the slot's IP and re-syncs the guest clock over vsock. Any change to the key (Firecracker build, host kernel, CPU model, base flavor, vCPUs, memory, snapshot format) silently invalidates the cache and falls back to a cold boot.
+A cold boot is fast (~0.4 s), but a warm resume is faster still. isopod keeps a **full-VM memory snapshot** of a booted-idle, network-less VM, keyed on the exact environment it must match. A fresh `sandbox_run` that qualifies (fresh base image, network on, no commit, default scratch — the full rules are in [docs/getting-started.md](docs/getting-started.md)) **hot-resumes** that snapshot into a free network slot in tens of milliseconds instead of cold-booting, then re-applies the slot's IP and re-syncs the guest clock over vsock. Any change to the key (Firecracker build, host kernel, CPU model, base flavor, vCPUs, memory, snapshot format) silently invalidates the cache and falls back to a cold boot.
 
 ---
 
@@ -193,7 +193,7 @@ sandbox_run(cmd="python3 -c 'import numpy; print(numpy.__version__)'",
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
-Key `sandbox_run` parameters: `cmd` (required), `stage` (default `"base"` — a fresh toolchain VM), `base` (`base-alpine` with python/node/git/gcc, or `base-sqfs` minimal busybox), `network` (default `true`), `timeout_s` (default 120, an **outer wall-clock budget that includes boot**), `cwd`, `env`, `commit_as`, `stdin` / `stdin_file` (inline text vs. a host file for big payloads), `vcpus`, `mem_mib`, `scratch_mib` (per-VM sizing), and `copy_out` (stream guest files to host paths after the run — the binary-safe artifact channel). Full schema is self-describing in each tool. See [docs/mcp-usage.md](docs/mcp-usage.md).
+Beyond `cmd`, `stage`, and `network`, `sandbox_run` takes `timeout_s` (an **outer wall-clock budget that includes boot**), `commit_as`, `cwd`/`env`, `stdin`/`stdin_file`, per-VM sizing (`vcpus`, `mem_mib`, `scratch_mib`), and `copy_out` for streaming artifacts back to the host. The full parameter and result tables live in [docs/mcp-usage.md](docs/mcp-usage.md); every tool's schema is also self-describing.
 
 ### CLI
 
@@ -309,8 +309,9 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 
 | Doc | What it covers |
 |---|---|
-| [docs/getting-started.md](docs/getting-started.md) | Full setup walk-through: prerequisites, build, images, networking, first runs, the jail, MCP registration, troubleshooting. |
+| [docs/getting-started.md](docs/getting-started.md) | Full setup walk-through: prerequisites, build, images, networking, first runs, the jail, MCP registration, troubleshooting, uninstall. |
 | [docs/mcp-usage.md](docs/mcp-usage.md) | MCP server registration (local scope and plugin), the tool list, `sandbox_run` parameters and result shape. |
+| [skill/SKILL.md](skill/SKILL.md) | The workflow skill loaded into Claude's context — also the best short conceptual intro to the stage model for humans. |
 | [SECURITY.md](SECURITY.md) | The security model: threat model, what holds, the jail, known limitations, operator guidance. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, crate map, coding conventions, versioning policy. |
 | [CHANGELOG.md](CHANGELOG.md) | Release history. |

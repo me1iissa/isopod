@@ -37,19 +37,20 @@ On a Debian/Ubuntu host these come from `nftables iproute2 e2fsprogs squashfs-to
 cargo build --release
 ```
 
-This produces two binaries under `target/release/`:
+This produces three binaries under `target/release/`:
 
 - `isopod` — the CLI (from `crates/cli`).
 - `isopod-mcp` — the MCP stdio server (from `crates/mcp`).
+- `isopod-jail` — the rootless jail helper (from `crates/jail`, used only when `ISOPOD_JAIL=1`).
 
-They are separate binaries built from a shared `isopod-core` library, so after changing `crates/core` you must rebuild whichever front end you are exercising (`cargo build --release` builds both).
+(The guest agent, `isopod-guest-agent`, is also built as part of the workspace but is baked into the guest images by the image pipeline rather than run on the host.) The front ends are separate binaries built from a shared `isopod-core` library, so after changing `crates/core` you must rebuild whichever front end you are exercising (`cargo build --release` builds all of them).
 
-To bring up a working environment (Firecracker binary, guest kernel, guest rootfs), then run once:
+To bring up a working environment (Firecracker binary, guest kernel, guest images), then run once:
 
 ```bash
 ./target/release/isopod dev build-fc        # build vendored Firecracker into ~/.isopod/bin
-./target/release/isopod image fetch-kernel  # pull a CI guest kernel
-./target/release/isopod image build-rootfs  # build the guest rootfs (unprivileged)
+./target/release/isopod image fetch-kernel  # pinned, digest-verified guest kernel
+./target/release/isopod image build-all     # every guest image incl. the squashfs bases (unprivileged)
 sudo ./target/release/isopod setup          # one-time host networking (the only root step)
 ```
 
@@ -77,7 +78,7 @@ A few notes on the test suite:
 
 ## Crate map
 
-isopod is a Cargo workspace of six crates:
+isopod is a Cargo workspace of seven crates:
 
 | Path | Package | Responsibility |
 |---|---|---|
@@ -87,8 +88,9 @@ isopod is a Cargo workspace of six crates:
 | `crates/guest-agent` | `isopod-guest-agent` | Static musl binary that runs as PID 1 in the guest: mounts pseudo-filesystems and the overlay, `pivot_root`s, resyncs the clock, reaps zombies, and serves the exec/file/configure RPC on vsock port 52. |
 | `crates/cli` | `isopod` | The `isopod` binary — `run`, `stage`, `vm`, `warmpool`, `setup`, `image`, `dev`. One-shot argv + JSON. |
 | `crates/mcp` | `isopod-mcp` | The rmcp 2.2 stdio MCP server exposing `sandbox_run`, `stage_list`/`stage_info`/`stage_rm`, `vm_list`/`vm_gc`. A thin async shim over `isopod-core`. |
+| `crates/jail` | `isopod-jail` | The rootless microjail helper that wraps each Firecracker process when `ISOPOD_JAIL=1`: user/pid namespaces, minimal bind-mount chroot, per-VM cgroup v2 caps. |
 
-Supporting directories: `images/` (checked-in kernel config, image build inputs), `skill/` (the Claude Code workflow skill), `docs/` (feasibility, MCP usage, dogfood findings, security assessment), `vendor/firecracker/` (the pinned submodule).
+Supporting directories: `images/` (checked-in kernel config, image build inputs), `skill/` (the Claude Code workflow skill), `docs/` (getting started, MCP usage, engineering logs), `vendor/firecracker/` (the pinned submodule).
 
 ---
 
