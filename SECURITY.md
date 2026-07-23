@@ -90,7 +90,8 @@ It requires an environment that supports it: unprivileged user namespaces, a del
 isopod v1 is honest about its posture. State these before running anything genuinely hostile:
 
 - **Without `ISOPOD_JAIL=1`, isolation is single-layer.** The default path relies on Firecracker's seccomp filter + KVM alone; a hypothetical VMM/KVM escape would land as your own user account with access to the whole `~/.isopod` store. Enable the jail (above) — or treat the host as **single-tenant** — before running mutually distrusting workloads.
-- **Some resource-exhaustion hardening is still in progress.** Exec/serial **output logs are not yet size-capped** (a single run can fill host disk with output), and there is **no global governor across concurrent VMs** (the jail's `memory.max` bounds each VM, but many unjailed VMs can still over-commit host RAM). Per-drive/NIC bandwidth rate limiters are also not yet wired. Prefer bounded workloads and prune the store (`vm_gc`) until these land.
+- **Guest-controlled host sinks are capped, but retention is manual.** Exec output logs are capped at **64 MiB per stream** and serial console logs at **16 MiB** (beyond the cap, bytes are counted but not persisted); every guest RPC the host waits on is **time-bounded**, and each run's wall budget is capped at **3600 s**. Capped logs are still retained per VM until pruned — run `vm_gc` regularly; automatic log retention/GC is not yet wired.
+- **No global governor across concurrent VMs.** The jail's `memory.max` bounds each VM, but many unjailed VMs can still over-commit host RAM. Per-drive/NIC bandwidth rate limiters are also not yet wired. Prefer bounded workloads until these land.
 
 ---
 
