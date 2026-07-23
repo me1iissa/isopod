@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "isopod",
   "displayName": "isopod",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Firecracker-microVM sandbox for Claude Code: ephemeral sandbox_run plus content-addressed environment stages (commit/fork), exposed as MCP tools with a workflow skill.",
   "license": "Apache-2.0",
   "keywords": ["sandbox", "firecracker", "microvm", "mcp", "isolation"],

@@ -114,7 +114,9 @@ pub fn assemble_if_requested() {
                 "overlay-root assembly failed (layers={n_layers}, upper={}): {e}",
                 upper.as_str()
             );
-            log(&format!("overlay: {msg}; continuing on the read-only base root"));
+            log(&format!(
+                "overlay: {msg}; continuing on the read-only base root"
+            ));
             let _ = ASSEMBLY_ERROR.set(msg);
         }
     }
@@ -214,8 +216,12 @@ fn assemble(n_layers: usize, upper: UpperMode) -> io::Result<()> {
     // (dogfood finding #26). The base image must ship a /layers directory (all
     // stamped images do) for the tmpfs to mount over.
     if !layers.is_empty() {
-        sys::mount_with_data("tmpfs", LAYERS_DIR, "tmpfs", MS_NOATIME, None)
-            .map_err(|e| annotate(e, &format!("mount tmpfs for layer mountpoints at {LAYERS_DIR}")))?;
+        sys::mount_with_data("tmpfs", LAYERS_DIR, "tmpfs", MS_NOATIME, None).map_err(|e| {
+            annotate(
+                e,
+                &format!("mount tmpfs for layer mountpoints at {LAYERS_DIR}"),
+            )
+        })?;
     }
 
     // Each committed stage layer → /layers/<i> (1-based; PUT order is bottom→top).
