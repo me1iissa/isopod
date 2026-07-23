@@ -104,6 +104,30 @@ Supporting directories: `images/` (checked-in kernel config, image build inputs)
 
 ---
 
+## Versioning
+
+The project follows [Semantic Versioning](https://semver.org/) with the usual pre-1.0
+reading: while the leading version is `0`, a **minor** bump signals a feature wave or
+any breaking change (new subcommands, guest-image format changes, host↔guest protocol
+cutovers), and a **patch** bump signals backward-compatible fixes only.
+
+- The workspace version in the root `Cargo.toml` is the **single source of truth**;
+  every crate inherits it via `version.workspace = true`, and
+  `.claude-plugin/plugin.json` must be kept in lockstep by hand.
+- **Every change wave that lands on `main` bumps the version in the same commit** —
+  the version at `HEAD` always describes the code at `HEAD`. Never leave the number
+  behind while the code moves on.
+- Each version bump gets an annotated tag `vX.Y.Z` on the commit that bumps it.
+- `PROTO_VERSION` in `crates/proto` is a separate, independently-incremented
+  compatibility number for the host↔guest RPC contract; it is not tied to the crate
+  version.
+
+Historical note: versions `v0.2.0`–`v0.6.0` were tagged retroactively at each
+milestone-close commit (M2–M6) when the versioning discipline was adopted at `v0.7.0`;
+the manifests at those commits still read `0.1.0`.
+
+---
+
 ## Proposing changes
 
 1. **Branch** off `main`. Do not commit directly to `main`.
