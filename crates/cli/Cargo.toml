@@ -26,7 +26,7 @@ assets = [
     ["target/release/isopod-mcp", "usr/bin/", "755"],
     ["target/release/isopod-jail", "usr/bin/", "755"],
     ["../../dist/firecracker", "usr/lib/isopod/", "755"],
-    ["../../target/x86_64-unknown-linux-musl/release/isopod-guest-agent", "usr/lib/isopod/", "755"],
+    ["../../dist/isopod-guest-agent", "usr/lib/isopod/", "755"],
     ["../../README.md", "usr/share/doc/isopod/README.md", "644"],
 ]
 
@@ -39,7 +39,7 @@ assets = [
     { source = "target/release/isopod-mcp", dest = "/usr/bin/isopod-mcp", mode = "755" },
     { source = "target/release/isopod-jail", dest = "/usr/bin/isopod-jail", mode = "755" },
     { source = "dist/firecracker", dest = "/usr/lib/isopod/firecracker", mode = "755" },
-    { source = "target/x86_64-unknown-linux-musl/release/isopod-guest-agent", dest = "/usr/lib/isopod/isopod-guest-agent", mode = "755" },
+    { source = "dist/isopod-guest-agent", dest = "/usr/lib/isopod/isopod-guest-agent", mode = "755" },
     { source = "LICENSE", dest = "/usr/share/doc/isopod/LICENSE", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/isopod/README.md", mode = "644" },
 ]

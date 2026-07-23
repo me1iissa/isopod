@@ -6,6 +6,13 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.8.1] — 2026-07-23
+
+- Fix the release packaging: cargo-deb rejects explicit cross-target asset
+  paths, so the guest agent is staged into `dist/` alongside Firecracker.
+  (v0.8.0's release run failed at the .deb step; this is the first tag with
+  published artifacts.)
+
 ## [0.8.0] — 2026-07-23
 
 - **Formal installation.** Every `v*` tag now publishes a GitHub Release with

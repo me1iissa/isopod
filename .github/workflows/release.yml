@@ -28,7 +28,10 @@ jobs:
         run: cargo build --release --workspace --locked
 
       - name: Build the static guest agent
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p isopod-guest-agent
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p isopod-guest-agent
+          mkdir -p dist
+          install -m755 target/x86_64-unknown-linux-musl/release/isopod-guest-agent dist/
 
       - name: Build vendored Firecracker
         run: |
@@ -51,7 +54,7 @@ jobs:
           stage="isopod-${ver}-x86_64-linux"
           mkdir -p "$stage/lib"
           install -m755 target/release/isopod target/release/isopod-mcp target/release/isopod-jail "$stage/"
-          install -m755 dist/firecracker target/x86_64-unknown-linux-musl/release/isopod-guest-agent "$stage/lib/"
+          install -m755 dist/firecracker dist/isopod-guest-agent "$stage/lib/"
           cp README.md LICENSE CHANGELOG.md "$stage/"
           tar czf "dist/${stage}.tar.gz" "$stage"
 
