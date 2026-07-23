@@ -216,7 +216,8 @@ fn resolve_kernel() -> Result<PathBuf> {
         return Ok(p);
     }
     eprintln!("dev boot: no guest kernel present; fetching a 6.18 CI vmlinux…");
-    Ok(image::fetch_kernel("6.18", false)?.kernel_path)
+    // Auto-fetch takes the pinned, digest-verified path only (F9).
+    Ok(image::fetch_kernel("6.18", false, false)?.kernel_path)
 }
 
 /// Resolve the rootfs image for `flavor`, building it unprivileged if absent.

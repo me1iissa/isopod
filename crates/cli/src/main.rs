@@ -197,7 +197,7 @@ enum StageCommand {
 
 #[derive(Subcommand)]
 enum ImageCommand {
-    /// Fetch a prebuilt CI guest kernel (enumerates S3 prefixes; layout is date-stamped)
+    /// Fetch the pinned, digest-verified CI guest kernel
     FetchKernel {
         /// Kernel series (major.minor) to fetch.
         #[arg(long, default_value = "6.18")]
@@ -205,6 +205,10 @@ enum ImageCommand {
         /// Re-download even if a matching kernel is already present.
         #[arg(long)]
         force: bool,
+        /// Fetch the newest upstream build WITHOUT digest verification (only
+        /// for discovering the digest of a new kernel before pinning it).
+        #[arg(long)]
+        allow_unpinned: bool,
     },
     /// Build the dev rootfs unprivileged (mkfs.ext4 -d)
     BuildRootfs {
@@ -315,7 +319,11 @@ fn run_warmpool(cmd: WarmpoolCommand) -> i32 {
 
 fn run_image(cmd: ImageCommand) -> i32 {
     match cmd {
-        ImageCommand::FetchKernel { series, force } => emit(image::fetch_kernel(&series, force)),
+        ImageCommand::FetchKernel {
+            series,
+            force,
+            allow_unpinned,
+        } => emit(image::fetch_kernel(&series, force, allow_unpinned)),
         ImageCommand::BuildRootfs { flavor, force } => {
             emit(RootfsFlavor::from_slug(&flavor).and_then(|f| image::build_rootfs(f, force)))
         }

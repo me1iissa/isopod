@@ -12,7 +12,7 @@ fn fetch_kernel_downloads_real_vmlinux() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("ISOPOD_HOME", tmp.path());
 
-    let out = isopod_core::image::fetch_kernel("6.18", false).expect("fetch-kernel");
+    let out = isopod_core::image::fetch_kernel("6.18", false, false).expect("fetch-kernel");
     assert!(out.ok);
     assert!(
         out.version.starts_with("6.18."),
@@ -21,6 +21,7 @@ fn fetch_kernel_downloads_real_vmlinux() {
     );
     assert!(out.prefix_used.starts_with("firecracker-ci/"));
     assert_eq!(out.sha256.len(), 64);
+    assert!(out.pinned, "the default path must be the pinned one");
 
     // The downloaded file must be a real (uncompressed) ELF vmlinux.
     let mut f = std::fs::File::open(&out.kernel_path).expect("open kernel");
@@ -29,7 +30,19 @@ fn fetch_kernel_downloads_real_vmlinux() {
     assert_eq!(&magic, b"\x7fELF", "kernel is not an ELF binary");
 
     // Second call must be a cache hit (no re-download) with the same digest.
-    let again = isopod_core::image::fetch_kernel("6.18", false).expect("fetch-kernel cached");
+    let again =
+        isopod_core::image::fetch_kernel("6.18", false, false).expect("fetch-kernel cached");
     assert!(again.cached);
     assert_eq!(again.sha256, out.sha256);
+}
+
+/// Offline: a series with no pin must fail closed (no network I/O happens
+/// before the guard) and point at the `--allow-unpinned` discovery path.
+#[test]
+fn fetch_kernel_refuses_unpinned_series() {
+    let err = isopod_core::image::fetch_kernel("5.10", false, false)
+        .expect_err("unpinned series must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("no pinned kernel digest"), "{msg}");
+    assert!(msg.contains("--allow-unpinned"), "{msg}");
 }
