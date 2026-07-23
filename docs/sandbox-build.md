@@ -22,9 +22,9 @@ cd /root/src
 
 ## Getting source in
 
-There is no git remote yet, and inline MCP `stdin` is unsuitable for large payloads (the
-payload would transit model context). Use `stdin_file` (a host path — works on both the CLI
-`--stdin-file` and, since the #21 fix, the MCP `sandbox_run` param):
+For uncommitted local changes — or a guest without network access — use `stdin_file` (a host
+path — works on both the CLI `--stdin-file` and, since the #21 fix, the MCP `sandbox_run`
+param) rather than inline MCP `stdin`, which would transit the payload through model context:
 
 ```sh
 tar czf - Cargo.toml Cargo.lock rust-toolchain.toml crates | base64 -w0 > /tmp/src.b64
@@ -39,7 +39,8 @@ touched crates (measured: 6.93 s after touching `crates/cli/src/main.rs`, vs 2 m
 To persist the refreshed state, add `--commit-as isopod-build/<date>` (label-reuse semantics
 for an existing label are untested — use versioned labels until that's gauntleted).
 
-Once a git remote exists: `git clone`/`git pull` in-guest replaces the tarball dance.
+For committed state, `git clone`/`git pull` in-guest from the remote replaces the tarball
+dance (a private repo needs a read token supplied to the guest).
 
 ## Everyday check/test loop (MCP)
 
@@ -69,7 +70,7 @@ base64-over-stdout recipe still works as a fallback but is obsolete.)
 Note: replacing `target/release/isopod-mcp` requires restarting the MCP server, and a
 `PROTO_VERSION` bump requires rebuilding all guest images together (finding #17).
 
-## Sizing (4-core / 5.9 GiB WSL2 host)
+## Sizing (example: a 4-core / 6 GiB host)
 
 One build VM at a time; 4 vcpu / 3072 MiB (3584 for release) / 8192 MiB scratch. Never run a
 build VM alongside a fleet of test VMs — memory pressure has killed agents before.

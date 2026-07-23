@@ -117,7 +117,8 @@ cutovers), and a **patch** bump signals backward-compatible fixes only.
 - **Every change wave that lands on `main` bumps the version in the same commit** —
   the version at `HEAD` always describes the code at `HEAD`. Never leave the number
   behind while the code moves on.
-- Each version bump gets an annotated tag `vX.Y.Z` on the commit that bumps it.
+- Each version bump gets an annotated tag `vX.Y.Z` on the commit that bumps it,
+  and an entry in [CHANGELOG.md](CHANGELOG.md) (a few lines, most recent first).
 - CI enforces this (`version-guard` job): a PR touching code paths must carry a
   strictly greater version than its base; a lower version is always rejected.
   Docs/CI-only changes may keep the version unchanged.

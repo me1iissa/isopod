@@ -126,11 +126,24 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `cwd` | guest default (`/root`) | Working directory inside the guest. |
 | `env` | `{}` | Extra environment variables as a flat `KEY: "VALUE"` object. |
 | `commit_as` | — | Label to persist the result as a new stage. Only commits when the command exits 0 — a failed setup command never silently produces a broken stage. |
+| `stdin` | — | Small inline text piped to the command's stdin, then closed. |
+| `stdin_file` | — | HOST-side file whose bytes are piped to stdin — use for anything beyond a few KiB so large payloads never transit the model context. Mutually exclusive with `stdin`. |
+| `vcpus` | `1` | Guest vCPUs: 1 or an even number, at most the host CPU count. Over-cap errors before boot. |
+| `mem_mib` | `512` | Guest memory in MiB, bounded 128..=host free RAM (with headroom). Over-cap errors before boot. |
+| `scratch_mib` | ~`1024` | Writable overlay scratch in MiB (128..=65536, sparse). Raise for build workloads; passing it forces the cold (disk-upper) path. |
+| `copy_out` | — | List of `{guest, host}` mappings: stream guest files to host paths after a successful exec — the binary-safe artifact channel. A copy failure fails the call; written files are listed in the result's `copied`. |
 
-Return shape: `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated,
-duration_ms, vm_name, stage_id?, stage_name?, guest_ip?}` — the `stage_*`
-fields are present only when `commit_as` actually committed; `guest_ip` only
-when `network` was true.
+Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
+stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
+total_ms, path, resume_ms?, snapshot_built, commit_ms?, vcpus, mem_mib,
+vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?, guest_ip?,
+stdout_log_path, stderr_log_path, serial_log_path, copied?}`. Highlights:
+`stdout`/`stderr` are 64 KiB inline heads with exact byte totals alongside
+and full logs at the `*_log_path`s; `path` says whether the run resumed
+`"warm"` or booted `"cold"` (with `resume_ms` on warm runs and
+`snapshot_built` flagging the one-time cache build); `stage_*` appear only
+when `commit_as` actually committed; `guest_ip`/`slot` only when networking
+was on.
 
 ## Example prompts
 

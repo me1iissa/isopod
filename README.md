@@ -1,10 +1,46 @@
 # isopod
 
+[![CI](https://github.com/me1iissa/isopod/actions/workflows/ci.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/ci.yml)
+
 **A Firecracker-microVM sandbox for Claude Code — run a command in a fast, hardware-isolated microVM that is destroyed after every call.**
 
 isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM in roughly **0.4 s** (with a warm pool, resume is milliseconds), execs one command inside it over vsock, and tears the VM down. Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
 
-> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool). Pre-1.0; `main` is the supported line. See [PLAN.md](PLAN.md) for the full milestone log.
+> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels). Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
+
+---
+
+## Quick start
+
+Prerequisites: Linux x86_64 with `/dev/kvm` (your user in the `kvm` group), Rust via rustup, and `nftables iproute2 e2fsprogs squashfs-tools` plus a C toolchain. Full details, WSL2 notes, and troubleshooting: **[docs/getting-started.md](docs/getting-started.md)**.
+
+```bash
+# 1. Clone and build (toolchain is pinned by rust-toolchain.toml).
+git clone https://github.com/me1iissa/isopod.git
+cd isopod
+git submodule update --init --recursive     # vendored Firecracker v1.16.1
+cargo build --release
+
+# 2. Build Firecracker and the guest images (all unprivileged).
+./target/release/isopod dev build-fc        # ~/.isopod/bin/firecracker
+./target/release/isopod image fetch-kernel  # pinned, digest-verified guest kernel
+./target/release/isopod image build-all     # every guest rootfs image
+
+# 3. One-time host networking — the only step that needs root.
+#    (Skip it entirely if you will only ever run with --no-network.)
+sudo ./target/release/isopod setup
+
+# 4. Run something.
+./target/release/isopod run --stage base --base base-alpine -- \
+  python3 -c 'print("hello from a microVM")'
+```
+
+To drive it from **Claude Code**, register the MCP server and restart your session:
+
+```bash
+claude mcp add --scope local isopod -- "$PWD/target/release/isopod-mcp"
+# then, inside Claude Code:  sandbox_run(cmd="echo hi")
+```
 
 ---
 
@@ -69,6 +105,7 @@ flowchart TB
 | `crates/guest-agent` | `isopod-guest-agent` | Static musl binary that runs as PID 1 in the guest: mounts the overlay, pivots root, syncs the clock, serves exec/file RPC on vsock. |
 | `crates/cli` | `isopod` | The `isopod` binary: `run`, `stage`, `vm`, `warmpool`, `setup`, `image`, `dev`. |
 | `crates/mcp` | `isopod-mcp` | The rmcp 2.2 stdio MCP server for Claude Code. |
+| `crates/jail` | `isopod-jail` | The optional rootless microjail that wraps each Firecracker process (user/pid namespaces, minimal chroot, per-VM cgroup caps). |
 
 ### The `sandbox_run` lifecycle
 
@@ -118,68 +155,6 @@ stateDiagram-v2
 
 ---
 
-## Quickstart
-
-### Prerequisites
-
-- **Linux with KVM** — `/dev/kvm` present and your user in the `kvm` group (nested virtualization if you are inside a VM/WSL2).
-- **Rust** — the toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (`stable`, with the `x86_64-unknown-linux-musl` target for the guest agent).
-- **Host tools** — `nftables` and `iproute2` (networking), `e2fsprogs` (`mkfs.ext4`, `resize2fs`), `squashfs-tools` (`mksquashfs`), plus the usual C toolchain to build Firecracker from source.
-- **The vendored Firecracker submodule** — `git submodule update --init --recursive` (Firecracker **v1.16.1**, pinned).
-
-### Build
-
-```bash
-git clone https://github.com/me1iissa/isopod.git
-cd isopod
-git submodule update --init --recursive
-
-# Build the workspace (CLI + MCP server + core + guest agent).
-cargo build --release
-
-# Build the vendored Firecracker v1.16.1 from source into ~/.isopod/bin.
-./target/release/isopod dev build-fc
-
-# Fetch a guest kernel and build the guest rootfs images (unprivileged).
-./target/release/isopod image fetch-kernel
-./target/release/isopod image build-rootfs
-```
-
-### One-time host setup (the only step that needs root)
-
-Networking requires a single privileged provisioning step. It creates user-owned tap devices, an nftables NAT table, and enables IP forwarding. Everything at runtime is unprivileged.
-
-```bash
-sudo ./target/release/isopod setup            # provisions 8 network slots by default
-# sudo ./target/release/isopod setup --remove  # tears it all back down
-```
-
-If you only ever run untrusted code with `--no-network`, you can skip `setup` entirely — exec works over vsock regardless.
-
-### Use it from Claude Code (MCP)
-
-Build the server and register it at **local** scope (auto-trusted, no approval prompt):
-
-```bash
-cargo build --release -p isopod-mcp
-claude mcp add --scope local isopod -- /absolute/path/to/isopod/target/release/isopod-mcp
-claude mcp list      # -> isopod ... ✔ Connected
-```
-
-Tools appear as `mcp__isopod__<tool>`. MCP servers load at Claude Code session startup, so **restart Claude Code** after registering. See [docs/mcp-usage.md](docs/mcp-usage.md) for the plugin-based registration and full details.
-
-### Use it from the shell (CLI)
-
-```bash
-# Ephemeral run — boots, execs, destroys.
-./target/release/isopod run -- /bin/sh -c 'uname -a'
-
-# Untrusted code with no network interface at all.
-./target/release/isopod run --no-network -- python3 suspicious.py
-```
-
----
-
 ## Usage
 
 ### MCP tools
@@ -218,7 +193,7 @@ sandbox_run(cmd="python3 -c 'import numpy; print(numpy.__version__)'",
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
-Key `sandbox_run` parameters: `cmd` (required), `stage` (default `"base"` — a fresh toolchain VM), `base` (`base-alpine` with python/node/git/gcc, or `base-sqfs` minimal busybox), `network` (default `true`), `timeout_s` (default 120, an **outer wall-clock budget that includes boot**), `cwd`, `env`, `commit_as`, `scratch_mib`. Full schema is self-describing in each tool. See [docs/mcp-usage.md](docs/mcp-usage.md).
+Key `sandbox_run` parameters: `cmd` (required), `stage` (default `"base"` — a fresh toolchain VM), `base` (`base-alpine` with python/node/git/gcc, or `base-sqfs` minimal busybox), `network` (default `true`), `timeout_s` (default 120, an **outer wall-clock budget that includes boot**), `cwd`, `env`, `commit_as`, `stdin` / `stdin_file` (inline text vs. a host file for big payloads), `vcpus`, `mem_mib`, `scratch_mib` (per-VM sizing), and `copy_out` (stream guest files to host paths after the run — the binary-safe artifact channel). Full schema is self-describing in each tool. See [docs/mcp-usage.md](docs/mcp-usage.md).
 
 ### CLI
 
@@ -230,6 +205,10 @@ isopod run --stage base --base base-alpine --commit-as myproj/data-deps -- pip i
 
 # Fork that stage by name (auto-uses the base it was built on).
 isopod run --stage myproj/data-deps -- python3 -c 'import requests; print(requests.__version__)'
+
+# Big builds: size the VM, feed stdin from a file, copy artifacts out.
+isopod run --stage myproj/data-deps --vcpus 4 --mem-mib 3072 --scratch-mib 8192 \
+  --copy-out /root/out/artifact:./artifact -- /bin/sh -c 'make -C /root/out'
 
 # Inspect and prune the store.
 isopod stage list
@@ -297,8 +276,10 @@ The short version:
 
 - The security boundary is the Firecracker VMM + KVM, the host-side code that ingests guest-controlled bytes, and the tap/nftables network fabric — **not** the inside of the guest. Inside a guest, untrusted code runs as root by design; the guest is expendable.
 - Firecracker runs **unprivileged** (kvm group) with its **seccomp filter on** and **all capabilities dropped**. Guest→host and guest→guest are blocked, the base image is read-only, and no host filesystem is shared into the guest.
-- **v1 is single-layer isolation** (Firecracker seccomp + KVM; a jailer/chroot/cgroup layer is planned for v2) and is intended for **single-tenant** use.
-- A **networked** guest can reach the host's whole routable network (its LAN), not just the internet. **Use `--no-network` (CLI) / `network=false` (MCP) for untrusted code.**
+- **Guest egress is public-only by default.** A networked guest reaches the internet but not the host's private network: RFC1918, CGNAT, and link-local/metadata destinations are dropped, with per-tap anti-spoofing. (LAN reachability is an explicit opt-in: `isopod setup --allow-lan-egress`.)
+- An **optional rootless jail** (`ISOPOD_JAIL=1`) wraps each Firecracker in user/pid namespaces, a minimal chroot, and per-VM cgroup caps — a second isolation layer with no privileged host component. It is opt-in in this release; enable it (or keep the host single-tenant) before running mutually distrusting workloads.
+- Guest-controlled host sinks are **bounded**: exec/serial logs are size-capped, every RPC the host waits on is time-bounded, and resource requests are validated before boot.
+- For untrusted code, prefer **`--no-network` (CLI) / `network=false` (MCP)** — no NIC is attached at all; exec still works over vsock.
 
 To report a vulnerability, use **GitHub's private vulnerability reporting** on this repository (Security → Advisories → *Report a vulnerability*). Please do not open a public issue for security bugs.
 
@@ -306,7 +287,7 @@ To report a vulnerability, use **GitHub's private vulnerability reporting** on t
 
 ## Project status
 
-All planned v1 milestones are complete:
+All planned v1 milestones are complete, plus a post-v1 security-hardening wave:
 
 | Milestone | Scope |
 |---|---|
@@ -318,8 +299,24 @@ All planned v1 milestones are complete:
 | **M5** | MCP + skill — rmcp 2.2 stdio server, workflow skill, plugin packaging. |
 | **M5.5** | Flexible per-VM vCPU / memory sizing. |
 | **M6** | Warm pool — full-snapshot save/resume with post-resume net + clock reconfiguration over vsock. |
+| **Hardening** | Public-only egress by default, rootless jail (`ISOPOD_JAIL=1`), bounded guest-controlled host sinks, digest-pinned guest kernel, streamed `copy_out`, `stdin_file`. |
 
-Backlog (v2+): jailer hardening, destination-filtered egress, UFFD lazy restore + snapshot compression, `stage flatten`, PTY exec, host→guest port forwarding, and a concurrent-VM memory governor + I/O rate limiters. See [PLAN.md](PLAN.md).
+Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate limiters, exec/serial log retention auto-GC, UFFD lazy restore + snapshot compression, `stage flatten`, PTY exec, and host→guest port forwarding. See [PLAN.md](PLAN.md).
+
+---
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [docs/getting-started.md](docs/getting-started.md) | Full setup walk-through: prerequisites, build, images, networking, first runs, the jail, MCP registration, troubleshooting. |
+| [docs/mcp-usage.md](docs/mcp-usage.md) | MCP server registration (local scope and plugin), the tool list, `sandbox_run` parameters and result shape. |
+| [SECURITY.md](SECURITY.md) | The security model: threat model, what holds, the jail, known limitations, operator guidance. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, crate map, coding conventions, versioning policy. |
+| [CHANGELOG.md](CHANGELOG.md) | Release history. |
+| [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
+| [docs/sandbox-build.md](docs/sandbox-build.md) | Building isopod inside its own sandboxes (dogfood recipe). |
+| [docs/feasibility.md](docs/feasibility.md), [docs/m4-verify.md](docs/m4-verify.md), [docs/dogfood-findings.md](docs/dogfood-findings.md) | Engineering logs: the M0 spike results, M4 network verification, and the running dogfood findings ledger. |
 
 ---
 

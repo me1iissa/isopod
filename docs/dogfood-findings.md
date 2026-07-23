@@ -246,7 +246,7 @@ downloads included), committed as stage `isopod-build` (1.53 GiB layer, +34.3 s 
 
 **Positive re-verifications (all via MCP):**
 - **F1 egress proven against a live service**: host connects to its own LAN listener
-  `192.168.3.207:3478` instantly; the guest gets a filtered **timeout** on that same listening
+  (`<host-lan-ip>:3478`) instantly; the guest gets a filtered **timeout** on that same listening
   port, and on gateway:80, and on RFC1918/link-local probes — while DNS through the gateway
   works. Drop-not-refused + live-listener evidence closes the "maybe nothing was there" gap.
 - Truncation: 600 KB stdout → in-band string capped, `stdout_truncated=true`, `stdout_bytes`
