@@ -29,3 +29,6 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` enables paused-clock tests (`start_paused`) for the vsock
+# timeout coverage without real 10 s waits.
+tokio = { workspace = true, features = ["test-util"] }

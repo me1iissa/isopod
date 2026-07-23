@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 use isopod_proto::frame::{self, FrameError};
 use isopod_proto::{
     b64_decode, b64_encode, ExecRequest, ExecStreamKind, Request, RequestOp, Response,
-    ResponseBody, PROTO_VERSION, VSOCK_PORT,
+    ResponseBody, EXEC_CHUNK_LEN, PROTO_VERSION, VSOCK_PORT,
 };
 
 /// Failures talking to the guest agent.
@@ -95,6 +95,29 @@ pub enum AgentError {
         /// Decoder error text.
         detail: String,
     },
+    /// The guest sent a streamed chunk larger than the protocol's chunk cap.
+    /// The guest agent never does this ([`isopod_proto::EXEC_CHUNK_LEN`] bounds
+    /// its reads), so an oversize chunk means a malicious or corrupted peer.
+    #[error("guest {stream} chunk of {len} bytes exceeds the {cap}-byte protocol cap")]
+    OversizeChunk {
+        /// Which stream (`stdout`, `stderr`, or `file`).
+        stream: &'static str,
+        /// Decoded chunk length received.
+        len: usize,
+        /// The protocol chunk cap.
+        cap: usize,
+    },
+    /// The guest did not complete an RPC within its wall budget. A peer that
+    /// completes the vsock CONNECT handshake and then withholds bytes must not
+    /// hang the host forever (finding F8: a hung `halt` would leak the network
+    /// slot and the VMM process).
+    #[error("guest agent {op} did not complete within {budget:?}")]
+    Timeout {
+        /// Which operation timed out.
+        op: &'static str,
+        /// The wall budget that elapsed.
+        budget: Duration,
+    },
     /// A host-side I/O error (writing a tee log, etc.).
     #[error("{context}: {source}")]
     Io {
@@ -110,6 +133,39 @@ pub enum AgentError {
 fn io_err(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> AgentError {
     let context = context.into();
     move |source| AgentError::Io { context, source }
+}
+
+/// Wall budget for one control RPC round trip (connect + one request + one
+/// response): ping, clock, net, hostname, put/get file, halt. Generous for the
+/// largest legal frame over a local vsock, but bounded so a wedged or malicious
+/// guest cannot hang the host and leak its network slot + VMM process (F8).
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max silence between streamed `copy_out` frames before the guest is declared
+/// wedged. A healthy guest streams chunks back-to-back, so this bounds a hang
+/// without limiting the total transfer size (F8).
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-stream ceiling on bytes teed to an exec log file. Output beyond the cap
+/// is still counted (the report's totals stay exact) but no longer persisted,
+/// so a guest spraying stdout cannot fill the host disk (F3).
+pub const EXEC_LOG_CAP: u64 = 64 * 1024 * 1024;
+
+/// Marker appended to a log file when its byte cap trips.
+const LOG_TRUNCATED_MARKER: &[u8] =
+    b"\n[isopod: log cap reached; output beyond this point was not persisted]\n";
+
+/// Bound a vsock I/O future with `budget`, mapping expiry to
+/// [`AgentError::Timeout`] (F8).
+async fn timed<T>(
+    op: &'static str,
+    budget: Duration,
+    fut: impl std::future::Future<Output = Result<T, AgentError>>,
+) -> Result<T, AgentError> {
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(AgentError::Timeout { op, budget }),
+    }
 }
 
 /// Answer to [`AgentClient::ping`].
@@ -152,6 +208,9 @@ pub struct ExecSpec {
     pub stderr_log: PathBuf,
     /// Keep at most this many bytes of each stream in memory for inline reporting.
     pub inline_cap: usize,
+    /// Cap on bytes teed to each log file; output beyond it is counted but not
+    /// persisted (use [`EXEC_LOG_CAP`]; F3).
+    pub log_cap: u64,
 }
 
 /// The captured head of one output stream plus its exact size.
@@ -269,7 +328,7 @@ impl AgentClient {
     /// root — executing there would hit the wrong filesystem, finding #26), or
     /// a connect/framing error.
     pub async fn ping(&self) -> Result<Pong, AgentError> {
-        match self.request_one(RequestOp::Ping).await? {
+        match self.request_one("ping", RequestOp::Ping).await? {
             ResponseBody::Pong {
                 agent_version,
                 proto_version,
@@ -348,6 +407,11 @@ impl AgentClient {
 
     /// Run a command, teeing streamed output to the log files named in `spec`.
     ///
+    /// The connect and request write are internally time-bounded, but the
+    /// stream reads are not: a silent long-running command legitimately sends
+    /// nothing for its whole duration. The caller must wrap the returned future
+    /// in a wall-clock deadline sized to the run's timeout budget (F8).
+    ///
     /// # Errors
     /// [`AgentError::ExecIncomplete`] if the connection dies before `ExecDone`
     /// (with the byte counts seen so far), [`AgentError::Guest`] if the guest
@@ -361,10 +425,15 @@ impl AgentClient {
             timeout_ms: spec.timeout_ms,
             stdin_b64: spec.stdin.as_deref().map(b64_encode),
         });
-        self.write_request(&mut stream, op).await?;
+        timed(
+            "exec request write",
+            CONTROL_RPC_TIMEOUT,
+            self.write_request(&mut stream, op),
+        )
+        .await?;
 
-        let mut out = StreamSink::create(&spec.stdout_log, spec.inline_cap).await?;
-        let mut err = StreamSink::create(&spec.stderr_log, spec.inline_cap).await?;
+        let mut out = StreamSink::create(&spec.stdout_log, spec.inline_cap, spec.log_cap).await?;
+        let mut err = StreamSink::create(&spec.stderr_log, spec.inline_cap, spec.log_cap).await?;
 
         loop {
             let frame = frame::aio::read_frame::<_, Response>(&mut stream)
@@ -392,6 +461,15 @@ impl AgentClient {
                         stream: label,
                         detail: e.to_string(),
                     })?;
+                    // Re-enforce the protocol chunk cap host-side (F3): only the
+                    // frame cap would otherwise bound a malicious guest's chunks.
+                    if bytes.len() > EXEC_CHUNK_LEN {
+                        return Err(AgentError::OversizeChunk {
+                            stream: label,
+                            len: bytes.len(),
+                            cap: EXEC_CHUNK_LEN,
+                        });
+                    }
                     sink.write(&bytes).await?;
                 }
                 ResponseBody::ExecDone {
@@ -427,33 +505,40 @@ impl AgentClient {
     /// answer, a clean EOF, or a reset immediately afterwards are all treated as
     /// success. Only a guest-reported error or a malformed frame is surfaced.
     ///
+    /// The whole round trip is time-bounded: a malicious guest that accepts the
+    /// halt connection and then stalls must not hang teardown, or the network
+    /// slot and the VMM process would leak with it (F8).
+    ///
     /// # Errors
-    /// [`AgentError::Guest`] if the guest explicitly refused, or a non-I/O
-    /// framing error.
+    /// [`AgentError::Guest`] if the guest explicitly refused,
+    /// [`AgentError::Timeout`] if it stalled, or a non-I/O framing error.
     pub async fn halt(&self, sync: bool) -> Result<(), AgentError> {
-        let mut stream = self.connect().await?;
-        let id = self.next_id();
-        let req = Request {
-            id,
-            op: RequestOp::Halt { sync },
-        };
-        if let Err(e) = frame::aio::write_frame(&mut stream, &req).await {
-            // A broken pipe here just means the guest raced us to power off.
-            return match e {
-                FrameError::Io(_) => Ok(()),
-                other => Err(self.frame_err(other)),
+        timed("halt", CONTROL_RPC_TIMEOUT, async {
+            let mut stream = self.connect().await?;
+            let id = self.next_id();
+            let req = Request {
+                id,
+                op: RequestOp::Halt { sync },
             };
-        }
-        match frame::aio::read_frame::<_, Response>(&mut stream).await {
-            Ok(Some(resp)) => match resp.body {
-                ResponseBody::Ok => Ok(()),
-                ResponseBody::Error { message } => Err(AgentError::Guest(message)),
-                other => Err(unexpected("halt", &other)),
-            },
-            Ok(None) => Ok(()),               // clean EOF right after Halt
-            Err(FrameError::Io(_)) => Ok(()), // connection reset as guest powers off
-            Err(other) => Err(self.frame_err(other)),
-        }
+            if let Err(e) = frame::aio::write_frame(&mut stream, &req).await {
+                // A broken pipe here just means the guest raced us to power off.
+                return match e {
+                    FrameError::Io(_) => Ok(()),
+                    other => Err(self.frame_err(other)),
+                };
+            }
+            match frame::aio::read_frame::<_, Response>(&mut stream).await {
+                Ok(Some(resp)) => match resp.body {
+                    ResponseBody::Ok => Ok(()),
+                    ResponseBody::Error { message } => Err(AgentError::Guest(message)),
+                    other => Err(unexpected("halt", &other)),
+                },
+                Ok(None) => Ok(()),               // clean EOF right after Halt
+                Err(FrameError::Io(_)) => Ok(()), // connection reset as guest powers off
+                Err(other) => Err(self.frame_err(other)),
+            }
+        })
+        .await
     }
 
     /// Write a file into the guest.
@@ -478,7 +563,7 @@ impl AgentClient {
             path: path.to_string(),
             max_bytes,
         };
-        match self.request_one(op).await? {
+        match self.request_one("get_file", op).await? {
             ResponseBody::File { data_b64, mode } => {
                 let bytes = b64_decode(&data_b64).map_err(|e| AgentError::BadChunk {
                     stream: "file",
@@ -515,9 +600,10 @@ impl AgentClient {
     /// # Errors
     /// [`AgentError::Guest`] if the guest refused (missing file, over
     /// `max_bytes`) or failed mid-stream, [`AgentError::Unexpected`] if the byte
-    /// count disagrees with `FileDone` (file changed mid-copy) or the connection
-    /// died, or a connect/framing/IO error. On any error the partial host file
-    /// is removed.
+    /// count disagrees with `FileDone` (file changed mid-copy), the stream
+    /// exceeded `max_bytes` (host-enforced), or the connection died,
+    /// [`AgentError::Timeout`] if the guest went silent mid-stream, or a
+    /// connect/framing/IO error. On any error the partial host file is removed.
     pub async fn copy_out(
         &self,
         guest_path: &str,
@@ -529,16 +615,27 @@ impl AgentClient {
             path: guest_path.to_string(),
             max_bytes,
         };
-        self.write_request(&mut stream, op).await?;
+        timed(
+            "copy_out request write",
+            CONTROL_RPC_TIMEOUT,
+            self.write_request(&mut stream, op),
+        )
+        .await?;
 
         let mut file = tokio::fs::File::create(dest)
             .await
             .map_err(io_err(format!("creating copy-out dest {}", dest.display())))?;
         let mut written: u64 = 0;
         let result = loop {
-            let frame = frame::aio::read_frame::<_, Response>(&mut stream)
-                .await
-                .map_err(|e| self.frame_err(e));
+            // Idle-bounded per frame (F8): a healthy guest streams chunks
+            // back-to-back, so prolonged silence means it is wedged — without a
+            // bound the teardown would hang and leak the slot + VMM process.
+            let frame = timed("copy_out stream read", STREAM_IDLE_TIMEOUT, async {
+                frame::aio::read_frame::<_, Response>(&mut stream)
+                    .await
+                    .map_err(|e| self.frame_err(e))
+            })
+            .await;
             let resp = match frame {
                 Ok(Some(resp)) => resp,
                 Ok(None) => {
@@ -554,6 +651,23 @@ impl AgentClient {
                         stream: "file",
                         detail: e.to_string(),
                     })?;
+                    // Re-enforce the protocol chunk cap host-side (F3).
+                    if bytes.len() > EXEC_CHUNK_LEN {
+                        break Err(AgentError::OversizeChunk {
+                            stream: "file",
+                            len: bytes.len(),
+                            cap: EXEC_CHUNK_LEN,
+                        });
+                    }
+                    // `max_bytes` is sent to the guest, but only the guest
+                    // enforces it there — a malicious agent could stream forever
+                    // and fill the host disk, so re-enforce it here (F3).
+                    if written.saturating_add(bytes.len() as u64) > max_bytes {
+                        break Err(AgentError::Unexpected(format!(
+                            "copy-out stream exceeded the {max_bytes}-byte ceiling \
+                             (guest ignored max_bytes)"
+                        )));
+                    }
                     match file.write_all(&bytes).await {
                         Ok(()) => written = written.saturating_add(bytes.len() as u64),
                         Err(e) => {
@@ -603,12 +717,17 @@ impl AgentClient {
     }
 
     async fn connect(&self) -> Result<UnixStream, AgentError> {
-        isopod_fc::vsock::connect_to_guest(&self.uds_path, VSOCK_PORT)
-            .await
-            .map_err(|source| AgentError::Connect {
-                path: self.uds_path.display().to_string(),
-                source,
-            })
+        // Bounded (F8): a peer can accept the UDS connection and then stall the
+        // CONNECT/OK handshake indefinitely.
+        timed("vsock connect", CONTROL_RPC_TIMEOUT, async {
+            isopod_fc::vsock::connect_to_guest(&self.uds_path, VSOCK_PORT)
+                .await
+                .map_err(|source| AgentError::Connect {
+                    path: self.uds_path.display().to_string(),
+                    source,
+                })
+        })
+        .await
     }
 
     async fn write_request(
@@ -625,24 +744,33 @@ impl AgentClient {
             .map_err(|e| self.frame_err(e))
     }
 
-    /// One request, exactly one response frame.
-    async fn request_one(&self, op: RequestOp) -> Result<ResponseBody, AgentError> {
-        let mut stream = self.connect().await?;
-        self.write_request(&mut stream, op).await?;
-        match frame::aio::read_frame::<_, Response>(&mut stream)
-            .await
-            .map_err(|e| self.frame_err(e))?
-        {
-            Some(resp) => Ok(resp.body),
-            None => Err(AgentError::Unexpected(
-                "connection closed before a response was received".to_string(),
-            )),
-        }
+    /// One request, exactly one response frame. The whole round trip is
+    /// time-bounded (F8): a stalling guest surfaces as [`AgentError::Timeout`]
+    /// instead of hanging the host.
+    async fn request_one(
+        &self,
+        label: &'static str,
+        op: RequestOp,
+    ) -> Result<ResponseBody, AgentError> {
+        timed(label, CONTROL_RPC_TIMEOUT, async {
+            let mut stream = self.connect().await?;
+            self.write_request(&mut stream, op).await?;
+            match frame::aio::read_frame::<_, Response>(&mut stream)
+                .await
+                .map_err(|e| self.frame_err(e))?
+            {
+                Some(resp) => Ok(resp.body),
+                None => Err(AgentError::Unexpected(
+                    "connection closed before a response was received".to_string(),
+                )),
+            }
+        })
+        .await
     }
 
     /// A one-request op whose only success answer is `Ok`.
     async fn expect_ok(&self, label: &'static str, op: RequestOp) -> Result<(), AgentError> {
-        match self.request_one(op).await? {
+        match self.request_one(label, op).await? {
             ResponseBody::Ok => Ok(()),
             ResponseBody::Error { message } => Err(AgentError::Guest(message)),
             other => Err(unexpected(label, &other)),
@@ -678,18 +806,22 @@ pub struct CopyOutcome {
     pub mode: u32,
 }
 
-/// Tees a stream to a log file while retaining a capped in-memory head.
+/// Tees a stream to a log file (up to `disk_cap` bytes; F3) while retaining a
+/// capped in-memory head.
 struct StreamSink {
     log: tokio::fs::File,
     path: PathBuf,
     inline: Vec<u8>,
     cap: usize,
+    disk_cap: u64,
+    disk_written: u64,
+    disk_truncated: bool,
     total: u64,
     truncated: bool,
 }
 
 impl StreamSink {
-    async fn create(path: &Path, cap: usize) -> Result<Self, AgentError> {
+    async fn create(path: &Path, cap: usize, disk_cap: u64) -> Result<Self, AgentError> {
         let log = tokio::fs::File::create(path)
             .await
             .map_err(io_err(format!("creating exec log {}", path.display())))?;
@@ -698,16 +830,39 @@ impl StreamSink {
             path: path.to_path_buf(),
             inline: Vec::new(),
             cap,
+            disk_cap,
+            disk_written: 0,
+            disk_truncated: false,
             total: 0,
             truncated: false,
         })
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), AgentError> {
-        self.log
-            .write_all(bytes)
-            .await
-            .map_err(io_err(format!("writing exec log {}", self.path.display())))?;
+        // Tee to disk up to `disk_cap` (F3): beyond it bytes are still counted
+        // but not persisted, so a guest spraying output cannot fill the host
+        // disk. The marker line makes the cut visible in the log itself.
+        if !self.disk_truncated {
+            let room = self.disk_cap.saturating_sub(self.disk_written);
+            if (bytes.len() as u64) <= room {
+                self.log
+                    .write_all(bytes)
+                    .await
+                    .map_err(io_err(format!("writing exec log {}", self.path.display())))?;
+                self.disk_written = self.disk_written.saturating_add(bytes.len() as u64);
+            } else {
+                self.log
+                    .write_all(&bytes[..room as usize])
+                    .await
+                    .map_err(io_err(format!("writing exec log {}", self.path.display())))?;
+                self.log
+                    .write_all(LOG_TRUNCATED_MARKER)
+                    .await
+                    .map_err(io_err(format!("writing exec log {}", self.path.display())))?;
+                self.disk_written = self.disk_cap;
+                self.disk_truncated = true;
+            }
+        }
         self.total = self.total.saturating_add(bytes.len() as u64);
         if self.inline.len() < self.cap {
             let room = self.cap - self.inline.len();
@@ -975,6 +1130,7 @@ mod tests {
                 stdout_log: out_log.clone(),
                 stderr_log: err_log.clone(),
                 inline_cap: 8,
+                log_cap: EXEC_LOG_CAP,
             })
             .await
             .expect("exec ok");
@@ -1028,6 +1184,7 @@ mod tests {
                 stdout_log: out_log,
                 stderr_log: err_log,
                 inline_cap: 64,
+                log_cap: EXEC_LOG_CAP,
             })
             .await
             .expect_err("must fail");
@@ -1216,5 +1373,203 @@ mod tests {
         assert_eq!(small.inline, b"hi");
         assert!(!small.truncated);
         assert_eq!(small.total_bytes, 2);
+    }
+
+    #[tokio::test]
+    async fn exec_disk_tee_respects_log_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let out_log = dir.path().join("exec-stdout.log");
+        let err_log = dir.path().join("exec-stderr.log");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Three 8-byte chunks (24 B total) against a 20-byte disk cap.
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            for _ in 0..3 {
+                write_resp(
+                    &mut conn,
+                    req.id,
+                    ResponseBody::ExecStream {
+                        stream: ExecStreamKind::Stdout,
+                        data_b64: b64_encode(b"01234567"),
+                    },
+                )
+                .await;
+            }
+            write_resp(
+                &mut conn,
+                req.id,
+                ResponseBody::ExecDone {
+                    exit_code: Some(0),
+                    signal: None,
+                    duration_ms: 1,
+                    timed_out: false,
+                },
+            )
+            .await;
+        });
+
+        let client = AgentClient::new(&sock);
+        let outcome = client
+            .exec(ExecSpec {
+                argv: vec!["spew".into()],
+                env: vec![],
+                cwd: None,
+                timeout_ms: None,
+                stdin: None,
+                stdout_log: out_log.clone(),
+                stderr_log: err_log,
+                inline_cap: 64,
+                log_cap: 20,
+            })
+            .await
+            .expect("exec ok");
+        server.await.unwrap();
+
+        // Totals and the inline head stay exact regardless of the disk cap.
+        assert_eq!(outcome.stdout.total_bytes, 24);
+        assert_eq!(outcome.stdout.inline, b"012345670123456701234567");
+        // The log holds only the first 20 bytes plus the truncation marker.
+        let log = std::fs::read(&out_log).unwrap();
+        assert!(log.starts_with(b"01234567012345670123"), "{log:?}");
+        assert!(log.ends_with(LOG_TRUNCATED_MARKER), "{log:?}");
+        assert_eq!(log.len(), 20 + LOG_TRUNCATED_MARKER.len());
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_oversize_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let out_log = dir.path().join("exec-stdout.log");
+        let err_log = dir.path().join("exec-stderr.log");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            write_resp(
+                &mut conn,
+                req.id,
+                ResponseBody::ExecStream {
+                    stream: ExecStreamKind::Stdout,
+                    data_b64: b64_encode(&vec![0u8; EXEC_CHUNK_LEN + 1]),
+                },
+            )
+            .await;
+            // Wait for the client to give up and close.
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client
+            .exec(ExecSpec {
+                argv: vec!["x".into()],
+                env: vec![],
+                cwd: None,
+                timeout_ms: None,
+                stdin: None,
+                stdout_log: out_log,
+                stderr_log: err_log,
+                inline_cap: 64,
+                log_cap: EXEC_LOG_CAP,
+            })
+            .await
+            .expect_err("oversize chunk must be rejected");
+        match err {
+            AgentError::OversizeChunk { stream, len, cap } => {
+                assert_eq!(stream, "stdout");
+                assert_eq!(len, EXEC_CHUNK_LEN + 1);
+                assert_eq!(cap, EXEC_CHUNK_LEN);
+            }
+            other => panic!("expected OversizeChunk, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    /// A guest that answers the handshake and then withholds the response frame
+    /// must surface as [`AgentError::Timeout`], not hang forever (F8). Paused
+    /// tokio time auto-advances to the deadline, so the test is instant.
+    #[tokio::test(start_paused = true)]
+    async fn control_rpc_times_out_when_guest_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let _req = read_req(&mut conn).await;
+            // Never reply; hold the connection open until the client gives up.
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client.ping().await.expect_err("stall must time out");
+        assert!(
+            matches!(err, AgentError::Timeout { op: "ping", .. }),
+            "{err:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// The teardown-critical variant of the stall: `halt` must return (with a
+    /// timeout) so the caller can proceed to force-kill the VMM and release the
+    /// network slot (F8).
+    #[tokio::test(start_paused = true)]
+    async fn halt_times_out_instead_of_hanging_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let _req = read_req(&mut conn).await;
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client.halt(true).await.expect_err("stall must time out");
+        assert!(
+            matches!(err, AgentError::Timeout { op: "halt", .. }),
+            "{err:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_out_enforces_ceiling_and_removes_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let dest = dir.path().join("artifact.bin");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            assert!(matches!(req.op, RequestOp::CopyOut { .. }));
+            // Two 8-byte chunks against a 10-byte ceiling: the guest is
+            // pretending max_bytes does not exist.
+            for _ in 0..2 {
+                write_resp(
+                    &mut conn,
+                    req.id,
+                    ResponseBody::FileChunk {
+                        data_b64: b64_encode(b"01234567"),
+                    },
+                )
+                .await;
+            }
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client
+            .copy_out("/big", &dest, 10)
+            .await
+            .expect_err("over-ceiling stream must fail");
+        assert!(
+            matches!(&err, AgentError::Unexpected(m) if m.contains("ceiling")),
+            "{err:?}"
+        );
+        // The partial host file must not survive.
+        assert!(!dest.exists());
+        server.await.unwrap();
     }
 }

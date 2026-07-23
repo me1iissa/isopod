@@ -401,13 +401,11 @@ async fn spawn_piped_draining(
         let log = tokio::fs::File::create(console_log)
             .await
             .with_context(|| format!("creating {}", console_log.display()))?;
-        // Detached: the copy ends on its own when the VMM exits and the pipe
-        // closes. We never need to join it (console.log is for inspection only).
-        tokio::spawn(async move {
-            let mut stdout = stdout;
-            let mut log = log;
-            let _ = tokio::io::copy(&mut stdout, &mut log).await;
-        });
+        // Detached: the drain ends on its own when the VMM exits and the pipe
+        // closes. We never need to join it (console.log is for inspection
+        // only). The shared drain caps the persisted bytes (F3) — a raw
+        // `tokio::io::copy` here was an uncapped guest-controlled disk sink.
+        tokio::spawn(crate::vm::console::drain_to_log(stdout, log));
     }
     Ok(proc)
 }

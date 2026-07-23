@@ -18,7 +18,7 @@ use serde::Serialize;
 use isopod_fc::models::{BootSource, Drive, MachineConfig, NetworkInterface, Vsock};
 use isopod_fc::{FcClient, FcProcess, FcProcessConfig, LogLevel, StdioMode, VmId};
 
-use crate::agent::{AgentClient, ExecSpec, StreamCapture};
+use crate::agent::{AgentClient, ExecSpec, StreamCapture, EXEC_LOG_CAP};
 use crate::image::{self, RootfsFlavor};
 use crate::net;
 use crate::paths;
@@ -26,7 +26,7 @@ use crate::snapshot::{self, SnapshotKey};
 use crate::stage::{self, StageMeta};
 
 mod build_fc;
-mod console;
+pub(crate) mod console;
 mod registry;
 mod resources;
 
@@ -672,6 +672,13 @@ async fn wait_for_markers(
 /// The default agent rootfs flavor slug for `isopod run`.
 pub const DEFAULT_RUN_FLAVOR: &str = "dev-agent";
 
+/// Upper bound on [`RunOptions::timeout_s`] (one hour). The budget sets how
+/// long one run may stream output to the host and hold a network slot, so an
+/// unbounded value would turn a single run into an open-ended host-disk /
+/// slot-occupancy window (F3). Out-of-range values are a hard error at
+/// [`run_ephemeral`], never silently clamped (matching the vcpus/mem policy).
+pub const MAX_TIMEOUT_S: u64 = 3600;
+
 /// Reserved `--stage` word: overlay topology with **zero** committed layers —
 /// a fresh scratch straight on top of the squashfs base.
 const STAGE_BASE: &str = "base";
@@ -686,6 +693,7 @@ pub struct RunOptions {
     /// Working directory in the guest (agent default `/root` when `None`).
     pub cwd: Option<String>,
     /// Outer wall-clock budget in seconds (covers boot + exec; default 120).
+    /// Must be in `1..=`[`MAX_TIMEOUT_S`]; out-of-range values are a hard error.
     pub timeout_s: u64,
     /// Rootfs flavor to boot (the agent flavor, `dev-agent`, by default).
     /// Ignored when [`stage`](Self::stage) is set (the overlay topology boots
@@ -791,9 +799,11 @@ pub struct RunReport {
     pub stdout: String,
     /// Captured stderr head (lossy UTF-8, capped at 64 KiB).
     pub stderr: String,
-    /// `true` if stdout exceeded the inline cap (full output is in the log).
+    /// `true` if stdout exceeded the inline cap (the log holds the stream up to
+    /// [`EXEC_LOG_CAP`](crate::agent::EXEC_LOG_CAP) bytes).
     pub stdout_truncated: bool,
-    /// `true` if stderr exceeded the inline cap (full output is in the log).
+    /// `true` if stderr exceeded the inline cap (the log holds the stream up to
+    /// [`EXEC_LOG_CAP`](crate::agent::EXEC_LOG_CAP) bytes).
     pub stderr_truncated: bool,
     /// Total stdout bytes produced (regardless of the inline cap).
     pub stdout_bytes: u64,
@@ -921,6 +931,15 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     }
     // Malformed env names/values must error here, before any VM work (#27).
     validate_env(&opts.env)?;
+    // Bound the wall budget (F3): zero would be an instant timeout, and an
+    // arbitrarily large value lets one run stream to the host disk and hold a
+    // network slot for an open-ended window. Shared choke point for CLI + MCP.
+    if opts.timeout_s == 0 || opts.timeout_s > MAX_TIMEOUT_S {
+        bail!(
+            "timeout_s must be between 1 and {MAX_TIMEOUT_S} seconds (got {})",
+            opts.timeout_s
+        );
+    }
     // Fail fast, before any artifact resolution or disk copy, if a networked run
     // was asked for but the host has not been set up.
     if opts.network {
@@ -1783,6 +1802,9 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
     }
 
     // Best-effort in-guest halt, then wait for FC to exit; force if it hangs.
+    // `halt` is internally time-bounded (F8), so a malicious guest that accepts
+    // the connection and stalls cannot wedge this teardown — the forced
+    // shutdown below still runs and the slot/process drop-guards still fire.
     let _ = vm.agent.halt(true).await;
     match tokio::time::timeout(Duration::from_secs(3), vm.proc.wait()).await {
         Ok(Ok(_status)) => {}
@@ -1865,6 +1887,7 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
         stdout_log: ctx.stdout_log.to_path_buf(),
         stderr_log: ctx.stderr_log.to_path_buf(),
         inline_cap: INLINE_CAP,
+        log_cap: EXEC_LOG_CAP,
     };
 
     // Give the host wall a grace margin over the guest's own timeout so the
@@ -1902,15 +1925,35 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
 }
 
 /// Reconstruct a [`StreamCapture`] from a teed log file (used to recover output
-/// after a host-side wall-clock timeout drops the live stream).
+/// after a host-side wall-clock timeout drops the live stream). Reads only the
+/// inline head — never the whole file — because this path runs exactly when a
+/// guest kept streaming past its budget, i.e. when the log may be at its cap;
+/// slurping it whole was a host-OOM lever (F3).
 async fn capture_from_log(path: &Path, cap: usize) -> Result<StreamCapture> {
-    match tokio::fs::read(path).await {
-        Ok(data) => Ok(StreamCapture::from_bytes(&data, cap)),
+    use tokio::io::AsyncReadExt;
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(StreamCapture::from_bytes(&[], cap))
+            return Ok(StreamCapture::from_bytes(&[], cap));
         }
-        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
-    }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", path.display()))),
+    };
+    let total_bytes = file
+        .metadata()
+        .await
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let mut inline = Vec::new();
+    (&mut file)
+        .take(cap as u64)
+        .read_to_end(&mut inline)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(StreamCapture {
+        inline,
+        truncated: total_bytes > cap as u64,
+        total_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -2078,7 +2121,6 @@ mod tests {
         assert!(validate_env(&[("K".into(), "nul\0value".into())]).is_err());
     }
 
-
     #[test]
     fn exec_budget_subtracts_elapsed_and_floors_at_one() {
         assert_eq!(exec_budget(120_000, 5_000), 115_000);
@@ -2087,6 +2129,49 @@ mod tests {
         assert_eq!(exec_budget(1_000, 1_000), 1);
         // No elapsed time -> full budget.
         assert_eq!(exec_budget(120_000, 0), 120_000);
+    }
+
+    #[test]
+    fn run_ephemeral_rejects_out_of_range_timeout() {
+        // Zero and over-cap budgets must error before any VM work (F3).
+        let opts = |timeout_s: u64| RunOptions {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            timeout_s,
+            flavor: RootfsFlavor::DevAgent,
+            keep: false,
+            network: false,
+            stage: None,
+            commit_as: None,
+            base: RootfsFlavor::BaseSqfs,
+            stdin: None,
+            vcpus: DEFAULT_VCPUS,
+            mem_mib: DEFAULT_MEM_MIB,
+            scratch_mib: None,
+            copy_out: Vec::new(),
+        };
+        for bad in [0, MAX_TIMEOUT_S + 1] {
+            let err = run_ephemeral(opts(bad)).expect_err("out-of-range timeout must error");
+            assert!(err.to_string().contains("timeout_s"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_from_log_reads_only_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exec-stdout.log");
+        std::fs::write(&path, vec![b'z'; 100]).unwrap();
+        let capture = capture_from_log(&path, 10).await.unwrap();
+        assert_eq!(capture.inline.len(), 10);
+        assert!(capture.truncated);
+        assert_eq!(capture.total_bytes, 100);
+        // A missing log is an empty capture, not an error.
+        let missing = capture_from_log(&dir.path().join("nope"), 10)
+            .await
+            .unwrap();
+        assert_eq!(missing.total_bytes, 0);
+        assert!(!missing.truncated);
     }
 
     #[test]

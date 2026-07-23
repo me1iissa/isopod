@@ -12,9 +12,23 @@
 
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::ChildStdout;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Ceiling on bytes persisted to a serial console log. Serial output is fully
+/// guest-controlled, so an uncapped tee is a host-disk DoS (F3); beyond the cap
+/// the pipe is still drained (the VMM must never block on a full stdout pipe)
+/// but the bytes are discarded.
+pub(crate) const SERIAL_LOG_CAP: u64 = 16 * 1024 * 1024;
+
+/// Marker appended to a console log when [`SERIAL_LOG_CAP`] trips.
+const SERIAL_TRUNCATED_MARKER: &[u8] =
+    b"\n[isopod: serial log cap reached; further output was not persisted]\n";
+
+/// Longest single serial line buffered for marker detection; a guest emitting
+/// an endless line without newlines must not grow host memory (F3). Bytes past
+/// the cap are dropped from the buffered line (the head is enough to classify).
+const MAX_LINE_LEN: usize = 64 * 1024;
 
 /// A classified serial-console line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,43 +79,99 @@ pub(crate) fn scan_lines(text: &str) -> MarkerScan {
     scan
 }
 
+/// Persist one serial line (newline restored) to `log`, respecting the
+/// [`SERIAL_LOG_CAP`] byte budget in `written`. Returns the truncation state.
+async fn persist_line(
+    log: &mut tokio::fs::File,
+    written: &mut u64,
+    truncated: bool,
+    line: &str,
+) -> bool {
+    if truncated {
+        return true;
+    }
+    if *written >= SERIAL_LOG_CAP {
+        let _ = log.write_all(SERIAL_TRUNCATED_MARKER).await;
+        return true;
+    }
+    let _ = log.write_all(line.as_bytes()).await;
+    let _ = log.write_all(b"\n").await;
+    *written = written.saturating_add(line.len() as u64 + 1);
+    false
+}
+
 /// Drain Firecracker's piped stdout (the relayed guest serial console): persist
-/// every line to `log`, and forward each line — stamped with the instant it was
-/// read — over `tx` for marker detection. Returns when the pipe reaches EOF
-/// (i.e. the VMM has exited).
+/// every line to `log` (up to [`SERIAL_LOG_CAP`]; F3), and forward each line —
+/// stamped with the instant it was read — over `tx` for marker detection.
+/// Returns when the pipe reaches EOF (i.e. the VMM has exited).
 ///
 /// fc-client's `StdioMode` has no direct file-redirect variant, so the pump is
-/// how serial output reaches `console.log`.
-pub(crate) async fn drain_serial(
-    stdout: ChildStdout,
+/// how serial output reaches `console.log`. Lines are split manually (rather
+/// than with a growable line reader) so a guest emitting an endless unbroken
+/// line cannot grow host memory: only the first [`MAX_LINE_LEN`] bytes of a
+/// line are buffered, the rest is dropped.
+pub(crate) async fn drain_serial<R: AsyncRead + Unpin>(
+    mut stdout: R,
     mut log: tokio::fs::File,
     tx: UnboundedSender<(Instant, String)>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
-    // Loop ends on EOF (VMM exited) or a read error — both leave the `Ok(Some)`
-    // pattern, so `while let` is the right shape.
-    while let Ok(Some(line)) = lines.next_line().await {
-        // Persist the raw line verbatim (plus the newline lines() stripped).
-        let _ = log.write_all(line.as_bytes()).await;
-        let _ = log.write_all(b"\n").await;
-        // A send error just means the boot watcher already gave up.
+    let mut buf = [0u8; 8192];
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut written: u64 = 0;
+    let mut truncated = false;
+    loop {
+        match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    if byte == b'\n' {
+                        let line = String::from_utf8_lossy(&line_buf).into_owned();
+                        line_buf.clear();
+                        truncated = persist_line(&mut log, &mut written, truncated, &line).await;
+                        // A send error just means the boot watcher already gave up.
+                        let _ = tx.send((Instant::now(), line));
+                    } else if line_buf.len() < MAX_LINE_LEN {
+                        line_buf.push(byte);
+                    }
+                }
+            }
+        }
+    }
+    // A trailing partial line (EOF without a newline) still counts.
+    if !line_buf.is_empty() {
+        let line = String::from_utf8_lossy(&line_buf).into_owned();
+        let _ = persist_line(&mut log, &mut written, truncated, &line).await;
         let _ = tx.send((Instant::now(), line));
     }
     let _ = log.flush().await;
 }
 
 /// Tee Firecracker's piped stdout (the relayed guest serial console) verbatim
-/// into `log` until the pipe reaches EOF (the VMM exited). Unlike
-/// [`drain_serial`], no marker channel is involved — the ephemeral run flow keys
-/// readiness off the vsock ping, so serial is retained purely for inspection.
-pub(crate) async fn drain_to_log(mut stdout: ChildStdout, mut log: tokio::fs::File) {
+/// into `log` — up to [`SERIAL_LOG_CAP`] bytes (F3); the pipe keeps draining
+/// beyond the cap so the VMM never blocks, but the bytes are discarded — until
+/// the pipe reaches EOF (the VMM exited). Unlike [`drain_serial`], no marker
+/// channel is involved — the ephemeral run flow keys readiness off the vsock
+/// ping, so serial is retained purely for inspection.
+pub(crate) async fn drain_to_log<R: AsyncRead + Unpin>(mut stdout: R, mut log: tokio::fs::File) {
     let mut buf = [0u8; 8192];
+    let mut written: u64 = 0;
+    let mut truncated = false;
     loop {
         match stdout.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if log.write_all(&buf[..n]).await.is_err() {
+                if truncated {
+                    continue; // keep draining; discard beyond the cap
+                }
+                let room = SERIAL_LOG_CAP.saturating_sub(written);
+                let take = (n as u64).min(room) as usize;
+                if log.write_all(&buf[..take]).await.is_err() {
                     break;
+                }
+                written = written.saturating_add(take as u64);
+                if take < n {
+                    let _ = log.write_all(SERIAL_TRUNCATED_MARKER).await;
+                    truncated = true;
                 }
             }
         }
@@ -166,5 +236,49 @@ mod tests {
         let scan = scan_lines("kernel panic - not syncing\nTICK 1.0 2.0\n");
         assert!(!scan.boot_complete);
         assert_eq!(scan.ticks, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_to_log_caps_persisted_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let log = tokio::fs::File::create(&path).await.unwrap();
+        // 100 bytes past the cap: the tail must be drained but not persisted.
+        let input = vec![b'x'; SERIAL_LOG_CAP as usize + 100];
+        drain_to_log(input.as_slice(), log).await;
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(
+            written.len(),
+            SERIAL_LOG_CAP as usize + SERIAL_TRUNCATED_MARKER.len()
+        );
+        assert!(written.ends_with(SERIAL_TRUNCATED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn drain_serial_bounds_an_endless_line_and_flushes_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let log = tokio::fs::File::create(&path).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // One normal marker line, then an unbroken flood twice the line cap
+        // ending at EOF without a newline.
+        let mut input = b"ISOPOD-BOOT-COMPLETE uptime=1.0\n".to_vec();
+        input.extend(std::iter::repeat_n(b'y', MAX_LINE_LEN * 2));
+        drain_serial(input.as_slice(), log, tx).await;
+
+        let (_, first) = rx.recv().await.unwrap();
+        assert_eq!(classify_line(&first), Marker::BootComplete);
+        // The flood arrives as one line, capped at MAX_LINE_LEN.
+        let (_, flood) = rx.recv().await.unwrap();
+        assert_eq!(flood.len(), MAX_LINE_LEN);
+        assert!(rx.recv().await.is_none());
+        // Both lines were persisted (well under the serial byte cap).
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("ISOPOD-BOOT-COMPLETE"));
+        assert_eq!(
+            written.len(),
+            first.len() + 1 + MAX_LINE_LEN + 1,
+            "persisted bytes must match the two capped lines"
+        );
     }
 }

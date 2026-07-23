@@ -101,7 +101,7 @@ struct SandboxRunParams {
     #[serde(default)]
     network: Option<bool>,
     /// Outer wall-clock budget in seconds, covering **boot + exec** (boot costs
-    /// ~0.4 s of the budget). Default 120.
+    /// ~0.4 s of the budget). Default 120, max 3600.
     #[serde(default)]
     timeout_s: Option<u64>,
     /// Working directory inside the guest (default `/root`).
@@ -141,8 +141,8 @@ struct SandboxRunParams {
     #[serde(default)]
     scratch_mib: Option<u32>,
     /// Guest files to stream to HOST paths after the command finishes — the
-    /// artifact-extraction channel (no size ceiling, binary-safe; use instead
-    /// of base64-over-stdout). Attempted only when the exec completed without
+    /// artifact-extraction channel (16 GiB per-file ceiling, binary-safe; use
+    /// instead of base64-over-stdout). Attempted only when the exec completed without
     /// timing out; a copy failure fails the call. Written files are listed in
     /// the result's `copied`.
     #[serde(default)]
@@ -466,8 +466,8 @@ impl Isopod {
     /// `commit_as` to persist the result as a new stage (only when the command
     /// exits 0). A non-zero exit code is returned normally, not as an error.
     /// Networking is on by default; set `network=false` for untrusted code.
-    /// `timeout_s` covers boot + exec (default 120). Size the VM with `vcpus`
-    /// (default 1) and `mem_mib` (default 512); both are host-capped.
+    /// `timeout_s` covers boot + exec (default 120, max 3600). Size the VM with
+    /// `vcpus` (default 1) and `mem_mib` (default 512); both are host-capped.
     #[tool(
         name = "sandbox_run",
         description = "Run a shell command in a fresh, disposable Firecracker microVM (boot, exec, \
@@ -476,9 +476,10 @@ commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the tool
 (Python/Node/git/gcc); pass `stage` to fork a committed stage, `commit_as` to persist the result \
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
 Networking on by default (network=false for untrusted code). timeout_s covers boot + exec \
-(default 120). Size the VM with vcpus (default 1) and mem_mib (default 512), both host-capped. \
+(default 120, max 3600). Size the VM with vcpus (default 1) and mem_mib (default 512), both \
+host-capped. \
 For large stdin payloads pass stdin_file (a host path) instead of stdin; to extract build \
-artifacts pass copy_out (guest->host file mappings, binary-safe, no size ceiling). NOTE: \
+artifacts pass copy_out (guest->host file mappings, binary-safe, 16 GiB per-file ceiling). NOTE: \
 parallel sandbox_run calls batched in one message execute serially; for concurrent sandboxes, \
 issue calls from separate agents.",
         meta = crate::sandbox_run_meta()

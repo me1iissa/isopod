@@ -88,7 +88,7 @@ enum VmCommand {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Outer wall-clock budget in seconds (covers boot + exec).
+    /// Outer wall-clock budget in seconds (covers boot + exec; max 3600).
     #[arg(long = "timeout-s", default_value_t = 120)]
     timeout_s: u64,
     /// Guest vCPU count (default 1). Must be 1 or an even number, and at most the
