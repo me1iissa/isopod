@@ -345,7 +345,7 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   `RunOptions`/`sandbox_run`/CLI params, host-aware caps (≤ host nproc; mem leaves host headroom),
   clear clamp errors, reported in `RunReport`. Default bumped to 1 vCPU / 512 MiB (256 OOMs on
   bigger installs). Foundational for M6 — the warm-pool key includes the resource shape.
-  *[✅ COMPLETE 2026-07-22 (e348201) — shipped and dogfooded; supplies the resource-shape
+  *[✅ COMPLETE 2026-07-22 (cced444) — shipped and dogfooded; supplies the resource-shape
   dimension of the M6 warm-pool key.]*
 - **M6 — Warm pool.** Full-snapshot save/resume so a fresh `sandbox_run` (no stage layers)
   hot-resumes in ~ms instead of a ~400 ms cold boot. Snapshot a booted-idle, network-less VM per
@@ -358,7 +358,7 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
   Cache invalidation on any key change (WSL2 kernel auto-updates WILL fire it → silent cold-boot
   fallback). `stage_info`/a `warmpool` status command shows cache state; resume-latency benchmark
   vs the M0 baseline.
-  *[✅ COMPLETE 2026-07-22 (fea8895 guest half + ffb4bae host half) — `core::snapshot` keyed on
+  *[✅ COMPLETE 2026-07-22 (d58aeaa guest half + d87d954 host half) — `core::snapshot` keyed on
   (fc build, kernel id, cpu model, base flavor, vcpus, mem_mib, snapshot format); guest boots a
   **tmpfs (RAM) overlay upper** (`isopod.upper=ram`) so a resume needs no external scratch drive
   (dodges FC's no-drive-path-override-on-load limit); on resume the NIC is retargeted via

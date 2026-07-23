@@ -13,19 +13,19 @@ accumulation. All core behaviors correct (truncation exact, full logs retained,
 timeout kill in 3.05 s wall, signal 9 reported, concurrent runs isolated with
 distinct vanity names).
 
-1. **[fixed b1caea7] HIGH — vanity names exist but nothing lists or resolves them.**
+1. **[fixed 9ecbd79] HIGH — vanity names exist but nothing lists or resolves them.**
    Names are persisted in each VM dir's `meta.json`, but there is no
    `isopod vm ls`, so a user/model cannot look up `resilient-legionary` after
    the fact — which defeats the point of memorable handles.
    → FIX at M3 integration: `isopod vm ls` (id, name, flavor, created, status)
    reading the meta.json files; name→vm resolution helper shared with stages.
 
-2. **[fixed b1caea7] MEDIUM — `~/.isopod/vms/` grows without bound.** 25 dirs / 600 KB
+2. **[fixed 9ecbd79] MEDIUM — `~/.isopod/vms/` grows without bound.** 25 dirs / 600 KB
    after one day of testing; harmless now (logs only), but every run adds one
    and nothing prunes. → FIX at M3 integration: `isopod vm gc [--keep-last N]
    [--older-than 7d]` with sane defaults; consider auto-gc on run.
 
-3. **[fixed b1caea7] MEDIUM — command-not-found is indistinguishable from infra failure.**
+3. **[fixed 9ecbd79] MEDIUM — command-not-found is indistinguishable from infra failure.**
    `isopod run -- /bin/nonexistent` yields `{ok:false, error:"exec over vsock:
    guest agent reported an error: exec: No such file or directory"}` — same
    shape as a genuine sandbox/transport failure, and no exit code. Callers
@@ -40,7 +40,7 @@ distinct vanity names).
    exist yet either. → file for M5 (MCP `file_put` + a `--stdin-file` flag land
    together).
 
-5. **[fixed b1caea7] MEDIUM — guest rootfs has no `/tmp`.** Found by probing the guest
+5. **[fixed 9ecbd79] MEDIUM — guest rootfs has no `/tmp`.** Found by probing the guest
    environment: `echo t > /tmp/x` fails on a fresh dev-agent VM (the dir simply
    isn't in the image; `mkdir -p` works). A large fraction of real scripts and
    tools assume `/tmp`. → FIX at M3 integration: add `/tmp` (mode 1777) and
@@ -54,7 +54,7 @@ Egress works (ICMP + DNS through the NAT), concurrency lands on distinct slots
 (0/1), host isolation holds (guest can't reach the host tap — the `iifname`
 input-drop fix), `--no-network` attaches no NIC. Two findings:
 
-7. **[fixed 4605db8+] HIGH — a leaked firecracker holding a tap breaks its slot until
+7. **[fixed f332743+] HIGH — a leaked firecracker holding a tap breaks its slot until
    manually killed.** A VMM that outlived its run (here `dev-85eddd65` from an
    earlier failed attempt) kept `isopod-tap0` open, so every later slot-0 run
    died with `EBUSY` at `PUT /network-interfaces` — a confusing, persistent
@@ -78,7 +78,7 @@ The marquee test passed: bare `pip install requests` into an Alpine stage →
 commit → fork BY VANITY NAME → `import requests` with no reinstall → parent
 byte-identical. Three fixes fell out of running it:
 
-10. **[fixed 3bea60c+] HIGH — bare `pip install` failed (PEP 668).** Alpine's
+10. **[fixed 0a37865+] HIGH — bare `pip install` failed (PEP 668).** Alpine's
     Python 3.14 ships an `EXTERNALLY-MANAGED` marker, so `pip install` errored
     and an agent would have to know `--break-system-packages`. In a disposable
     sandbox that protection is pure friction. → FIXED: the `base-alpine` build
