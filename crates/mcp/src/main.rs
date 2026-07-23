@@ -605,7 +605,7 @@ issue calls from separate agents.",
         // Periodic background retention sweep (see `spawn_auto_gc`); counted per
         // attempt so failed runs still advance the cadence.
         let served = self.runs.fetch_add(1, Ordering::Relaxed) + 1;
-        if served % AUTO_GC_EVERY == 0 {
+        if served.is_multiple_of(AUTO_GC_EVERY) {
             spawn_auto_gc("periodic");
         }
 

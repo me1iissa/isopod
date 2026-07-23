@@ -849,7 +849,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isopod-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-fc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "libc",
  "reqwest",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-guest-agent"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "isopod-core",
  "isopod-fc",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-jail"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-mcp"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "isopod-core",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-proto"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64",
  "serde",

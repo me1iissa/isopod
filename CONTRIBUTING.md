@@ -118,6 +118,9 @@ cutovers), and a **patch** bump signals backward-compatible fixes only.
   the version at `HEAD` always describes the code at `HEAD`. Never leave the number
   behind while the code moves on.
 - Each version bump gets an annotated tag `vX.Y.Z` on the commit that bumps it.
+- CI enforces this (`version-guard` job): a PR touching code paths must carry a
+  strictly greater version than its base; a lower version is always rejected.
+  Docs/CI-only changes may keep the version unchanged.
 - `PROTO_VERSION` in `crates/proto` is a separate, independently-incremented
   compatibility number for the host↔guest RPC contract; it is not tied to the crate
   version.

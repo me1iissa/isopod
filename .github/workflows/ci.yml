@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run per ref; superseded PR runs are cancelled to conserve free minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Paths whose change constitutes a "code wave" and therefore demands a
+  # version bump (CONTRIBUTING.md § Versioning). Docs/CI-only changes are
+  # exempt.
+  CODE_PATHS: crates/ Cargo.toml Cargo.lock vendor/ scripts/
+
+jobs:
+  version-guard:
+    name: Version guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract workspace version
+        id: ver
+        run: |
+          ver="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ -z "$ver" ]; then
+            echo "::error::could not read workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "workspace version: $ver"
+
+      - name: Plugin manifest is in lockstep
+        run: |
+          plugin="$(jq -r .version .claude-plugin/plugin.json)"
+          if [ "$plugin" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error file=.claude-plugin/plugin.json::plugin version ($plugin) != workspace version (${{ steps.ver.outputs.version }}) — bump them together"
+            exit 1
+          fi
+
+      - name: Incoming version must be newer than the current one (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_ver="$(git show "$base_sha:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)"
+          head_ver="${{ steps.ver.outputs.version }}"
+          echo "current (base): $base_ver -> incoming (head): $head_ver"
+          if [ "$head_ver" = "$base_ver" ]; then
+            if git diff --name-only "$base_sha"...HEAD -- $CODE_PATHS | grep -q .; then
+              echo "::error file=Cargo.toml::code changed but the workspace version is still $base_ver — bump it (semver: minor for features/breaking, patch for fixes)"
+              exit 1
+            fi
+            echo "docs/CI-only change; equal version accepted"
+          elif [ "$(printf '%s\n%s\n' "$base_ver" "$head_ver" | sort -V | tail -1)" != "$head_ver" ]; then
+            echo "::error file=Cargo.toml::incoming version $head_ver is LOWER than current $base_ver"
+            exit 1
+          fi
+
+      - name: Version must describe the tree (main)
+        if: github.event_name == 'push'
+        run: |
+          ver="${{ steps.ver.outputs.version }}"
+          latest="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -n "$latest" ] && [ "$ver" != "$latest" ] && \
+             [ "$(printf '%s\n%s\n' "$latest" "$ver" | sort -V | tail -1)" != "$ver" ]; then
+            echo "::error file=Cargo.toml::workspace version $ver is lower than already-tagged v$latest"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
+            tagged="$(git rev-list -n1 "v$ver")"
+            if [ "$tagged" != "$GITHUB_SHA" ] && \
+               git diff --name-only "$tagged" "$GITHUB_SHA" -- $CODE_PATHS | grep -q .; then
+              echo "::error file=Cargo.toml::code changed since v$ver but the workspace version was not bumped"
+              exit 1
+            fi
+          else
+            echo "::warning::tag v$ver does not exist yet — push it alongside the bump commit (git push origin main --follow-tags)"
+          fi
+
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

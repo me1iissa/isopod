@@ -24,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // one-shot dispatch value; variant size is irrelevant
 enum Command {
     /// Guest image pipeline (fetch-kernel, build-rootfs)
     Image {
