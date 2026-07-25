@@ -8,6 +8,25 @@ start is the condensed version of this document.
 Everything below is written for a normal, unprivileged user account. Exactly
 one step (`isopod setup`) needs root, once.
 
+The whole path, and the two places it branches — a package install skips the
+Firecracker build (§2a vs §2b), and a `--no-network`-only setup skips the root
+step (§4):
+
+```mermaid
+flowchart TB
+    K["Linux x86_64 with /dev/kvm, your user in the kvm group"] --> HOW{"install from"}
+    HOW -->|"a release .deb, .rpm or tarball"| PKG["isopod · isopod-mcp · isopod-jail installed<br/>Firecracker and the guest agent come prebuilt"]
+    HOW -->|"a source checkout"| SRC["cargo build --release"]
+    SRC --> BFC["isopod dev build-fc<br/>compiles the vendored Firecracker"]
+    PKG --> FK
+    BFC --> FK["isopod image fetch-kernel<br/>pinned guest kernel, digest-verified"]
+    FK --> BA["isopod image build-all<br/>guest rootfs and squashfs bases"]
+    BA --> NEED{"does your workload need a network?"}
+    NEED -->|"yes"| SETUP["sudo isopod setup<br/>the one step that needs root"]
+    NEED -->|"no, --no-network only"| RUN
+    SETUP --> RUN["isopod run ..."]
+```
+
 ## 1. Prerequisites
 
 **Hardware / kernel:**
@@ -162,16 +181,32 @@ This provisions, once:
   (`--iface` to override) with guest→guest and guest→LAN blocking;
 - an **IP-forwarding sysctl** drop-in.
 
+Which pool a run lands in, and what each pool can actually reach:
+
+```mermaid
+flowchart TB
+    R1["a run with no allowlist"] --> PUB["public slot<br/>isopod-tap0 .. isopod-tap7"]
+    R2["a run with --allow-host, --allow-cidr or --deny-egress"] --> FIL["filtered slot<br/>isopod-tap8 .. isopod-tap11"]
+    PUB -->|"NAT off your default-route interface"| WAN["the public internet"]
+    PUB -.->|"dropped by the ruleset"| PRIV["your LAN · other RFC1918 · CGNAT · link-local metadata"]
+    FIL -->|"only 1080 SOCKS5, 3128 HTTP and 5353 DNS<br/>on this slot's own gateway"| BR["host-side egress broker"]
+    FIL -.->|"all other forwarding dropped"| NOTHING["nothing at all"]
+    BR -->|"allowlisted destinations only"| WAN
+```
+
+Each slot is its own `/30`. For slot *i* the host holds `10.107.<i>.1` on
+`isopod-tap<i>` and the guest gets `10.107.<i>.2` — the address a run reports
+back as `guest_ip`. Every tap is pinned to its own source address, so one slot
+cannot spoof another.
+
 Three things worth knowing:
 
-- **Egress is public-only by default.** Guests can reach the internet but not
-  your LAN, other RFC1918/CGNAT space, or link-local/metadata addresses.
-  `--allow-lan-egress` disables that filter — it is explicitly insecure and
-  exists for trusted-workload setups that need to reach LAN services.
-- **Filtered slots are a separate pool.** A run asking for an allowlist claims
-  one of the 4; a run without one claims from the 8 public slots. They never
-  compete. If the filtered pool is busy, the run waits for a filtered slot
-  rather than quietly falling back to unfiltered egress.
+- **Egress is public-only by default.** `--allow-lan-egress` disables the
+  private-destination filter drawn above — it is explicitly insecure and exists
+  for trusted-workload setups that need to reach LAN services.
+- **The two pools never compete.** If the filtered pool is busy, a run asking
+  for an allowlist waits for a filtered slot rather than quietly falling back to
+  unfiltered egress.
 - **Tap devices do not survive a reboot** (the sysctl does). If runs fail
   with a networking error after a host reboot — or a WSL2 shutdown — just
   re-run `sudo isopod setup`; it is idempotent.
@@ -443,7 +478,8 @@ snapshot caches. Stages are never auto-pruned.
 |---|---|
 | `permission denied` opening `/dev/kvm` | Not in the `kvm` group (or no re-login since adding). `sudo usermod -aG kvm "$USER"`, log out/in. |
 | `python3: not found` in a stage run (CLI) | The CLI's `--base` default is the toolchain-less `base-sqfs` — pass `--base base-alpine`. |
-| Slot-exhaustion error on concurrent runs | All 8 default network slots are claimed. Wait, run with `--no-network`, or re-provision with `sudo isopod setup --slots N`. |
+| Slot-exhaustion error on concurrent runs | All 8 **public** slots are claimed. Wait, run with `--no-network`, or re-provision with `sudo isopod setup --slots N`. |
+| `no filtered-egress slots` on an `--allow-host` run | A *different* pool. Either the host predates 0.9 / was provisioned with `--filtered-slots 0`, or all 4 filtered slots are busy. The error prints the exact re-provisioning command; the two pools never borrow from each other. |
 | Networking errors right after a host reboot / WSL restart | Taps don't survive reboots — re-run `sudo isopod setup` (idempotent). |
 | `sudo: isopod: command not found` | sudo's `secure_path` skips user dirs — use `sudo ./target/release/isopod setup` or the full path. |
 | Protocol-mismatch error naming host vs. image versions | Images built by an older checkout — `isopod image build-all`. |

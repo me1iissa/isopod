@@ -81,6 +81,24 @@ isopod can wrap each Firecracker in a **rootless microjail** — set **`ISOPOD_J
 - a **minimal chroot** (built from identity bind mounts) exposing only the VM's own files + `/dev/kvm` + the tap device — **your home directory and the rest of `~/.isopod` are not visible**;
 - a **per-VM cgroup v2 slice** with `memory.max` / `cpu.max` / `pids.max`, so a runaway guest is cgroup-OOM-killed and cannot exhaust host RAM, CPU, or pids.
 
+Drawn as containment layers — what an escape from the box in the middle would still have to get through:
+
+```mermaid
+flowchart TB
+    subgraph HOST["Host — your user account"]
+        HIDE["not visible from inside<br/>your home · the rest of ~/.isopod · other VMs"]
+        subgraph JAIL["isopod-jail — user + pid namespace, single-id map<br/>per-VM cgroup v2 slice with memory.max · cpu.max · pids.max"]
+            subgraph CH["minimal chroot — identity bind mounts only"]
+                FCP["firecracker<br/>seccomp on · caps dropped · no_new_privs"]
+                SEEN["reachable — this VM's own files · /dev/kvm · its tap device"]
+            end
+        end
+    end
+    FCP -.->|"a VMM or KVM escape lands as"| ESC["an unprivileged, unmapped uid<br/>with no host capabilities"]
+```
+
+Without `ISOPOD_JAIL=1` the two inner boxes do not exist, and that dashed arrow lands in the outermost one — as your own account, with your files and the whole `~/.isopod` store in reach.
+
 It requires an environment that supports it: unprivileged user namespaces, a delegated cgroup v2 subtree (a normal systemd user session), and membership in the `kvm` group. When enabled, isopod runs a preflight and **fails closed** with a clear message if any prerequisite is missing (it never silently runs unjailed). It is **opt-in in this release** for portability; enabling it is strongly recommended for untrusted or multi-tenant workloads.
 
 ---

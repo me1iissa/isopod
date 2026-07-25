@@ -17,6 +17,27 @@ the allowlist named in the row. Outcomes are read from the guest's own output
 and cross-checked against the run's `egress` record, which is produced host-side
 and cannot be influenced by the guest.
 
+Every packet a filtered guest emits meets the packet filter first and the broker
+second. This is the map of where each row below ends up — read it as a table of
+contents:
+
+```mermaid
+flowchart TB
+    G["guest code, running as root on a filtered slot"]
+    G --> NFT{"nftables ruleset<br/>baked in once by sudo isopod setup"}
+    NFT -->|"udp/tcp port 53, any destination<br/>nat prerouting redirect"| DNS["broker DNS responder<br/>gateway:5353"]
+    NFT -->|"gateway:1080 SOCKS5<br/>gateway:3128 HTTP"| PX["broker proxy"]
+    NFT -->|"every other forward"| DROP["dropped at the tap<br/>L4 · L7"]
+    DROP --> NOEV["no broker event at all<br/>the two layers fail independently"]
+    DNS --> POL{"on this run's allowlist?"}
+    PX --> POL
+    POL -->|"yes"| OK["resolved and dialled by the broker<br/>L1 · L2"]
+    POL -->|"no"| NO["NXDOMAIN or 403, and recorded<br/>L3 · L5 · L6 · L8 · L9 · L10"]
+```
+
+The left branch is the one that matters most: traffic that never reaches the
+broker is not a gap in the audit trail, it is the *other* layer holding.
+
 ## Environment
 
 | | |

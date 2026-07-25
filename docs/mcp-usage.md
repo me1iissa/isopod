@@ -106,6 +106,52 @@ cache-installed copy would need a prebuilt binary vendored into the package —
 out of scope for v1; local dev via `--plugin-dir` (or the project-scope
 `.mcp.json`) is the supported path today.
 
+## What one `sandbox_run` call does
+
+Every call is a whole microVM: claimed, booted or resumed, exec'd, and destroyed
+before the JSON comes back. Nothing survives the call except a stage you asked
+for with `commit_as` and files you asked for with `copy_out`.
+
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant MCP as isopod-mcp
+    participant Core as isopod-core
+    participant FC as Firecracker VMM
+    participant G as isopod-guest-agent PID 1
+
+    Note over CC,MCP: one stdio subprocess per Claude Code session
+    CC->>MCP: sandbox_run {cmd, stage, network, allow_hosts, timeout_s}
+    MCP->>Core: run_ephemeral(RunOptions)
+    Core->>Core: claim a network slot, resolve the stage chain
+    alt warm-pool hit
+        Core->>FC: load the snapshot and resume
+        Core->>G: ConfigureNet and SyncClock over vsock
+    else cold boot
+        Core->>FC: configure boot source, drives, NIC, vsock, then InstanceStart
+        FC->>G: boot the guest kernel, exec PID 1
+        G->>G: mount the overlay, pivot_root, listen on vsock
+    end
+    Core->>G: Exec {argv, env, cwd, timeout}
+    G-->>Core: ExecStream frames, stdout and stderr
+    G-->>Core: ExecDone {exit_code, duration_ms}
+    opt copy_out requested and the exec did not time out
+        Core->>G: CopyOut, streamed straight to host paths
+    end
+    Core->>G: Halt
+    Core->>FC: wait for exit, force shutdown if it hangs
+    opt commit_as set and exit_code is 0
+        Core->>Core: content-address the scratch layer, store it as a stage
+    end
+    Core-->>MCP: RunReport
+    MCP-->>CC: JSON result, 64 KiB inline heads plus log paths
+```
+
+Two things follow from the order above. The commit happens **after** the VM is
+gone, so a `commit_as` run's `total_ms` includes hashing the layer on top of
+everything else. And `timeout_s` is spent from the top of the diagram — boot or
+resume comes out of the same budget as `Exec`, not on top of it.
+
 ## Tool list
 
 All tools wrap `isopod-core` functions directly — the MCP server adds no

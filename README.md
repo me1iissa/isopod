@@ -140,11 +140,11 @@ sequenceDiagram
     Core->>Guest: Exec {argv, env, cwd, timeout} over vsock
     Guest-->>Core: ExecStream chunks (stdout / stderr)
     Guest-->>Core: ExecDone {exit_code, duration_ms}
+    Core->>Guest: Halt {sync}
+    Core->>FC: shutdown / kill, release net slot
     opt commit_as set and exit_code == 0
-        Core->>Guest: Halt {sync}
         Core->>Core: content-address scratch (blake3), store as new stage
     end
-    Core->>FC: shutdown / kill, release net slot
     Core-->>MCP: RunReport {exit_code, stdout, stderr, ...}
     MCP-->>CC: JSON result
 ```
