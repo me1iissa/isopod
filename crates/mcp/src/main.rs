@@ -115,6 +115,18 @@ struct SandboxRunParams {
     /// literal address is never matched against `allow_hosts` patterns.
     #[serde(default)]
     allow_cidrs: Option<Vec<String>>,
+    /// Credential aliases to inject, e.g. `["github"]`. The sandbox can spend
+    /// the credential without ever holding it: it calls
+    /// `$ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>` and the host attaches the
+    /// token, but only for the exact methods and paths the operator declared.
+    /// Everything about the credential — which secret, which host, which
+    /// requests — is declared host-side in `~/.isopod/credentials.json`; there
+    /// is no way to name a secret or a destination from here. An alias the
+    /// operator has not marked `"mcp": true` is refused, and every refusal
+    /// reads identically so probing reveals nothing. Also switches the run to
+    /// filtered egress.
+    #[serde(default)]
+    inject: Option<Vec<String>>,
     /// Outer wall-clock budget in seconds, covering **boot + exec** (boot costs
     /// ~0.4 s of the budget). Default 120, max 3600.
     #[serde(default)]
@@ -290,6 +302,13 @@ struct EgressResult {
     /// also in `denied` is a lookup that was refused — the signal that
     /// something tried to reach a destination you did not allow.
     dns_queries: Vec<String>,
+    /// Credentials injected into this run and exactly what each may authorise.
+    /// Never the secret itself, which never leaves the host.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    injected: Vec<InjectedCredentialResult>,
+    /// Where the sandbox reached the credential endpoint, when one was offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_endpoint: Option<String>,
     /// Total decisions the broker made, including any beyond the inline caps.
     total_events: u64,
     /// `true` when a list above was capped; the full record is at
@@ -324,10 +343,30 @@ struct EgressDeniedResult {
     /// Destination port (0 for a DNS lookup, which names no port).
     port: u16,
     /// Why it was refused: `not_allowed`, `literal_address`, `empty_allowlist`,
-    /// or `malformed`.
+    /// `malformed`, `pinned_credential_host` (the destination belongs to an
+    /// injected credential and must be reached through the credential endpoint,
+    /// not dialled directly), or `credential_refused` (the endpoint itself
+    /// refused — see `note`).
     reason: String,
+    /// A short machine-readable detail when the broker had one, e.g.
+    /// `inject-not-permitted` (the credential exists but does not authorise
+    /// that method and path) or `dial-failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     /// Milliseconds after the broker started listening.
     ts_ms: u64,
+}
+
+/// One credential injected into a run, as listed in [`EgressResult`].
+#[derive(Debug, Serialize, JsonSchema)]
+struct InjectedCredentialResult {
+    /// The alias, and the first path segment at the credential endpoint.
+    alias: String,
+    /// The only host this credential is ever sent to.
+    host: String,
+    /// The request shapes it may authorise, e.g. `GET|HEAD /**`. A request
+    /// outside these is refused before any token is attached.
+    allow: Vec<String>,
 }
 
 impl From<vm::EgressReport> for EgressResult {
@@ -360,10 +399,21 @@ impl From<vm::EgressReport> for EgressResult {
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_else(|| "not_allowed".to_string()),
+                    note: d.note.map(str::to_string),
                     ts_ms: d.ts_ms,
                 })
                 .collect(),
             dns_queries: e.dns_queries,
+            injected: e
+                .injected
+                .into_iter()
+                .map(|c| InjectedCredentialResult {
+                    alias: c.alias,
+                    host: c.host,
+                    allow: c.allow,
+                })
+                .collect(),
+            credential_endpoint: e.credential_endpoint,
             total_events: e.total_events,
             truncated: e.truncated,
             egress_log_path: e.egress_log_path.to_string_lossy().into_owned(),
@@ -668,19 +718,29 @@ issue calls from separate agents.",
             (None, None) => None,
         };
 
-        // Either parameter present — even as an empty list — means "filtered".
-        // An absent parameter is the unfiltered default, byte-identical to 0.8.1.
-        let egress = match (&p.allow_hosts, &p.allow_cidrs) {
-            (None, None) => None,
-            (hosts, cidrs) => Some(isopod_core::vm::EgressPolicy {
+        // Any of the three present — even as an empty list — means "filtered".
+        // All absent is the unfiltered default, byte-identical to 0.8.1.
+        //
+        // `inject` belongs in this tuple rather than beside it: a credential
+        // that did not imply a filtered slot would arrive on a public one, with
+        // full NAT egress and no broker to enforce its `allow` list.
+        let egress = match (&p.allow_hosts, &p.allow_cidrs, &p.inject) {
+            (None, None, None) => None,
+            (hosts, cidrs, inject) => Some(isopod_core::vm::EgressPolicy {
                 hosts: hosts.clone().unwrap_or_default(),
                 cidrs: cidrs.clone().unwrap_or_default(),
+                inject: inject.clone().unwrap_or_default(),
+                // Every MCP caller is a model whose context the sandboxed code
+                // may have written. Credential refusals render identically so
+                // probing cannot enumerate the operator's aliases; the specific
+                // reason goes to the server's stderr instead.
+                caller: isopod_core::vm::Caller::Model,
             }),
         };
         if egress.is_some() && p.network == Some(false) {
             return Err(ErrorData::invalid_params(
-                "allow_hosts/allow_cidrs ask for a filtered network interface while \
-                 network=false attaches none at all. Pass allow_hosts for \
+                "allow_hosts/allow_cidrs/inject ask for a filtered network interface \
+                 while network=false attaches none at all. Pass allow_hosts for \
                  default-deny egress, or network=false for no network."
                     .to_string(),
                 None,

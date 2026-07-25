@@ -73,11 +73,17 @@ pub const CREDENTIALS_FILE: &str = "credentials.json";
 /// it" responses are an oracle for enumerating the operator's credential names.
 /// Over MCP every refusal renders identically, and the detail goes to the host's
 /// stderr where the operator can still read it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Caller {
     /// The CLI — the human who owns the file. Errors are specific.
     Operator,
     /// An MCP client. Errors are deliberately uniform.
+    ///
+    /// The default, because the failure modes are asymmetric: treating a human
+    /// as a model costs one round trip to the host's stderr, while treating a
+    /// model as a human hands a poisoned context an oracle for the operator's
+    /// credential names.
+    #[default]
     Model,
 }
 
@@ -138,12 +144,23 @@ pub enum CredError {
 }
 
 impl CredError {
-    /// Render for `caller`, collapsing anything alias-specific for a model.
+    /// Render for `caller`, collapsing **every** variant for a model.
+    ///
+    /// Collapsing only `Unavailable` was not enough, and the gap contradicted
+    /// the guarantee stated above. `NoStore`, `BadMode` and `Unreadable` all
+    /// carry the store's absolute path — so a poisoned context could learn the
+    /// operator's home directory, and whether a credential store exists at all,
+    /// just by naming any alias. `BadSpec` and `BadVersion` are quieter oracles
+    /// of the same kind: a "that alias is malformed" answer confirms the alias
+    /// exists, which "not available" deliberately does not.
+    ///
+    /// The operator still gets the specific error, on the host's stderr, from
+    /// [`load_credentials`].
     #[must_use]
     pub fn for_caller(self, caller: Caller) -> Self {
-        match (caller, &self) {
-            (Caller::Model, Self::Unavailable { .. }) => Self::UnavailableOpaque,
-            _ => self,
+        match caller {
+            Caller::Model => Self::UnavailableOpaque,
+            Caller::Operator => self,
         }
     }
 }
@@ -271,9 +288,23 @@ impl PathGlob {
         Ok(Self { segments, trailing })
     }
 
-    /// Whether an already-[normalised](normalize_target) path matches.
+    /// Whether an already-[normalised](normalize_target) target matches.
+    ///
+    /// The query is **stripped before matching**, which is what makes the
+    /// documented contract ("path patterns match the path only") true of the
+    /// code. Without this, `allow: ["GET /repos/*/*/issues"]` would refuse
+    /// `/repos/me/proj/issues?state=open` — the trailing segment would be
+    /// `issues?state=open`, which is not `issues`. That is fail-closed and so
+    /// not a hole, but it would make every paginated or filtered API call
+    /// unusable and push operators toward `readonly` (any path) purely to get
+    /// query strings to work, which is a real loss of scoping.
+    ///
+    /// Ignoring the query is safe in a way that ignoring a path segment would
+    /// not be: a query cannot move the request to a different endpoint, and the
+    /// origin is pinned separately and never derived from the target at all.
     #[must_use]
-    pub fn matches(&self, path: &str) -> bool {
+    pub fn matches(&self, target: &str) -> bool {
+        let path = target.split_once('?').map_or(target, |(p, _)| p);
         let body = path.strip_prefix('/').unwrap_or(path);
         let actual: Vec<&str> = if body.is_empty() {
             Vec::new()
@@ -390,7 +421,14 @@ impl RequestRule {
 ///   *after* the rule already matched.
 ///
 /// The query is preserved verbatim: it cannot change the origin, and rewriting it
-/// would break legitimate API calls.
+/// would break legitimate API calls. It takes no part in
+/// [`PathGlob::matches`], which strips it.
+///
+/// A fragment is rejected outright. It has no meaning in an origin-form request
+/// target (RFC 9112 §3.2), and permitting one would create exactly the disagreement
+/// this function exists to prevent: `#` ends the path for a URL parser but not
+/// for a rule matcher, so `/user#/admin` could satisfy one reading while the
+/// other sees something else.
 ///
 /// # Errors
 /// A short static reason, suitable for a fixed error body. Never echoes the input.
@@ -400,6 +438,9 @@ pub fn normalize_target(raw: &str) -> Result<String, &'static str> {
     }
     if !raw.starts_with('/') {
         return Err("request target must be origin-form, beginning with '/'");
+    }
+    if raw.contains('#') {
+        return Err("request target must not contain a fragment");
     }
     if raw.starts_with("//") {
         return Err("request target must not begin with '//' (scheme-relative)");
@@ -426,6 +467,45 @@ pub fn normalize_target(raw: &str) -> Result<String, &'static str> {
         if lowered.contains(enc) {
             return Err("request target must not percent-encode '/', '\\' or '.'");
         }
+    }
+    // Every remaining percent-escape must decode to an ordinary visible byte.
+    //
+    // The explicit list above is not enough on its own, because it only catches
+    // the *first* level of encoding. `%252e%252e` contains no `%2e` — it decodes
+    // to `%2e%2e`, and a server that decodes twice then sees `..`. The same
+    // shape gets a NUL through as `%00`, which a C-based server may treat as the
+    // end of the string, and a space through as `%20`, which some frameworks
+    // trim. Each is a way to make the rule matcher and the upstream server
+    // disagree about where the path goes, which is the single failure this
+    // function exists to prevent.
+    let bytes = path.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'%' {
+            continue;
+        }
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            // Visible ASCII only, and never another '%' (a second encoding
+            // layer) — the two explicit checks above already cover / \ and .
+            Some(d) if (0x21..=0x7e).contains(&d) && d != b'%' => {}
+            Some(_) => {
+                return Err(
+                    "request target must not percent-encode a control character, a space, \
+                     or another percent sign",
+                )
+            }
+            None => return Err("request target contains a malformed percent-escape"),
+        }
+    }
+    // A path parameter (`;jsessionid=…`) is stripped by some servers before
+    // routing, so `..;` reaches the filesystem layer as `..` while the rule
+    // matcher saw a segment that was neither `.` nor `..`. Nothing an API path
+    // being scoped by method and path needs one for.
+    if path.contains(';') {
+        return Err("request target must not contain a path parameter (';')");
     }
     if path.split('/').any(|s| s == "." || s == "..") {
         return Err("request target must not contain '.' or '..' segments");
@@ -553,6 +633,23 @@ impl ResolvedCredential {
     }
 }
 
+/// The credential store's path: `$ISOPOD_HOME/credentials.json`.
+///
+/// Resolved through [`crate::paths`] like every other piece of isopod state, so
+/// a test or a CI run pointing `$ISOPOD_HOME` at a scratch directory gets its
+/// own store rather than the developer's real one.
+///
+/// # Errors
+/// If the isopod home cannot be determined.
+pub fn store_path() -> Result<PathBuf, CredError> {
+    crate::paths::isopod_home()
+        .map(|home| home.join(CREDENTIALS_FILE))
+        .map_err(|e| CredError::Unreadable {
+            path: PathBuf::from(CREDENTIALS_FILE),
+            reason: e.to_string(),
+        })
+}
+
 /// Resolve every named alias, or fail without resolving any.
 ///
 /// All-or-nothing on purpose. A partial success would let a run proceed believing
@@ -573,12 +670,25 @@ pub fn load_credentials(
     if required.is_empty() {
         return Ok(Vec::new());
     }
-    let store = read_store(store_path)?;
-    let mut out = Vec::with_capacity(required.len());
-    for alias in required {
-        out.push(resolve_one(alias, &store, caller, store_path)?);
-    }
-    Ok(out)
+    // Every exit from here is funnelled through `for_caller`, including the
+    // store-level failures. Those used to return directly, and each of them
+    // names the store's absolute path — so over MCP a model could learn the
+    // operator's home directory, and whether a store exists at all, by naming
+    // any alias at all. The operator still sees the real reason on stderr.
+    (|| {
+        let store = read_store(store_path)?;
+        let mut out = Vec::with_capacity(required.len());
+        for alias in required {
+            out.push(resolve_one(alias, &store, caller, store_path)?);
+        }
+        Ok(out)
+    })()
+    .map_err(|e: CredError| {
+        if caller == Caller::Model {
+            eprintln!("credential request refused to an MCP caller: {e}");
+        }
+        e.for_caller(caller)
+    })
 }
 
 /// Read, mode-check and parse the store.
@@ -837,6 +947,78 @@ mod tests {
     }
 
     #[test]
+    fn a_query_does_not_take_part_in_matching() {
+        // The contract the docs already stated: patterns match the path only.
+        // Before this, `/repos/*/*/issues` refused `?state=open` because the
+        // final segment was `issues?state=open` — fail-closed, but it made every
+        // paginated API call unusable and pushed operators to `readonly`.
+        let g = PathGlob::parse("/repos/*/*/issues").unwrap();
+        assert!(g.matches("/repos/me/proj/issues"));
+        assert!(g.matches("/repos/me/proj/issues?state=open&page=2"));
+        assert!(g.matches("/repos/me/proj/issues?"));
+        // A query cannot smuggle in extra path segments, because it is removed
+        // before the split rather than treated as one.
+        assert!(!g.matches("/repos/me/proj/issues/1?state=open"));
+        assert!(!g.matches("/repos/me/proj?state=open"));
+
+        // The end-to-end shape: an exact rule with a real query string.
+        let rules = RequestRule::parse("GET /user").unwrap();
+        assert!(rules[0].permits(Method::Get, &normalize_target("/user?x=1").unwrap()));
+        assert!(!rules[0].permits(Method::Get, &normalize_target("/user/keys?x=1").unwrap()));
+    }
+
+    #[test]
+    fn traversal_survives_no_amount_of_decoration() {
+        // Exact `..` equality was never enough. Each of these is a way to make
+        // the rule matcher and the upstream server read the same target
+        // differently — the one failure this function exists to prevent.
+        for bad in [
+            // Double-encoded: contains no literal "%2e", decodes to one.
+            "/a/%252e%252e/b",
+            "/a/%252E%252E/b",
+            // A path parameter some servers strip before routing, leaving "..".
+            "/a/..;/b",
+            "/a/..;jsessionid=1/b",
+            // NUL and space, which truncating or trimming servers turn into "..".
+            "/a/..%00/b",
+            "/a/..%20/b",
+            "/a/%00/b",
+            // A malformed escape is not a safe target either.
+            "/a/%zz/b",
+            "/a/%2/b",
+            "/a/%",
+        ] {
+            assert!(
+                normalize_target(bad).is_err(),
+                "{bad:?} must not normalise to a usable target"
+            );
+        }
+        // Ordinary escaped bytes in a path are still fine — this must not have
+        // become a ban on percent-encoding.
+        assert_eq!(normalize_target("/a/b%41c").unwrap(), "/a/b%41c");
+        assert_eq!(
+            normalize_target("/repos/me/a%2Bb").unwrap(),
+            "/repos/me/a%2Bb"
+        );
+        // The query is left alone: it cannot move the request, and rewriting it
+        // would break real API calls.
+        assert_eq!(
+            normalize_target("/s?q=a%20b&x=%00;drop").unwrap(),
+            "/s?q=a%20b&x=%00;drop"
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_refused_rather_than_split_on() {
+        // `#` ends the path for a URL parser but not for a rule matcher, which
+        // is precisely the disagreement `normalize_target` exists to prevent.
+        // It is also not legal in an origin-form request target.
+        assert!(normalize_target("/user#/admin").is_err());
+        assert!(normalize_target("/user?q=1#frag").is_err());
+        assert!(normalize_target("/#").is_err());
+    }
+
+    #[test]
     fn path_glob_rejects_ambiguous_patterns() {
         for bad in [
             "repos/*", "/a/**/b", "/a//b", "/a/../b", "/a/./b", "/a%2fb", "/a?x=1", "/a#f",
@@ -1030,6 +1212,52 @@ mod tests {
     }
 
     #[test]
+    fn a_model_never_learns_anything_about_the_store_itself() {
+        // The gap the earlier version left: only `Unavailable` was collapsed, so
+        // "no store here", "your store is world-readable" and "your store is
+        // version 2" all reached the caller **with the store's absolute path**.
+        // A poisoned context could name any alias and read back the operator's
+        // home directory, and learn whether a credential store exists at all.
+        std::env::set_var("ISOPOD_TEST_TOK", "tok");
+        // A directory each: `write_store` always writes `credentials.json`, so
+        // sharing one would leave every path pointing at whichever store was
+        // written last.
+        let (d1, d2, d3) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let absent = Path::new("/nonexistent/isopod/credentials.json");
+        let permissive = write_store(d1.path(), GOOD, 0o644);
+        let wrong_version = write_store(
+            d2.path(),
+            &GOOD.replace("\"version\": 1", "\"version\": 9"),
+            0o600,
+        );
+        let good = write_store(d3.path(), GOOD, 0o600);
+
+        let opaque = CredError::UnavailableOpaque.to_string();
+        for (what, path) in [
+            ("absent store", absent),
+            ("permissive store", permissive.as_path()),
+            ("unknown version", wrong_version.as_path()),
+        ] {
+            let err = load_credentials(&["github".into()], Caller::Model, path).unwrap_err();
+            assert_eq!(err.to_string(), opaque, "{what} must be indistinguishable");
+            assert!(!err.to_string().contains("isopod"), "{what}: {err}");
+            assert!(!err.to_string().contains('/'), "no path may leak: {err}");
+        }
+        // And a refusal of an alias that is simply not opted in reads the same.
+        let denied = load_credentials(&["deploykey".into()], Caller::Model, &good).unwrap_err();
+        assert_eq!(denied.to_string(), opaque);
+
+        // The operator still gets every one of those specifically.
+        let err = load_credentials(&["github".into()], Caller::Operator, &permissive).unwrap_err();
+        assert!(matches!(err, CredError::BadMode { .. }), "{err}");
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+    }
+
+    #[test]
     fn resolution_is_all_or_nothing() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("ISOPOD_TEST_TOK", "tok");
@@ -1067,7 +1295,9 @@ mod tests {
         let p = write_store(dir.path(), &body, 0o600);
         let creds = load_credentials(&["x".into()], Caller::Operator, &p).unwrap();
         // The newline would otherwise split the header the broker builds.
-        assert_eq!(creds[0].secret().expose(), "ghp_abc123");
+        // Compared by value rather than through `expose`, so this test does not
+        // become a second sanctioned call site (see `secret::tests`).
+        assert_eq!(*creds[0].secret(), Secret::new("ghp_abc123".into()));
     }
 
     #[test]

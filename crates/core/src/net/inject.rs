@@ -152,16 +152,7 @@ impl InjectRefusal {
     /// The complete HTTP response to write back.
     #[must_use]
     pub fn response(self) -> String {
-        let body = format!("isopod credential endpoint: {}\n", self.explain());
-        format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            self.status(),
-            reason_phrase(self.status()),
-            body.len()
-        )
+        fixed_response(self.status(), self.explain())
     }
 }
 
@@ -173,9 +164,230 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
+        504 => "Gateway Timeout",
         _ => "Error",
     }
 }
+
+/// Build a complete, fixed HTTP response carrying `message`.
+///
+/// Every caller passes a `&'static str`, so no guest or upstream bytes can reach
+/// this body.
+fn fixed_response(status: u16, message: &'static str) -> String {
+    let body = format!("isopod credential endpoint: {message}\n");
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\r\n{body}",
+        reason = reason_phrase(status),
+        len = body.len(),
+    )
+}
+
+/// Why an **authorised** request produced no response.
+///
+/// Deliberately a separate type from [`InjectRefusal`]. A refusal means the
+/// guest asked for something it may not have; this means it asked for something
+/// it may have and the far side did not deliver. Conflating them would make the
+/// flight recorder unable to answer the first question an operator asks when a
+/// credentialled call fails: "was that my allow list, or was the API down?"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamFailure {
+    /// DNS, TCP, or TLS to the pinned host failed.
+    Unreachable,
+    /// The pinned host did not answer within the budget.
+    TimedOut,
+    /// The response exceeded [`MAX_INJECT_RESP`] and was cut off mid-body.
+    TooLarge,
+}
+
+impl UpstreamFailure {
+    /// The HTTP status to answer with.
+    #[must_use]
+    pub fn status(self) -> u16 {
+        match self {
+            Self::Unreachable | Self::TooLarge => 502,
+            Self::TimedOut => 504,
+        }
+    }
+
+    /// A fixed explanation. Static by construction: no upstream bytes.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::Unreachable => {
+                "the credential's pinned host could not be reached over TLS from the host"
+            }
+            Self::TimedOut => "the credential's pinned host did not answer in time",
+            Self::TooLarge => "the response exceeded the endpoint's size ceiling",
+        }
+    }
+
+    /// A short machine-readable tag for the flight recorder.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Unreachable => "inject-upstream-unreachable",
+            Self::TimedOut => "inject-upstream-timeout",
+            Self::TooLarge => "inject-response-too-large",
+        }
+    }
+
+    /// The complete HTTP response to write back.
+    #[must_use]
+    pub fn response(self) -> String {
+        fixed_response(self.status(), self.explain())
+    }
+}
+
+impl fmt::Display for UpstreamFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.explain())
+    }
+}
+
+// ===========================================================================
+// The response leg.
+// ===========================================================================
+
+/// Response headers the endpoint never relays.
+///
+/// This is a **denylist**, and the asymmetry with [`FORWARDABLE`] is deliberate
+/// rather than an inconsistency. On the way up, a permitted header lets the
+/// guest steer what the credential signs, so the next header to be invented must
+/// default to *dropped*. On the way down there is no such lever: the response
+/// comes from the host the operator pinned, to a guest that is already untrusted,
+/// and relaying one more of its headers grants the guest nothing. The only real
+/// hazard is the broker's own re-framing — so exactly the headers that describe
+/// the old framing or the old hop are removed, and everything else (`Link` for
+/// pagination, `ETag`, the rate-limit family) survives, which is what makes the
+/// endpoint usable for real API work.
+const RESPONSE_HEADER_DENY: [&str; 9] = [
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Largest number of response headers relayed to the guest.
+const MAX_RESPONSE_HEADERS: usize = 64;
+
+/// Whether a response header may be relayed, given an already-lower-cased name.
+///
+/// A value carrying anything outside a legal field-value is dropped rather than
+/// escaped: the broker writes the response head itself, and a CR in a relayed
+/// value would split it — response splitting sourced from upstream instead of
+/// from the guest.
+#[must_use]
+pub fn relayable_header(lname: &str, value: &str) -> bool {
+    !RESPONSE_HEADER_DENY.contains(&lname)
+        && !lname.is_empty()
+        && lname
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        && value.len() <= MAX_HEADER_VALUE
+        && value
+            .bytes()
+            .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+}
+
+/// Keep the relayable headers, in upstream order, bounded in count.
+#[must_use]
+pub fn relay_headers<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .filter(|(n, v)| relayable_header(&n.to_ascii_lowercase(), v))
+        .take(MAX_RESPONSE_HEADERS)
+        .map(|(n, v)| (n.to_ascii_lowercase(), v.to_string()))
+        .collect()
+}
+
+/// Build the response head the guest receives for a successful upstream call.
+///
+/// The body is framed **chunked**, always, and never with a `Content-Length`:
+///
+/// - The body is streamed, because a credentialled call may legitimately return
+///   megabytes and buffering [`MAX_INJECT_RESP`] per concurrent connection would
+///   put the host's memory under guest control.
+/// - Chunked rather than close-delimited, because the terminating chunk is what
+///   distinguishes a complete response from one the broker cut off at the
+///   ceiling. Handing a workload half a JSON document with no signal is worse
+///   than handing it a protocol error.
+/// - Never both framings at once — which is exactly what the endpoint refuses
+///   *from* the guest ([`InjectRefusal::BadBody`]), so emitting both here would
+///   be holding itself to a lower standard than its callers.
+#[must_use]
+pub fn build_response_head(status: u16, headers: &[(String, String)]) -> String {
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\n",
+        reason = upstream_reason_phrase(status),
+    );
+    for (name, value) in headers {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push_str("\r\n");
+    }
+    out.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    out
+}
+
+/// A reason phrase for an upstream status.
+///
+/// Deliberately not relayed from upstream: the phrase is free-form bytes chosen
+/// by the far side, and it lands on the guest's first response line where a
+/// stray CR would split the head. The numeric status carries all the meaning; a
+/// generic phrase for an unrecognised code costs nothing.
+fn upstream_reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        s if (200..300).contains(&s) => "OK",
+        s if (300..400).contains(&s) => "Redirection",
+        s if (400..500).contains(&s) => "Client Error",
+        _ => "Server Error",
+    }
+}
+
+/// Frame one body chunk for the chunked response.
+#[must_use]
+pub fn chunk_frame(bytes: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:x}\r\n", bytes.len()).into_bytes();
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The terminating chunk. Written only when the body completed, so a response
+/// cut off at [`MAX_INJECT_RESP`] is detectable as a protocol error rather than
+/// arriving as a silently short document.
+pub const CHUNK_TERMINATOR: &[u8] = b"0\r\n\r\n";
 
 impl fmt::Display for InjectRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -533,7 +745,12 @@ mod tests {
         let (req, cred) = authorize(&creds, &get).unwrap();
         assert_eq!(req.url, "https://api.github.com/user");
         assert_eq!(req.method, Method::Get);
-        assert_eq!(cred.secret().expose(), "ghp_testtoken");
+        // By value, not through `expose`: the set of modules that may unwrap a
+        // secret is asserted in `secret::tests`, and a test is not one of them.
+        assert_eq!(
+            *cred.secret(),
+            crate::net::secret::Secret::new("ghp_testtoken".into())
+        );
 
         // The attack the allow list exists to stop: planting a key that
         // outlives the VM.
@@ -647,6 +864,105 @@ mod tests {
         assert_eq!(InjectRefusal::NotPermitted.status(), 403);
         assert_eq!(InjectRefusal::UnknownAlias.status(), 403);
         assert_eq!(InjectRefusal::BadMethod.status(), 405);
+    }
+
+    // --- the response leg --------------------------------------------------
+
+    #[test]
+    fn response_headers_drop_framing_and_hop_but_keep_what_apis_need() {
+        let relayed = relay_headers([
+            ("Content-Type", "application/json"),
+            (
+                "Link",
+                "<https://api.github.com/user/repos?page=2>; rel=\"next\"",
+            ),
+            ("ETag", "W/\"abc\""),
+            ("X-RateLimit-Remaining", "4999"),
+            // Framing: the broker re-frames, so these must not survive.
+            ("Content-Length", "1234"),
+            ("Transfer-Encoding", "chunked"),
+            ("Connection", "keep-alive"),
+            ("Upgrade", "h2c"),
+        ]);
+        let names: Vec<&str> = relayed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["content-type", "link", "etag", "x-ratelimit-remaining"]
+        );
+    }
+
+    #[test]
+    fn a_response_header_cannot_split_the_head_the_broker_writes() {
+        // Response splitting sourced from upstream rather than from the guest:
+        // a CR in a relayed value would end the head early and let the far side
+        // dictate the rest of what the workload parses.
+        assert!(!relayable_header("x-evil", "a\r\nX-Injected: 1"));
+        assert!(!relayable_header("x-evil", "a\nb"));
+        assert!(!relayable_header(
+            "x-evil",
+            &"v".repeat(MAX_HEADER_VALUE + 1)
+        ));
+        assert!(!relayable_header("x evil", "fine"));
+        assert!(!relayable_header("", "fine"));
+        // And the filter is what keeps them out of the built head.
+        let relayed = relay_headers([("X-Evil", "a\r\nX-Injected: 1")]);
+        assert!(relayed.is_empty());
+    }
+
+    #[test]
+    fn the_built_head_frames_chunked_and_never_also_declares_a_length() {
+        let head = build_response_head(200, &[("content-type".into(), "application/json".into())]);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(
+            head.contains("content-type: application/json\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"), "{head}");
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        assert!(head.ends_with("\r\n\r\n"));
+        // Two framings in play is exactly what the endpoint refuses FROM the
+        // guest; it must not emit them itself.
+        assert!(
+            !head.to_ascii_lowercase().contains("content-length"),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn the_upstream_status_is_relayed_but_never_its_reason_phrase() {
+        // The phrase is free-form bytes from the far side, landing on the first
+        // line of what the workload parses. The number carries the meaning.
+        assert!(build_response_head(404, &[]).starts_with("HTTP/1.1 404 Not Found"));
+        assert!(build_response_head(418, &[]).starts_with("HTTP/1.1 418 Client Error"));
+        assert!(build_response_head(599, &[]).starts_with("HTTP/1.1 599 Server Error"));
+    }
+
+    #[test]
+    fn chunk_framing_round_trips_and_terminates() {
+        assert_eq!(chunk_frame(b"hello"), b"5\r\nhello\r\n".to_vec());
+        assert_eq!(chunk_frame(&[0u8; 256])[..4], *b"100\r");
+        assert_eq!(CHUNK_TERMINATOR, b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn an_upstream_failure_is_distinguishable_from_a_refusal() {
+        // "Was that my allow list, or was the API down?" — the first question an
+        // operator asks. The two axes must never collapse into one status.
+        for f in [
+            UpstreamFailure::Unreachable,
+            UpstreamFailure::TimedOut,
+            UpstreamFailure::TooLarge,
+        ] {
+            let resp = f.response();
+            assert!(resp.starts_with("HTTP/1.1 5"), "{resp}");
+            assert!(resp.contains("Content-Length:"), "{resp}");
+            assert!(f.tag().starts_with("inject-"));
+        }
+        assert_eq!(UpstreamFailure::TimedOut.status(), 504);
+        assert_ne!(
+            UpstreamFailure::Unreachable.status(),
+            InjectRefusal::NotPermitted.status()
+        );
     }
 
     #[test]

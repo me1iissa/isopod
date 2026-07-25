@@ -111,6 +111,34 @@ Pass `allow_hosts=[]` to deny everything while still recording every attempt —
 the result's `egress` field then shows exactly what the code tried to contact,
 which is how you find out whether a dependency phones home.
 
+## Credentials the sandbox can spend but never holds
+
+When the workload needs an API token, `inject` names an **alias** the operator
+declared on the host. You cannot name a secret, a host, or a permission from
+here — all of that lives in the operator's `~/.isopod/credentials.json`.
+
+```
+sandbox_run(cmd="curl -sS $ISOPOD_CREDENTIAL_ENDPOINT/github/user",
+            inject=["github"])
+```
+
+The sandbox calls `$ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>` and the host
+attaches the token — but only for the exact methods and paths the operator
+allowed, and only to the one host they pinned. A request outside that is
+refused before any token is attached.
+
+Practical notes:
+
+- Only aliases the operator marked `"mcp": true` are available to you. Every
+  refusal reads identically, so **do not try other names to see what exists** —
+  it will not tell you anything, and the operator sees the attempt.
+- The pinned host is *not* reachable directly. A denial with
+  `reason: "pinned_credential_host"` means "use the endpoint", not "ask for a
+  wider allowlist".
+- `inject` also switches the run to default-deny egress, so combine it with
+  `allow_hosts` if the workload needs other destinations too.
+- The result's `egress.injected` lists exactly what the run was granted.
+
 ## Big inputs and parallelism
 
 - `stdin` is for small text. For anything beyond a few KiB (tarballs, datasets,
@@ -156,6 +184,7 @@ auto-pruned**:
 | Untrusted input | `sandbox_run(cmd=..., network=false)` |
 | Untrusted input that needs one host | `sandbox_run(cmd=..., allow_hosts=["pypi.org"])` |
 | See what a dependency contacts | `sandbox_run(cmd=..., allow_hosts=[])`, then read `egress` |
+| Needs an API token | `sandbox_run(cmd=..., inject=["github"])`, call `$ISOPOD_CREDENTIAL_ENDPOINT/github/...` |
 | Minimal image, no toolchain | `sandbox_run(cmd=..., stage="base", base="base-sqfs")` |
 | See what's stored | `stage_list()`, `vm_list()` |
 | Clean up | `vm_gc()`, `stage_rm(reference=...)` |

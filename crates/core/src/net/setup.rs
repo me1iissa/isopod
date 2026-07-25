@@ -46,8 +46,7 @@ use serde::Serialize;
 
 use super::{
     guest_ip, host_cidr, host_ip, net_dir, tap_name, write_manifest_in, Manifest, BROKER_DNS_PORT,
-    BROKER_HTTP_PORT, BROKER_SOCKS_PORT, DEFAULT_FILTERED_SLOTS, DEFAULT_SLOT_COUNT,
-    MAX_SLOT_COUNT, SLOT_SUPERNET,
+    BROKER_TCP_PORTS, DEFAULT_FILTERED_SLOTS, DEFAULT_SLOT_COUNT, MAX_SLOT_COUNT, SLOT_SUPERNET,
 };
 
 /// The single nftables table isopod owns.
@@ -173,7 +172,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         run_tolerating(
             "ip",
             &["addr", "add", &host_cidr(i), "dev", &tap],
-            "File exists",
+            &ADDR_EXISTS,
         )?;
         run_cmd("ip", &["link", "set", &tap, "up"])?;
     }
@@ -234,16 +233,12 @@ fn teardown() -> Result<SetupReport> {
         .unwrap_or_default();
 
     // nftables table (tolerate absence — a partial or repeated teardown).
-    run_tolerating(
-        "nft",
-        &["delete", "table", "inet", "isopod"],
-        "No such file",
-    )?;
+    run_tolerating("nft", &["delete", "table", "inet", "isopod"], &ALREADY_GONE)?;
 
     // Every isopod tap in the root netns.
     let mut taps_removed = Vec::new();
     for tap in list_isopod_taps()? {
-        run_tolerating("ip", &["link", "del", &tap], "Cannot find")?;
+        run_tolerating("ip", &["link", "del", &tap], &ALREADY_GONE)?;
         taps_removed.push(tap);
     }
 
@@ -312,10 +307,13 @@ fn teardown() -> Result<SetupReport> {
 /// - **prerouting**: `udp/tcp dport 53 redirect to :<BROKER_DNS_PORT>` — the
 ///   guest keeps addressing its gateway on `:53` while the unprivileged broker
 ///   binds a port it is allowed to bind.
-/// - **input**: an accept for the three broker ports, ahead of the existing
-///   generic `ct state new drop`. Pinned on `iifname` (a root guest cannot
-///   change which tap its packets arrive on), on the exact gateway address, and
-///   on the exact ports — the narrowest hole that makes the broker reachable.
+/// - **input**: an accept for [`BROKER_TCP_PORTS`] (plus the UDP DNS port),
+///   ahead of the existing generic `ct state new drop`. Pinned on `iifname` (a
+///   root guest cannot change which tap its packets arrive on), on the exact
+///   gateway address, and on the exact ports — the narrowest hole that makes the
+///   broker reachable. The set is rendered from the constant, and the same
+///   constant is recorded in the manifest, so the runtime can tell a host
+///   provisioned before a port existed from one provisioned after it.
 ///
 /// > The input rule matches the **post-DNAT** DNS port
 /// > ([`BROKER_DNS_PORT`], 5353), not 53: the input hook runs after nat
@@ -354,6 +352,14 @@ pub fn build_nft_ruleset(
     let mut filtered_forward = String::new();
     let mut filtered_prerouting = String::new();
     let mut filtered_input = String::new();
+    // Rendered from the constant, never spelled out twice: the runtime decides
+    // whether a listener is reachable by comparing against the same list, and a
+    // ruleset that disagreed with it would be undetectable.
+    let tcp_ports = BROKER_TCP_PORTS
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     for i in filtered_from..slots {
         filtered_forward.push_str(&format!("\t\tiifname \"isopod-tap{i}\" drop\n"));
         filtered_prerouting.push_str(&format!(
@@ -364,7 +370,7 @@ pub fn build_nft_ruleset(
         // the post-DNAT port. Writing 53 here blackholes every query silently.
         filtered_input.push_str(&format!(
             "\t\tiifname \"isopod-tap{i}\" ip daddr {gip} tcp dport \
-             {{ {BROKER_SOCKS_PORT}, {BROKER_HTTP_PORT}, {BROKER_DNS_PORT} }} accept\n\
+             {{ {tcp_ports} }} accept\n\
              \t\tiifname \"isopod-tap{i}\" ip daddr {gip} udp dport {BROKER_DNS_PORT} accept\n",
             gip = host_ip(i),
         ));
@@ -669,9 +675,23 @@ fn run_cmd(bin: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run a command, but treat a failure whose stderr contains `tolerate` as
-/// success (idempotent re-runs: "File exists", "No such file", "Cannot find").
-fn run_tolerating(bin: &str, args: &[&str], tolerate: &str) -> Result<()> {
+/// Stderr fragments that mean "already in the state we were converging toward".
+///
+/// `ip addr add` reports an address that is already present in **two** different
+/// ways depending on the iproute2/kernel version — `File exists` (the raw
+/// `EEXIST`) and `Error: ipv4: Address already assigned.` (the newer
+/// extended-ack message). Matching only the first made `isopod setup` fail on a
+/// re-run on any host with the newer message, which is to say: the documented
+/// idempotency did not hold, and the re-provisioning command printed by
+/// [`super::require_credential_endpoint`] would fail for exactly the people who
+/// need to run it — those with an already-provisioned host.
+const ADDR_EXISTS: [&str; 2] = ["File exists", "Address already assigned"];
+/// The same, for deletions that have already happened.
+const ALREADY_GONE: [&str; 3] = ["No such file", "Cannot find", "does not exist"];
+
+/// Run a command, treating a failure whose stderr contains any of `tolerate` as
+/// success — the idempotent-re-run path.
+fn run_tolerating(bin: &str, args: &[&str], tolerate: &[&str]) -> Result<()> {
     let out = Command::new(bin)
         .args(args)
         .output()
@@ -680,7 +700,7 @@ fn run_tolerating(bin: &str, args: &[&str], tolerate: &str) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains(tolerate) {
+    if tolerate.iter().any(|t| stderr.contains(t)) {
         eprintln!(
             "setup: tolerating expected condition from `{bin} {}`: {}",
             args.join(" "),
@@ -858,9 +878,11 @@ mod tests {
         let rs = build_nft_ruleset("eth0", 12, false, 8);
         for i in 8..12 {
             // Pinned on all three axes: arrival tap, exact gateway, exact ports.
+            // 3129 is the credential endpoint (0.10.0); a host provisioned
+            // without it is caught by `net::require_credential_endpoint`.
             assert!(rs.contains(&format!(
                 "iifname \"isopod-tap{i}\" ip daddr 10.107.{i}.1 tcp dport \
-                 {{ 1080, 3128, 5353 }} accept"
+                 {{ 1080, 3128, 3129, 5353 }} accept"
             )));
             assert!(rs.contains(&format!(
                 "iifname \"isopod-tap{i}\" ip daddr 10.107.{i}.1 udp dport 5353 accept"
@@ -874,11 +896,34 @@ mod tests {
             "input must match the post-DNAT port, never 53"
         );
         // The generic guest->host drop stays, and stays last.
-        let accept_at = rs.find("tcp dport { 1080, 3128, 5353 } accept").unwrap();
+        let accept_at = rs
+            .find("tcp dport { 1080, 3128, 3129, 5353 } accept")
+            .unwrap();
         let drop_at = rs
             .find("iifname \"isopod-tap*\" ct state new drop")
             .unwrap();
         assert!(accept_at < drop_at, "broker accept must precede the drop");
+    }
+
+    #[test]
+    fn the_ruleset_opens_exactly_the_ports_the_manifest_records() {
+        // The drift this closes: a listener added to the broker but not to the
+        // provisioning would bind host-side and be unreachable from the guest,
+        // presenting as a hang. Both sides read BROKER_TCP_PORTS, and the
+        // manifest records it, so the runtime can detect a stale host.
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        let manifest = Manifest::new(12, "eth0".into(), 1, false, 8);
+        let rendered = manifest
+            .broker_tcp_ports()
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            rs.contains(&format!("tcp dport {{ {rendered} }} accept")),
+            "the ruleset must open exactly the ports the manifest claims"
+        );
+        assert!(manifest.supports_credential_endpoint());
     }
 
     #[test]
@@ -907,6 +952,33 @@ mod tests {
         // The anti-spoof and isolation rules are unaffected by the mode.
         assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
         assert!(rs.contains("iifname \"isopod-tap*\" oifname \"isopod-tap*\" drop"));
+    }
+
+    #[test]
+    fn both_spellings_of_an_already_assigned_address_are_tolerated() {
+        // Found by re-provisioning a real host: `ip addr add` reports an address
+        // that is already present as either the raw EEXIST ("File exists") or
+        // the newer extended-ack message. Matching only the first meant
+        // `isopod setup` failed on a re-run — so the documented idempotency did
+        // not hold, and the re-provisioning command that
+        // `net::require_credential_endpoint` prints would fail for precisely the
+        // people it is printed to.
+        let observed = "Error: ipv4: Address already assigned.";
+        assert!(
+            ADDR_EXISTS.iter().any(|t| observed.contains(t)),
+            "iproute2's extended-ack message must be tolerated"
+        );
+        assert!(ADDR_EXISTS.iter().any(|t| "File exists".contains(t)));
+        // A genuine failure must still be a failure.
+        for real in [
+            "Error: Nexthop has invalid gateway.",
+            "RTNETLINK answers: Operation not permitted",
+        ] {
+            assert!(
+                !ADDR_EXISTS.iter().any(|t| real.contains(t)),
+                "{real:?} must not be swallowed"
+            );
+        }
     }
 
     #[test]

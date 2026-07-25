@@ -117,7 +117,7 @@ isopod v1 is honest about its posture. State these before running anything genui
 
 A run started with `--allow-host` / `--allow-cidr` / `--deny-egress` (or MCP `allow_hosts` / `allow_cidrs`) claims a **filtered** network slot instead of a public one. Two controls apply, both on the host, outside the guest boundary:
 
-1. **The packet filter.** `sudo isopod setup` bakes `iifname "isopod-tap<i>" drop` into the forward chain for every filtered slot — all forwarding, not just to the WAN. The only rule that lets anything in from a filtered tap is a narrow input `accept` for three ports on that slot's own gateway, pinned on arrival interface, destination address, and port. This is set once, as root, at provisioning time; the unprivileged runtime never edits nftables.
+1. **The packet filter.** `sudo isopod setup` bakes `iifname "isopod-tap<i>" drop` into the forward chain for every filtered slot — all forwarding, not just to the WAN. The only rule that lets anything in from a filtered tap is a narrow input `accept` for the broker's own ports on that slot's own gateway, pinned on arrival interface, destination address, and port. This is set once, as root, at provisioning time; the unprivileged runtime never edits nftables — so a port a given host was not provisioned with is unreachable, and a run that needs one fails closed with the re-provisioning command rather than hanging.
 2. **The egress broker.** A host-side SOCKS5 / HTTP-proxy / DNS responder on the slot gateway, running as tokio tasks inside the VM supervisor process. It resolves and dials on the guest's behalf, only for destinations on the run's allowlist, and records every decision.
 
 ### What holds
@@ -135,7 +135,29 @@ A run started with `--allow-host` / `--allow-cidr` / `--deny-egress` (or MCP `al
 - **A tunnel to a shared address is a tunnel to that address.** Allowlisting one name on a CDN gives a TCP path to an IP that may serve many origins, and the guest chooses the SNI it sends. Name-level enforcement without interception cannot separate them.
 - **Ignoring the proxy environment is not a bypass — it is a self-inflicted outage.** The packet filter drops the traffic either way. But a tool that reads neither `*_PROXY` nor `getaddrinfo` will report a confusing network error rather than a policy denial. This is a compatibility caveat, not a security one.
 - **Wildcards do not cover the apex.** `*.example.com` matches `files.example.com` and neither `example.com` nor `a.b.example.com`. List both if you want both.
-- **Credential injection is not in this release.** Secrets still must not be baked into a shared stage — see the operator guidance below.
+
+---
+
+## Injected credentials — spent by the run, never held by it
+
+A run started with `--inject <alias>` (or MCP `inject`) can authorise specific requests against one host without ever receiving the token. The alias, the secret's source, the single permitted host, and the exact set of permitted requests are all declared host-side in `~/.isopod/credentials.json` (mode `0600`); the run names only the alias. A fourth broker listener on the slot gateway (port 3129) accepts a *stated intent* and **constructs a new request from its own parts** — it is not a reverse proxy, and guest bytes never reach the wire. Full design: [docs/credentials.md](docs/credentials.md).
+
+### What holds
+
+- **The token never enters the guest**, the stage store, the exec environment, or a model's context. It lives in the supervisor process and is attached to a request the host builds.
+- **The guest cannot choose what the credential signs** beyond the credential's `allow` list. That list is mandatory and has no default — a credential without one fails to load — because a credential scoped only by host means "anything this token can do to that API", including planting a key that outlives the VM.
+- **The request cannot be relocated off its pinned origin.** The scheme is always `https` and the authority is always the declared host; neither is derived from anything the guest sent. Scheme-relative, absolute-form, backslash, dot-segment and percent-encoded-separator targets are all rejected before a rule is matched.
+- **Redirects are not followed.** A `30x` is relayed to the guest as a `30x`. Chasing one would carry the `Authorization` header to a host the operator never named, chosen by a party who is not the operator.
+- **A credential does not come with a network.** Naming one switches the run to a filtered slot; it never lands on a public slot with unfiltered NAT egress.
+- **Refusals do not enumerate your credential names.** Over MCP, "no such alias", "not opted in for model callers", and "the source did not resolve" render identically. The specific reason goes to the host's stderr.
+
+### What is explicitly **not** claimed
+
+- **A credential is not a capability boundary between processes in one run.** Every process in the guest can reach the endpoint — it is a TCP port on the gateway, and an unguessable path would be theatre, since anything that can read the exec environment can read the URL. **Scope the `allow` list as though hostile code will use it.** If you need process-level separation, use two runs.
+- **Allowlisting a read is not confidentiality.** What the pinned host returns is relayed to the run as-is. A `readonly` credential still lets everything in that run see everything that read returns.
+- **The endpoint does not inspect payloads.** A permitted `POST` may carry whatever body the run chooses, within the size ceiling. Scope by method and path; that is the whole of the mechanism.
+- **A rule scopes the method and the path, not the query string.** Everything after the first `?` is chosen by the run and passed to the upstream verbatim. For the overwhelming majority of APIs that is exactly right — a query filters or paginates a resource the rule already named — but if an API dispatches *operations* through its query string, a path-shaped rule will not separate them. Scope such a credential by giving it its own alias with the narrowest path you can, and treat the query as part of what you are trusting the run with.
+- **The token is not protected against a host-local attacker.** `Secret` prevents accidental logging and serialization by construction, but it is not zeroized on drop and offers nothing against something that can read this process's memory. That is the same single-user, single-tenant assumption stated above.
 
 ---
 

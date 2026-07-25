@@ -399,6 +399,13 @@ pub enum DenyReason {
     NotAllowed,
     /// The guest supplied a name that is not a well-formed host name.
     Malformed,
+    /// The destination is the pinned host of a credential injected into this
+    /// run, and a credential is spent through the endpoint, not by dialling its
+    /// host directly.
+    PinnedCredentialHost,
+    /// The credential endpoint refused the request. The accompanying `note`
+    /// carries which of its checks failed.
+    CredentialRefused,
 }
 
 impl DenyReason {
@@ -412,6 +419,20 @@ impl DenyReason {
             }
             Self::NotAllowed => "the destination is not on this run's allowlist",
             Self::Malformed => "the requested host name is not a well-formed host name",
+            // The single most likely confusion for anyone using --inject for the
+            // first time, so the refusal has to carry the whole answer: this is
+            // not a missing allow rule, and adding one is the wrong fix.
+            Self::PinnedCredentialHost => {
+                "this destination is the pinned host of a credential injected into this run. \
+                 A credential is spent through the endpoint at $ISOPOD_CREDENTIAL_ENDPOINT \
+                 (GET $ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>), which attaches the token \
+                 host-side; connecting to the host directly is refused so that the token can \
+                 never be sent by anything but the broker"
+            }
+            Self::CredentialRefused => {
+                "the credential endpoint refused this request; the event's \"note\" says \
+                 which check failed"
+            }
         }
     }
 }

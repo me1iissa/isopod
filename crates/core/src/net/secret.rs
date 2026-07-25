@@ -166,4 +166,75 @@ mod tests {
         let s = Secret::new("ghp_abc ".into());
         assert_eq!(s.expose(), "ghp_abc ");
     }
+
+    /// Files permitted to unwrap a [`Secret`], relative to the workspace root.
+    ///
+    /// `secret.rs` defines it; `broker.rs` writes the one `Authorization` header
+    /// isopod ever produces. Nothing else has a reason, and a new entry here is
+    /// the review prompt: *why does this code need the value rather than the
+    /// type?*
+    const EXPOSE_CALL_SITES: [&str; 2] = [
+        "crates/core/src/net/secret.rs",
+        "crates/core/src/net/broker.rs",
+    ];
+
+    #[test]
+    fn expose_is_called_only_where_a_credential_reaches_the_wire() {
+        // The module docs claim this is enforced rather than merely intended.
+        // Enforce it: walk the source and fail on any call site outside the
+        // list. A leak does not begin as a leak — it begins as one
+        // reasonable-looking `.expose()` in a logging or serialization path.
+        //
+        // The whole workspace, not just this crate: `ResolvedCredential::secret`
+        // and `Broker::credentials` are both `pub`, so the CLI and the MCP
+        // server can reach a `Secret` too, and a guard that stopped at the crate
+        // boundary would be enforcing the invariant precisely where it is
+        // easiest to keep and ignoring it where a value is rendered for output.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        // Both spellings of the same call, so `Secret::expose(&s)` is not a way
+        // around a guard written only for method position.
+        let calls = [".expose()", "Secret::expose"];
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("reading the workspace source") {
+                let path = entry.expect("source entry").path();
+                if path.is_dir() {
+                    // `target/` under a crate dir is build output, not source.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("reading a source file");
+                if !calls.iter().any(|c| body.contains(c)) {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("under the workspace root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !EXPOSE_CALL_SITES.contains(&rel.as_str()) {
+                    offenders.push(rel);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Secret::expose() is called outside the sanctioned call sites \
+             ({EXPOSE_CALL_SITES:?}): {offenders:?}. If the new site genuinely \
+             puts a credential on a wire, add it to EXPOSE_CALL_SITES and say \
+             why in review; otherwise pass the `Secret` itself."
+        );
+    }
 }

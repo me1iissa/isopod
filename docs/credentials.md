@@ -1,12 +1,5 @@
 # Credentials
 
-> **Status: the enforcement core has landed; the wiring has not.** The types,
-> the credential store, and every policy decision below are implemented and
-> tested on `main`. The listener, the upstream TLS leg, and the `--inject` flag
-> arrive in **0.10.0**. Nothing on this page is reachable from a run yet — it is
-> published now because the design is settled and the security argument is the
-> part worth reviewing early.
-
 A sandboxed workload often needs exactly one credential — a package registry
 token, one API key — and giving it the token means giving *all* the code in that
 run the ability to spend it however it likes.
@@ -117,6 +110,92 @@ the file.
 
 Presets keep the ordinary case to one word while still requiring you to say it.
 
+A rule matches the **path only**. A query string rides along to the upstream
+untouched and takes no part in matching, so `GET /repos/*/*/issues` covers
+`/repos/me/proj/issues?state=open&page=2`. A query cannot move a request to a
+different endpoint, and matching against one would push you toward `readonly`
+just to make pagination work.
+
+---
+
+## Using it
+
+Name the alias. That is the entire run-side surface — there is deliberately no
+way to say *which secret* or *which host* at call time.
+
+```bash
+isopod run --inject github -- \
+  sh -c 'curl -sS "$ISOPOD_CREDENTIAL_ENDPOINT/github/user"'
+```
+
+```jsonc
+// MCP
+sandbox_run({ cmd: "...", inject: ["github"] })
+```
+
+Inside the guest, `$ISOPOD_CREDENTIAL_ENDPOINT` is set **only when this run has
+a credential**, so a script can test for it rather than guessing. The path is
+`/<alias>/<path>`; everything after the alias is the request the credential will
+authorise, if the `allow` list permits it.
+
+`--inject` also switches the run to **filtered egress**, exactly as
+`--allow-host` does. That is not a convenience — a credential arriving on a
+public slot would have full NAT egress and no broker enforcing its `allow` list,
+which is the one combination this feature must never produce.
+
+### "Why can't my tool reach api.github.com?"
+
+Because the pinned host is deliberately **not** added to the allowlist. A direct
+connection to it is refused with its own reason, `pinned_credential_host`, rather
+than a generic denial — the answer is not "widen the allow list", it is "go
+through the endpoint", and adding an `--allow-host` rule would hand the guest a
+path to that host that bypasses the credential's scoping entirely.
+
+Pass `--allow-host api.github.com` as well if you genuinely want both, and the
+widening is then explicit and visible in the run report.
+
+### The endpoint port must be provisioned
+
+The endpoint listens on **3129** on the slot gateway, and that hole is baked into
+nftables once, as root. A host provisioned before 0.10.0 has no such rule, and
+the unprivileged runtime cannot add one:
+
+```
+$ isopod run --inject github -- /bin/true
+error: this host was provisioned before credential injection: its nftables
+ruleset opens only port(s) 1080, 3128, 5353 on a filtered slot's gateway, so a
+guest cannot reach the credential endpoint on 3129. Re-provision with
+`sudo isopod setup --slots 12 --filtered-slots 4` (taps and in-flight runs are
+unaffected), or drop --inject.
+```
+
+The run fails **before any VM boots**. `slots.json` records the port set each
+provisioning opened, so this is detected rather than assumed — the alternative
+is a guest hanging against a listener it can never address.
+
+### What you get back
+
+`RunReport.egress` names every credential the run held and exactly what each
+could do, alongside the usual flight recorder:
+
+```jsonc
+"egress": {
+  "injected": [
+    { "alias": "github", "host": "api.github.com", "allow": ["GET|HEAD /**"] }
+  ],
+  "credential_endpoint": "http://10.107.8.1:3129",
+  "allowed": [{ "host": "api.github.com", "port": 443, "bytes_down": 2371, … }],
+  "denied":  [{ "host": "api.github.com", "reason": "not_allowed",
+                "note": "inject-not-permitted", … }]
+}
+```
+
+The `note` is the machine-readable reason a specific call was refused —
+`inject-not-permitted` (the credential exists but does not authorise that method
+and path) reads very differently from `inject-upstream-unreachable` (the API was
+down), and collapsing the two would send you editing a policy that was never the
+problem.
+
 ---
 
 ## What this defends, and what it does not
@@ -147,17 +226,61 @@ Two further limits, stated plainly:
 - **The pinned host is not added to the run's egress allowlist.** A run whose
   only egress input is `--inject github` gets an *empty* allowlist:
   `api.github.com` is `NXDOMAIN`, and the credential endpoint is the one way
-  out. Pass `--allow-host api.github.com` as well if you also want direct
-  access, and the widening is then explicit and visible in `RunReport.egress`.
+  out. See ["Why can't my tool reach api.github.com?"](#why-cant-my-tool-reach-apigithubcom)
+  above.
+- **The broker does not read the response.** What the pinned host returns is
+  relayed to the guest as-is (minus framing headers). Allowlisting a *read* of
+  an API still lets the run see everything that read returns.
+
+---
+
+## Where the enforcement sits
+
+Everything that decides anything is on the host, outside the VM boundary. The
+guest's only reachable peer is the gateway, on four ports.
+
+```mermaid
+flowchart LR
+    subgraph guest["guest — hostile, root, one trust domain"]
+        W["workload<br/>$ISOPOD_CREDENTIAL_ENDPOINT"]
+    end
+    subgraph host["host — outside the boundary"]
+        subgraph gw["slot gateway 10.107.i.1"]
+            P1[":1080 socks5"]
+            P2[":3128 http proxy"]
+            P3[":3129 credentials"]
+            P4[":5353 dns"]
+        end
+        S["~/.isopod/credentials.json<br/>mode 0600"]
+        R["egress.jsonl<br/>flight recorder"]
+    end
+    U["pinned upstream<br/>api.github.com"]
+
+    W -->|"GET /github/user"| P3
+    S -.->|"resolved before boot,<br/>all or nothing"| P3
+    P3 -->|"new request, built from parts<br/>TLS, redirects disabled"| U
+    P3 --> R
+    W -.->|"direct connect:<br/>pinned_credential_host"| P2
+    
+    nft["nftables: this tap forwards<br/>nothing, ever — set once as root"]
+    nft -.-> gw
+```
+
+The packet filter is what makes the rest true: a filtered slot forwards nothing,
+so there is no path to the upstream that does not pass through the endpoint, and
+no path to the endpoint that the guest can redirect.
 
 ---
 
 ## Failure is always closed
 
-Credential resolution happens **before** a network slot is claimed and before
-any VM work, and it is all-or-nothing. Any of these aborts the run rather than
-degrading it:
+Credential resolution happens **before any VM boots**, and it is all-or-nothing.
+(A network slot is claimed first, so that the broker has a gateway to bind; the
+slot is released again when the run aborts.) Any of these aborts the run rather
+than degrading it:
 
+- the host was provisioned before the endpoint port existed (checked first, with
+  the exact re-provisioning command);
 - the store is absent, malformed, permissive, a symlink, or declares an unknown
   version or key;
 - the `env:` variable is unset, or the `file:` source is unreadable, oversized,

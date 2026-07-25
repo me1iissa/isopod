@@ -6,17 +6,131 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
-## Unreleased (0.10.0 line)
+## [0.10.0] — 2026-07-25
 
-- **Credential injection — the enforcement core.** Landing in 0.10.0. A run
-  names an *alias*; the operator declares on the host which secret it is, the
-  single host it may be sent to, and — mandatorily — which requests it may
-  authorise. Merged so far: the `Secret` newtype (no `Display`, deliberately no
-  `Serialize`, so a future `#[derive(Serialize)]` on a containing struct fails
-  to compile), the `~/.isopod/credentials.json` store with mode and symlink
-  checks and all-or-nothing pre-boot resolution, and the endpoint's decision
-  core. Not yet wired to a run: the listener, the upstream TLS leg, and the
-  `--inject` surface. See [docs/credentials.md](docs/credentials.md).
+- **Credential injection — a run can spend a credential without ever holding
+  it.** A run names an *alias*; the operator declares on the host which secret
+  it is, the single host it may be sent to, and — mandatorily — which requests
+  it may authorise. `isopod run --inject github` / `sandbox_run(inject:
+  ["github"])`. The guest calls `$ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>`
+  and the host attaches the token, but only for a method and path the operator
+  wrote down. See [docs/credentials.md](docs/credentials.md).
+
+  The endpoint is **not a reverse proxy**: guest bytes never reach the wire. It
+  reads a stated intent and constructs a new request from its own parts — its
+  own `Host`, its own `Authorization`, a normalised path, and at most two
+  allowlisted headers. **Redirects are disabled** on the upstream leg, because
+  following one would carry the credential to a host the operator never named,
+  chosen by a party who is not the operator. The client also ignores the host's
+  own `*_PROXY` variables: those are exactly what isopod exports into a filtered
+  guest, so an isopod running inside an isopod sandbox would otherwise route its
+  credential leg through its parent's broker.
+
+  `--inject` lives **inside** the egress policy rather than beside it, so naming
+  a credential switches the run to a filtered slot. As a sibling field, `--inject
+  github` with no `--allow-host` would have left the run on a *public* slot with
+  full NAT egress and nothing enforcing the credential's `allow` list — the one
+  combination the feature must never produce.
+
+  The pinned host is deliberately not allowlisted, and a direct connection to it
+  is refused as `pinned_credential_host` rather than a generic denial: the fix is
+  to use the endpoint, not to widen a list.
+
+- **The broker's port set is recorded in the manifest, and a run fails closed
+  without it.** The credential endpoint needs port 3129 open on a filtered
+  slot's gateway, and that hole is baked into nftables once, as root. A host
+  provisioned by 0.9.x has no such rule and the unprivileged runtime cannot add
+  one, so `slots.json` now records which ports each provisioning opened.
+  `--inject` on an older host errors **before any VM boots**, naming the exact
+  re-provisioning command — structurally the same trap `filtered_from` closed in
+  0.9.0, where an absent field must never be read as a permissive default.
+
+- **A credential rule matches the path only.** `allow: ["GET /repos/*/*/issues"]`
+  now covers `?state=open&page=2`. Previously the query was part of the string
+  the glob matched, so every paginated or filtered API call was refused —
+  fail-closed, but it pushed operators toward `readonly` purely to make query
+  strings work, which is a real loss of scoping. A fragment in a request target
+  is now rejected outright: `#` ends the path for a URL parser but not for a
+  rule matcher, and that disagreement is the whole class of bug this layer
+  exists to prevent.
+
+- **A refusal survives a request that had a body.** The endpoint refuses before
+  reading a body — that is the point — but closing a socket with unread data
+  queued sends RST rather than FIN, and the RST discarded the `403` before the
+  guest could read it. Every refused `POST` surfaced as "connection reset by
+  peer" instead of the explanation naming which `allow` list to widen. Found by
+  the live wire test, which is now in the tree (`tests/live_inject.rs`) and
+  asserts against what a real upstream received rather than what this process
+  believed it sent.
+
+- **`Secret::expose` call sites are now enforced, not merely documented.** The
+  module claimed a test asserted it; there was none. A test now walks the crate
+  source and fails on any call outside `net/secret.rs` and `net/broker.rs`. A
+  leak does not begin as a leak — it begins as one reasonable-looking `.expose()`
+  in a logging path.
+
+- **The gateway is excluded from `NO_PROXY` in the guest.** Every broker endpoint
+  lives on the gateway, so without this a client asked for
+  `http://10.107.<i>.1:3129/...` would send it to the HTTP proxy on the same
+  address as an absolute-form request — which the broker then evaluates as a
+  connection to a literal address and refuses. The credential endpoint would have
+  looked broken for reasons unrelated to credentials.
+
+- **A model learns nothing about the credential store itself.** Only the
+  per-alias refusal was being collapsed for MCP callers, so "no store here",
+  "your store is world-readable" and "your store declares version 2" all reached
+  the caller **carrying the store's absolute path** — naming any alias read back
+  the operator's home directory and whether a store existed at all. Every
+  failure now renders identically for a model; the operator gets the specific
+  one on stderr.
+
+- **Traversal survives no amount of decoration.** The dot-segment check was
+  exact string equality, so `%252e%252e` (no literal `%2e` in it, decodes to
+  one), `..;` (a path parameter some servers strip before routing), `..%00` and
+  `..%20` all passed both the normaliser and the rule matcher. Every remaining
+  percent-escape must now decode to an ordinary visible byte, and a path
+  parameter is refused outright. Each of those was a way to make the rule
+  matcher and the upstream server disagree about where a path goes, which is the
+  one failure that layer exists to prevent.
+
+- **A credential's own refusals are no longer reported as "not on this run's
+  allowlist".** Endpoint denials carry `credential_refused`, and a pinned host
+  reached directly carries `pinned_credential_host`. Those three call for
+  completely different fixes, and the first two used to render as the third.
+
+- **A request that may have been executed upstream is no longer recorded as
+  denied.** Only a connect failure proves the request never left the host; a
+  timeout can mean the pinned host received and ran it and merely failed to
+  answer. Recording those as refused told an operator asking "was my token
+  used?" that it was not — the one question the flight recorder must not get
+  wrong.
+
+- **The `Secret::expose` guard covers the whole workspace.** It scanned only
+  `crates/core/src`, while `ResolvedCredential::secret` and
+  `Broker::credentials` are both `pub` — so the invariant was enforced exactly
+  where it is easiest to keep and ignored where a value gets rendered for
+  output. It now walks every crate and matches both call spellings. The
+  `Authorization` header value is also marked sensitive, so `http`'s own `Debug`
+  redacts it once the token leaves isopod's types.
+
+- **An empty upstream chunk no longer truncates the response.** An empty chunk
+  frames as `0\r\n\r\n`, which *is* the terminator, so relaying one would end
+  the body early and hand the workload a short document it believed was
+  complete.
+
+- **`isopod setup` is idempotent again.** `ip addr add` reports an
+  already-present address as either `File exists` or
+  `Error: ipv4: Address already assigned.` depending on the iproute2 version,
+  and only the first was tolerated — so re-provisioning failed on many hosts,
+  including for exactly the people told to re-provision by the new port gate.
+
+- **The flight recorder carries the specific reason inline.** `denied[].note`
+  surfaces the broker's machine-readable tag in the run report, so
+  `inject-not-permitted` (your allow list) is distinguishable from
+  `inject-upstream-unreachable` (the API was down) without opening
+  `egress.jsonl`. `RunReport.egress.injected` lists every credential the run
+  held and exactly what each could do — never the secret, which the type system
+  will not serialize.
 
 ## [0.9.1] — 2026-07-25
 

@@ -710,6 +710,7 @@ pub async fn resume(
             Some(isopod_proto::BrokerConfig {
                 socks: b.socks.clone(),
                 http: b.http.clone(),
+                inject: b.inject.clone(),
             }),
         ),
         None => (default_dns_list(), None),

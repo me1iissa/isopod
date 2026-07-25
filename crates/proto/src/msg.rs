@@ -107,6 +107,19 @@ pub struct BrokerConfig {
     pub socks: String,
     /// HTTP proxy endpoint as `HOST:PORT` (exported as `HTTP(S)_PROXY=http://…`).
     pub http: String,
+    /// Credential endpoint as `HOST:PORT` (exported as
+    /// `ISOPOD_CREDENTIAL_ENDPOINT=http://…`), present only when the run has
+    /// credentials injected.
+    ///
+    /// `None` — the serde default — keeps this wire-compatible in both
+    /// directions with pre-0.10 peers, exactly as `broker` itself is with
+    /// pre-0.9 ones: an old agent ignores the field, and a new agent reads its
+    /// absence as "nothing injected". No `PROTO_VERSION` bump, because neither
+    /// side needs to know the other speaks it — a guest that never learns the
+    /// endpoint URL simply has no credential to spend, and the endpoint
+    /// enforces identically either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<String>,
 }
 
 /// Parameters for `RequestOp::Exec`.

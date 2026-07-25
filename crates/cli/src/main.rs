@@ -172,6 +172,15 @@ struct RunArgs {
     /// tries to reach. Mutually exclusive with --allow-host / --allow-cidr.
     #[arg(long = "deny-egress")]
     deny_egress: bool,
+    /// Inject a credential declared in ~/.isopod/credentials.json, by alias
+    /// (repeatable). The run can spend it without ever holding it: the guest
+    /// asks the endpoint at $ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>, and the
+    /// host attaches the token only if the request matches that credential's
+    /// `allow` list. Also switches the run to filtered egress, so a credential
+    /// never comes with unfiltered network. Requires `sudo isopod setup`
+    /// (0.10.0 or later) to have provisioned the endpoint port.
+    #[arg(long = "inject", value_name = "ALIAS")]
+    inject: Vec<String>,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
@@ -444,28 +453,39 @@ fn run_run(args: RunArgs) -> i32 {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // Filtered egress: any allow flag, or an explicit --deny-egress, moves
-        // the run onto a filtered slot. `--no-network` is a different mode
-        // entirely (no NIC at all), so combining them is a hard error rather
-        // than a silent precedence rule.
-        let wants_filtered = !args.allow_host.is_empty() || !args.allow_cidr.is_empty();
+        // Filtered egress: any allow flag, an injected credential, or an
+        // explicit --deny-egress moves the run onto a filtered slot.
+        // `--no-network` is a different mode entirely (no NIC at all), so
+        // combining them is a hard error rather than a silent precedence rule.
+        //
+        // --inject counts as an allow flag on purpose. A credential that
+        // implied *nothing* about the network would leave `--inject github`
+        // alone on a public slot with full NAT egress and no broker listening
+        // to enforce the credential's `allow` list — the one combination this
+        // feature must never produce.
+        let wants_filtered =
+            !args.allow_host.is_empty() || !args.allow_cidr.is_empty() || !args.inject.is_empty();
         if args.deny_egress && wants_filtered {
             anyhow::bail!(
                 "--deny-egress denies everything, so it cannot be combined with \
-                 --allow-host / --allow-cidr; drop one"
+                 --allow-host / --allow-cidr / --inject; drop one"
             );
         }
         let egress = if wants_filtered || args.deny_egress {
             if args.no_network {
                 anyhow::bail!(
                     "--no-network attaches no network interface at all, while \
-                     --allow-host / --allow-cidr / --deny-egress ask for a filtered \
-                     one; pass only one of the two"
+                     --allow-host / --allow-cidr / --inject / --deny-egress ask for \
+                     a filtered one; pass only one of the two"
                 );
             }
             Some(vm::EgressPolicy {
                 hosts: args.allow_host,
                 cidrs: args.allow_cidr,
+                inject: args.inject,
+                // The CLI is the human who owns the credential store, so a
+                // failure names the alias and says exactly what was wrong.
+                caller: vm::Caller::Operator,
             })
         } else {
             None

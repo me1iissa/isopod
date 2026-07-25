@@ -26,8 +26,8 @@ the VM away. Isolation is the KVM hardware boundary, not a shared kernel.
 sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted.org"])
 ```
 
-> Pre-1.0 and moving quickly; `main` is the supported line. Newest: per-run egress allowlists (0.9.0).
-> In flight: host-declared credentials a run can spend but never read ([design](docs/credentials.md)).
+> Pre-1.0 and moving quickly; `main` is the supported line. Newest: host-declared
+> credentials a run can spend but never read (0.10.0 — [docs](docs/credentials.md)).
 
 ---
 
@@ -223,7 +223,7 @@ sandbox_run(cmd="python3 -c 'import numpy; print(numpy.__version__)'",
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
-**Give a run one credential without giving it the token** *(landing in 0.10.0)*:
+**Give a run one credential without giving it the token:**
 
 ```jsonc
 // ~/.isopod/credentials.json, mode 0600 — declared once, on the host
@@ -231,11 +231,17 @@ sandbox_run(cmd="python3 suspicious_script.py", network=false)
             "allow": ["readonly"] }        // GET+HEAD only. Required field.
 ```
 
+```
+sandbox_run(cmd="curl -sS $ISOPOD_CREDENTIAL_ENDPOINT/github/user", inject=["github"])
+```
+
 The run names the alias, never the secret. The broker builds each upstream
 request **from its own parts** — the guest's `Host` and `Authorization` are
-discarded, the target is normalised against origin-relocation tricks, and the
-request goes out only if it matches a rule you wrote. `POST /user/keys` under a
-`readonly` credential is not refused so much as unexpressible. See
+discarded, the target is normalised against origin-relocation tricks, redirects
+are not followed, and the request goes out only if it matches a rule you wrote.
+`POST /user/keys` under a `readonly` credential is not refused so much as
+unexpressible. Naming a credential also switches the run to filtered egress, so
+a token never arrives alongside an open network. See
 [docs/credentials.md](docs/credentials.md).
 
 **Or give it exactly one destination — default-deny egress, enforced on the host:**

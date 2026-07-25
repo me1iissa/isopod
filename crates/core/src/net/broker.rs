@@ -18,13 +18,19 @@
 //! slot lock already guarantees exclusive use of that address, and a wildcard
 //! bind would put every slot's broker on every other slot's gateway.
 //!
-//! # The three listeners
+//! # The four listeners
 //!
 //! | Port | Protocol | Why |
 //! |------|----------|-----|
 //! | 1080 | SOCKS5 | The primary. Hostname-form targets (`socks5h://`) keep resolution host-side, and it carries arbitrary TCP — `git://`, ssh, database clients. |
 //! | 3128 | HTTP `CONNECT` + absolute-form | `HTTPS_PROXY` is what pip, npm, curl and git read by default. Absolute-form (plain `http://`) is handled too, because the Alpine base fetches packages over HTTP. |
+//! | 3129 | The credential endpoint | Not a proxy. The guest states an intent; the broker builds a **new** request from parts and signs it with a token the guest never sees. See [`super::inject`]. |
 //! | 5353 | DNS (UDP + TCP) | Answers allowlisted names only. `:53` is redirected here at setup time because an unprivileged process cannot bind a low port. |
+//!
+//! Port 3129 arrived in 0.10.0, after the other three were already baked into
+//! provisioned hosts' nftables rulesets. A host provisioned before it cannot
+//! reach the endpoint at all, which is why the manifest records the port set and
+//! [`super::require_credential_endpoint`] refuses such a run up front.
 //!
 //! # Literal addresses and the resolution cache
 //!
@@ -56,8 +62,12 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use super::credentials::{CredScheme, Method, ResolvedCredential};
 use super::egress::{decide, DenyReason, HostRule, SafeName, Target};
-use super::{BROKER_DNS_PORT, BROKER_HTTP_PORT, BROKER_SOCKS_PORT};
+use super::inject::{
+    self, InjectRefusal, UpstreamFailure, MAX_INJECT_BODY, MAX_INJECT_HEAD, MAX_INJECT_RESP,
+};
+use super::{BROKER_DNS_PORT, BROKER_HTTP_PORT, BROKER_INJECT_PORT, BROKER_SOCKS_PORT};
 
 // ===========================================================================
 // Bounds. Every one of these caps a resource a hostile guest could otherwise
@@ -87,6 +97,16 @@ const ANSWER_TTL: u32 = 60;
 /// Ceiling on recorded events. A guest that hammers denied destinations must not
 /// grow host memory without bound; the counter keeps counting past the cap.
 const MAX_RECORDED_EVENTS: usize = 10_000;
+/// How long one credentialled call may take end to end, upstream.
+///
+/// Shorter than [`CONN_MAX_LIFETIME`] on purpose: unlike a proxied tunnel, a
+/// credentialled call is a request/response against one API, and a slot held
+/// open for half an hour by an unresponsive endpoint is a resource a guest
+/// should not be able to claim by asking.
+const INJECT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the endpoint will spend draining a refused request's body so the
+/// refusal itself survives the close. See [`drain_refused_body`].
+const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ===========================================================================
 // Recording.
@@ -100,6 +120,8 @@ pub enum Proto {
     Socks5,
     /// The HTTP listener (`CONNECT` tunnel or absolute-form forward).
     Http,
+    /// The credential-injection endpoint.
+    Inject,
     /// The DNS responder.
     Dns,
 }
@@ -231,6 +253,8 @@ pub struct BrokerPorts {
     pub socks: u16,
     /// HTTP listener port.
     pub http: u16,
+    /// Credential-endpoint listener port.
+    pub inject: u16,
     /// DNS listener port (TCP and UDP).
     pub dns: u16,
 }
@@ -240,6 +264,7 @@ impl Default for BrokerPorts {
         Self {
             socks: BROKER_SOCKS_PORT,
             http: BROKER_HTTP_PORT,
+            inject: BROKER_INJECT_PORT,
             dns: BROKER_DNS_PORT,
         }
     }
@@ -253,6 +278,10 @@ pub struct BrokerSpec {
     /// The run's allowlist. Empty means "deny everything", which is a supported
     /// and useful configuration: the recorder still logs every attempt.
     pub rules: Vec<HostRule>,
+    /// Credentials injected into this run, already resolved host-side. Empty is
+    /// the ordinary case; the endpoint still listens and answers every request
+    /// with "no such credential is injected into this run".
+    pub credentials: Vec<ResolvedCredential>,
     /// Listener ports; leave as [`BrokerPorts::default`] outside tests.
     pub ports: BrokerPorts,
 }
@@ -264,17 +293,34 @@ impl BrokerSpec {
         Self {
             gateway,
             rules,
+            credentials: Vec::new(),
             ports: BrokerPorts::default(),
         }
     }
+
+    /// Attach the run's resolved credentials.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Vec<ResolvedCredential>) -> Self {
+        self.credentials = credentials;
+        self
+    }
 }
 
-/// Policy shared by all three listeners.
+/// Policy shared by all four listeners.
 #[derive(Debug)]
 struct Policy {
     rules: Vec<HostRule>,
+    credentials: Vec<ResolvedCredential>,
+    /// This slot's gateway, so the proxy listener can recognise a request aimed
+    /// at the broker's own credential endpoint.
+    gateway: Ipv4Addr,
+    /// The port that endpoint listens on.
+    inject_port: u16,
     recorder: Recorder,
     conns: Arc<Semaphore>,
+    /// The client for the credential endpoint's upstream leg. Built once so
+    /// connections to a pinned host are pooled across a run's calls.
+    http: reqwest::Client,
 }
 
 /// A running broker. Drop or [`Broker::shutdown`] stops every listener.
@@ -284,6 +330,7 @@ pub struct Broker {
     tasks: Vec<JoinHandle<()>>,
     endpoints: BrokerEndpoints,
     dns_addr: SocketAddr,
+    inject_addr: String,
 }
 
 /// The addresses to hand the guest, so it can find the broker.
@@ -293,6 +340,14 @@ pub struct BrokerEndpoints {
     pub socks: String,
     /// `HOST:PORT` of the HTTP listener.
     pub http: String,
+    /// `HOST:PORT` of the credential endpoint — `Some` **only when this run has
+    /// credentials**.
+    ///
+    /// The listener always binds, so a stale or hardcoded URL gets a legible
+    /// 403 rather than a connection refusal. What varies is whether the guest is
+    /// *told*: the presence of `$ISOPOD_CREDENTIAL_ENDPOINT` in the exec
+    /// environment is the run-specific signal that something is injected.
+    pub inject: Option<String>,
     /// The gateway address the guest should use as its resolver.
     pub dns: String,
 }
@@ -305,15 +360,12 @@ impl Broker {
     /// partly-listening broker: the guest would see a total network outage
     /// rather than a policy decision, so a bind failure fails the run.
     pub async fn start(spec: BrokerSpec) -> Result<Self> {
-        let policy = Arc::new(Policy {
-            rules: spec.rules,
-            recorder: Recorder::new(),
-            conns: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS)),
-        });
+        let has_credentials = !spec.credentials.is_empty();
         let gw = spec.gateway;
 
         let socks = bind_tcp(gw, spec.ports.socks).await?;
         let http = bind_tcp(gw, spec.ports.http).await?;
+        let inject = bind_tcp(gw, spec.ports.inject).await?;
         let dns_udp = bind_udp(gw, spec.ports.dns).await?;
         // Bind DNS TCP from the same *request*, not from the port UDP happened
         // to get. For a real run `ports.dns` is the fixed BROKER_DNS_PORT, so
@@ -337,10 +389,27 @@ impl Broker {
         let http_addr = http
             .local_addr()
             .unwrap_or(SocketAddr::from((gw, spec.ports.http)));
+        let inject_addr = inject
+            .local_addr()
+            .unwrap_or(SocketAddr::from((gw, spec.ports.inject)));
+
+        // Built after the binds, so the endpoint's *actual* port is what the
+        // proxy listener compares against — an ephemeral (`0`) request in a test
+        // would otherwise leave the check comparing against 0 and never firing.
+        let policy = Arc::new(Policy {
+            rules: spec.rules,
+            credentials: spec.credentials,
+            gateway: gw,
+            inject_port: inject_addr.port(),
+            recorder: Recorder::new(),
+            conns: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS)),
+            http: build_upstream_client()?,
+        });
 
         let tasks = vec![
             tokio::spawn(serve_tcp(socks, Arc::clone(&policy), Proto::Socks5)),
             tokio::spawn(serve_tcp(http, Arc::clone(&policy), Proto::Http)),
+            tokio::spawn(serve_tcp(inject, Arc::clone(&policy), Proto::Inject)),
             tokio::spawn(serve_dns_udp(dns_udp, Arc::clone(&policy))),
             tokio::spawn(serve_tcp(dns_tcp, Arc::clone(&policy), Proto::Dns)),
         ];
@@ -351,10 +420,20 @@ impl Broker {
             endpoints: BrokerEndpoints {
                 socks: socks_addr.to_string(),
                 http: http_addr.to_string(),
+                inject: has_credentials.then(|| inject_addr.to_string()),
                 dns: gw.to_string(),
             },
             dns_addr: SocketAddr::from((gw, dns_port)),
+            inject_addr: inject_addr.to_string(),
         })
+    }
+
+    /// The credential endpoint's bound `HOST:PORT`, whether or not this run has
+    /// anything to spend there. [`BrokerEndpoints::inject`] is what the *guest*
+    /// is told; this is where the listener actually is.
+    #[must_use]
+    pub fn inject_addr(&self) -> &str {
+        &self.inject_addr
     }
 
     /// The DNS responder's bound address. The guest reaches it as `<gateway>:53`
@@ -375,6 +454,17 @@ impl Broker {
     #[must_use]
     pub fn events(&self) -> (Vec<EgressEvent>, u64) {
         self.policy.recorder.snapshot()
+    }
+
+    /// The credentials this run injected, for reporting what was granted.
+    ///
+    /// Returning [`ResolvedCredential`] rather than a rendered summary is safe
+    /// because the type cannot be serialised — it holds a
+    /// [`super::secret::Secret`], which has no `Serialize` — so a caller must
+    /// pick out the non-secret fields deliberately.
+    #[must_use]
+    pub fn credentials(&self) -> &[ResolvedCredential] {
+        &self.policy.credentials
     }
 
     /// Stop every listener. Idempotent.
@@ -403,6 +493,36 @@ async fn bind_udp(gw: Ipv4Addr, port: u16) -> Result<UdpSocket> {
         .with_context(|| format!("binding the egress broker's DNS responder to {gw}:{port}"))
 }
 
+/// Build the client the credential endpoint uses for its upstream leg.
+///
+/// Two settings carry the whole security argument, and neither is a default:
+///
+/// - **`redirect::Policy::none()`.** `reqwest` follows redirects out of the box.
+///   A 30x from the pinned host would carry the `Authorization` header to
+///   whatever `Location` names — the token walking off the origin the operator
+///   pinned, chosen by a party that is not the operator. A redirect is returned
+///   to the guest as a plain 30x response; if the workload wants to follow it,
+///   it must state that intent as a new request, which is authorised again.
+/// - **`no_proxy()`.** `reqwest` otherwise reads `HTTP_PROXY` / `HTTPS_PROXY`
+///   from the broker's own environment. Those variables are exactly what isopod
+///   exports into a filtered guest — so an isopod running *inside* an isopod
+///   sandbox would route its credential leg through its parent's broker, which
+///   is at best a denial and at worst a token handed to another isopod's
+///   allowlist. The pinned host is dialled directly, always.
+///
+/// TLS is not made optional anywhere: the URL is built as `https://` from parts
+/// in [`inject::authorize`], so there is no code path that puts a token on a
+/// plaintext socket.
+fn build_upstream_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(INJECT_UPSTREAM_TIMEOUT)
+        .user_agent(concat!("isopod/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building the credential endpoint's upstream HTTPS client")
+}
+
 /// Accept loop shared by all three TCP listeners.
 async fn serve_tcp(listener: TcpListener, policy: Arc<Policy>, proto: Proto) {
     loop {
@@ -423,6 +543,7 @@ async fn serve_tcp(listener: TcpListener, policy: Arc<Policy>, proto: Proto) {
                 match proto {
                     Proto::Socks5 => handle_socks(stream, &policy).await,
                     Proto::Http => handle_http(stream, &policy).await,
+                    Proto::Inject => handle_inject(stream, &policy).await,
                     Proto::Dns => handle_dns_tcp(stream, &policy).await,
                 }
             };
@@ -436,6 +557,7 @@ async fn serve_tcp(listener: TcpListener, policy: Arc<Policy>, proto: Proto) {
 // ===========================================================================
 
 /// The outcome of checking one target against the run's rules.
+#[derive(Debug)]
 enum Verdict {
     /// Permitted; connect to this name or address.
     Allow(SafeName),
@@ -458,9 +580,51 @@ impl Policy {
             }
         }
         match decide(&self.rules, target) {
-            Decision::Deny(reason) => Verdict::Deny(reason),
+            // A destination that is *only* refused because it is a credential's
+            // pinned host is the one denial an operator is most likely to read
+            // as a bug in their allow list. Say so specifically. The pinned host
+            // is deliberately not allowlisted: if it were, the guest could reach
+            // it directly — unauthenticated, but also without the `allow` rules
+            // that are the entire point of scoping the token.
+            Decision::Deny(reason) => match self.pinned_credential_host(target) {
+                true => Verdict::Deny(DenyReason::PinnedCredentialHost),
+                false => Verdict::Deny(reason),
+            },
             Decision::Allow => Verdict::Allow(target.safe_host()),
         }
+    }
+
+    /// Whether `target` is this broker's own credential endpoint.
+    ///
+    /// A client that ignores `NO_PROXY` sends `http://<gateway>:3129/alias/path`
+    /// to the proxy in absolute form. Without this it is evaluated as a
+    /// connection to a literal address and refused — the endpoint appears broken
+    /// for a reason that has nothing to do with credentials, and the operator is
+    /// pointed at an allowlist that was never the problem.
+    ///
+    /// Recognising it grants nothing: the guest can already address this port
+    /// directly (the packet filter opens it), and the request is authorised by
+    /// exactly the same code either way.
+    fn is_own_credential_endpoint(&self, target: &Target) -> bool {
+        matches!(
+            target,
+            Target::Addr(IpAddr::V4(ip), port)
+                if *ip == self.gateway && *port == self.inject_port
+        )
+    }
+
+    /// Whether `target` names the pinned host of a credential injected into this
+    /// run. Names only: an address the guest resolved itself is refused as a
+    /// literal address, which is already the right answer.
+    fn pinned_credential_host(&self, target: &Target) -> bool {
+        let Target::Name(name, _) = target else {
+            return false;
+        };
+        name.is_valid()
+            && self
+                .credentials
+                .iter()
+                .any(|c| c.host().as_str() == name.as_str())
     }
 
     fn record(&self, event: EgressEvent) -> Option<usize> {
@@ -730,28 +894,43 @@ async fn handle_http(mut stream: TcpStream, policy: &Policy) {
             // The broker cannot serve it without terminating TLS, which it
             // deliberately does not do — so refuse, but refuse *legibly*: name
             // the destination in the record and tell the client what to use.
+            //
+            // Unless the destination is a credential's pinned host, in which
+            // case that is the more fundamental answer: fixing the client to
+            // send CONNECT would only earn a 403 from the same check. Telling
+            // someone to change their HTTP client when the real instruction is
+            // "use the credential endpoint" costs an entire debugging session.
+            let pinned = policy.pinned_credential_host(&request.target);
             policy.record(EgressEvent {
                 proto: Proto::Http,
                 host: request.target.safe_host(),
                 port: request.target.port(),
                 allowed: false,
-                reason: Some(DenyReason::Malformed),
+                reason: Some(if pinned {
+                    DenyReason::PinnedCredentialHost
+                } else {
+                    DenyReason::Malformed
+                }),
                 bytes_up: 0,
                 bytes_down: 0,
                 ts_ms: policy.now_ms(),
-                note: Some("https-absolute-form-needs-connect"),
+                note: Some(if pinned {
+                    "pinned-credential-host"
+                } else {
+                    "https-absolute-form-needs-connect"
+                }),
             });
-            let _ = stream
-                .write_all(
-                    http_error(
-                        501,
-                        "this client sent an absolute-form https:// request; an \
-                         HTTPS destination must be reached with CONNECT (or via \
-                         ALL_PROXY=socks5h://). The broker does not terminate TLS.",
-                    )
-                    .as_bytes(),
+            let (code, message) = if pinned {
+                (403, DenyReason::PinnedCredentialHost.explain())
+            } else {
+                (
+                    501,
+                    "this client sent an absolute-form https:// request; an \
+                     HTTPS destination must be reached with CONNECT (or via \
+                     ALL_PROXY=socks5h://). The broker does not terminate TLS.",
                 )
-                .await;
+            };
+            let _ = stream.write_all(http_error(code, message).as_bytes()).await;
         }
         HttpKind::Connect => match dial(policy, &request.target, Proto::Http).await {
             Ok((upstream, slot)) => {
@@ -778,6 +957,14 @@ async fn handle_http(mut stream: TcpStream, policy: &Policy) {
             }
         },
         HttpKind::Absolute { rewritten } => {
+            // A credential call that came via the proxy because the client does
+            // not honour NO_PROXY. The rewrite already turned it into the
+            // origin-form head the endpoint parses, and any body is still
+            // unread on this socket, so it can be served in place.
+            if policy.is_own_credential_endpoint(&request.target) {
+                serve_inject(&mut stream, policy, rewritten.as_bytes()).await;
+                return;
+            }
             match dial(policy, &request.target, Proto::Http).await {
                 Ok((mut upstream, slot)) => {
                     // Forward the rewritten head, then splice. `Connection: close`
@@ -975,6 +1162,341 @@ fn make_target(host: &str, port: u16) -> Target {
 }
 
 // ===========================================================================
+// The credential endpoint.
+// ===========================================================================
+
+/// Serve one credentialled call.
+///
+/// The shape of this function is the security argument: nothing the guest sent
+/// is ever *forwarded*. The head is parsed into a [`inject::StatedIntent`],
+/// authorised against the run's credentials, and then a **new** request is built
+/// from the matched credential's pinned host, the enum's own method token, the
+/// normalised path, and at most two allowlisted headers. The token is attached
+/// last, at the single call site in this crate that touches a secret.
+async fn handle_inject(mut stream: TcpStream, policy: &Policy) {
+    let head = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_inject_head(&mut stream)).await {
+        Ok(Ok(h)) => h,
+        // A refusal the guest can act on; a timeout is a client that went away.
+        Ok(Err(refusal)) => return refuse_inject(&mut stream, policy, None, refusal).await,
+        Err(_) => return,
+    };
+    serve_inject(&mut stream, policy, &head).await;
+}
+
+/// Serve a credentialled call from an already-read request head.
+///
+/// Split from [`handle_inject`] because the HTTP proxy listener also lands here:
+/// `NO_PROXY` is advisory and plenty of clients ignore it (busybox `wget` among
+/// them), so a request for `http://<gateway>:3129/alias/path` frequently arrives
+/// at port 3128 in absolute form instead. Serving it inline — rather than
+/// dialling our own endpoint — matters: a loopback hop would take a second
+/// permit from the same [`MAX_CONCURRENT_CONNS`] semaphore its caller already
+/// holds, and enough concurrent calls would deadlock every one of them against
+/// each other until [`CONN_MAX_LIFETIME`].
+async fn serve_inject(stream: &mut TcpStream, policy: &Policy, head: &[u8]) {
+    let intent = match inject::parse_intent(head) {
+        Ok(i) => i,
+        Err(refusal) => return refuse_inject(stream, policy, None, refusal).await,
+    };
+    let (request, cred) = match inject::authorize(&policy.credentials, &intent) {
+        Ok(pair) => pair,
+        // `NotPermitted` names a credential that exists, so the record can name
+        // its pinned host — "api.github.com, inject-not-permitted" is the line
+        // that tells an operator to widen `allow`, not `--allow-host`.
+        Err(refusal) => {
+            let host = pinned_host_of(policy, &intent.alias);
+            return refuse_inject(stream, policy, host, refusal).await;
+        }
+    };
+
+    // Read exactly the body the guest declared. `parse_intent` already bounded
+    // it by MAX_INJECT_BODY and rejected every ambiguous framing, so there is
+    // one length and it is small enough to hold.
+    let body = match read_inject_body(stream, intent.body_len).await {
+        Ok(b) => b,
+        Err(()) => return,
+    };
+    let bytes_up = body.len() as u64;
+
+    let mut built = policy
+        .http
+        .request(reqwest_method(request.method), &request.url);
+    for (name, value) in &request.headers {
+        built = built.header(name, value);
+    }
+    // The only place in isopod that puts a credential on a wire. Everything
+    // above decided that this exact method, on this exact path, against this
+    // exact host, is one the operator wrote down by hand.
+    built = match cred.scheme() {
+        CredScheme::Bearer => {
+            let mut value = match reqwest::header::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                cred.secret().expose()
+            )) {
+                Ok(v) => v,
+                // Unreachable: the loader rejects a token with bytes that cannot
+                // appear in a field-value. Refusing here rather than unwrapping
+                // keeps that a policy decision instead of a panic that would put
+                // a partial header into a backtrace.
+                Err(_) => {
+                    return refuse_inject(stream, policy, None, InjectRefusal::Malformed).await
+                }
+            };
+            // Marks the value sensitive, so `http`'s own Debug renders it as
+            // `Sensitive` rather than verbatim. `Secret` guards isopod's types;
+            // this extends the same protection to the one place the value has to
+            // leave them, where a reqwest error or a future trace could
+            // otherwise print a whole header map.
+            value.set_sensitive(true);
+            built.header(reqwest::header::AUTHORIZATION, value)
+        }
+    };
+    if !body.is_empty() {
+        built = built.body(body);
+    }
+
+    let host = cred.host().name().clone();
+    let mut response = match built.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // `is_connect` is the only failure that proves the request never
+            // left the host. A timeout — or a body/decode error — can mean the
+            // pinned host received and *executed* it and merely failed to
+            // answer in time. Recording those as `allowed: false` would tell an
+            // operator asking "was my token used?" that it was not, which is
+            // exactly the question the flight recorder exists to answer and
+            // exactly the answer it must not get wrong. When in doubt, the
+            // honest record is that the credential was spent.
+            let reached_the_wire = !e.is_connect();
+            let failure = if e.is_timeout() {
+                UpstreamFailure::TimedOut
+            } else {
+                UpstreamFailure::Unreachable
+            };
+            policy.record(EgressEvent {
+                proto: Proto::Inject,
+                host,
+                port: 443,
+                allowed: reached_the_wire,
+                reason: (!reached_the_wire).then_some(DenyReason::CredentialRefused),
+                bytes_up,
+                bytes_down: 0,
+                ts_ms: policy.now_ms(),
+                note: Some(failure.tag()),
+            });
+            let _ = stream.write_all(failure.response().as_bytes()).await;
+            return;
+        }
+    };
+
+    // The call happened: the token was spent. Record that before a byte of the
+    // response is relayed, so a connection torn down mid-body still leaves the
+    // fact of the request in the flight recorder.
+    let slot = policy.record(EgressEvent {
+        proto: Proto::Inject,
+        host: host.clone(),
+        port: 443,
+        allowed: true,
+        reason: None,
+        bytes_up,
+        bytes_down: 0,
+        ts_ms: policy.now_ms(),
+        note: None,
+    });
+
+    let status = response.status().as_u16();
+    let headers = inject::relay_headers(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(n, v)| v.to_str().ok().map(|v| (n.as_str(), v))),
+    );
+    if stream
+        .write_all(inject::build_response_head(status, &headers).as_bytes())
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut bytes_down: u64 = 0;
+    loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                // An empty chunk frames as `0\r\n\r\n`, which *is* the
+                // terminator — relaying one would end the body early and hand
+                // the guest a truncated document it believes is complete.
+                if bytes.is_empty() {
+                    continue;
+                }
+                bytes_down = bytes_down.saturating_add(bytes.len() as u64);
+                if bytes_down > MAX_INJECT_RESP {
+                    // Past the ceiling. The head is long gone, so there is no
+                    // status left to change: close without the terminating
+                    // chunk, which is a protocol error at the client rather than
+                    // a silently short document, and record why.
+                    policy.record(EgressEvent {
+                        proto: Proto::Inject,
+                        host,
+                        port: 443,
+                        allowed: false,
+                        reason: Some(DenyReason::CredentialRefused),
+                        bytes_up: 0,
+                        bytes_down: 0,
+                        ts_ms: policy.now_ms(),
+                        note: Some(UpstreamFailure::TooLarge.tag()),
+                    });
+                    return;
+                }
+                if stream
+                    .write_all(&inject::chunk_frame(&bytes))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                policy.recorder.add_bytes(slot, 0, bytes.len() as u64);
+            }
+            // Complete: the terminator is the guest's proof of that.
+            Ok(None) => {
+                let _ = stream.write_all(inject::CHUNK_TERMINATOR).await;
+                return;
+            }
+            // Upstream died mid-body. No terminator, for the same reason.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Answer a refusal and record it, attributing it to `host` when one is known.
+async fn refuse_inject(
+    stream: &mut TcpStream,
+    policy: &Policy,
+    host: Option<SafeName>,
+    refusal: InjectRefusal,
+) {
+    policy.record(EgressEvent {
+        proto: Proto::Inject,
+        // An unattributable refusal records the same placeholder the HTTP
+        // listener uses: the guest's own bytes never become a recorded name.
+        host: host.unwrap_or_else(|| SafeName::sanitized("")),
+        port: 443,
+        allowed: false,
+        // Its own reason, not the `not_allowed` the report defaults to: "the
+        // credential does not permit that method and path" and "the destination
+        // is not on this run's allowlist" call for completely different fixes,
+        // and an operator who reads the second when the first is true will go
+        // and widen an allowlist that was never involved.
+        reason: Some(DenyReason::CredentialRefused),
+        bytes_up: 0,
+        bytes_down: 0,
+        ts_ms: policy.now_ms(),
+        note: Some(refusal.tag()),
+    });
+    if stream
+        .write_all(refusal.response().as_bytes())
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = stream.flush().await;
+    drain_refused_body(stream).await;
+}
+
+/// Read and discard whatever the guest had already sent, before closing.
+///
+/// This is not politeness, it is the difference between a refusal that arrives
+/// and one that does not. A refused request may have its body already in flight
+/// — a `POST` whose `Content-Length` the endpoint deliberately never read,
+/// because the whole point is to refuse *before* touching it. Closing a socket
+/// that still has unread data queued makes the kernel send RST rather than FIN,
+/// and an RST discards the response the peer has not read yet. The guest then
+/// sees "connection reset by peer" instead of the 403 telling it exactly which
+/// `allow` list to widen.
+///
+/// Bounded twice over — by [`MAX_INJECT_BODY`] and by a short deadline — so a
+/// guest cannot hold a connection open by refusing to stop talking.
+async fn drain_refused_body(stream: &mut TcpStream) {
+    let mut sink = [0u8; 4096];
+    let mut drained: u64 = 0;
+    let _ = tokio::time::timeout(REFUSAL_DRAIN_TIMEOUT, async {
+        while drained < MAX_INJECT_BODY {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained = drained.saturating_add(n as u64),
+            }
+        }
+    })
+    .await;
+}
+
+/// The pinned host of an injected credential, by alias.
+fn pinned_host_of(policy: &Policy, alias: &str) -> Option<SafeName> {
+    policy
+        .credentials
+        .iter()
+        .find(|c| c.alias().as_str() == alias)
+        .map(|c| c.host().name().clone())
+}
+
+/// Translate the closed method enum into the client's. Exhaustive on purpose: a
+/// method added to [`super::credentials::Method`] must not silently become a
+/// `GET` on the wire.
+fn reqwest_method(m: Method) -> reqwest::Method {
+    match m {
+        Method::Get => reqwest::Method::GET,
+        Method::Head => reqwest::Method::HEAD,
+        Method::Post => reqwest::Method::POST,
+        Method::Put => reqwest::Method::PUT,
+        Method::Patch => reqwest::Method::PATCH,
+        Method::Delete => reqwest::Method::DELETE,
+    }
+}
+
+/// Read the request head, bounded by [`MAX_INJECT_HEAD`].
+///
+/// Separate from [`read_http_head`] because the failures differ: this endpoint
+/// answers a refusal the guest can act on, where the proxy listener has nothing
+/// useful to say to a client that did not finish a request line.
+async fn read_inject_head(stream: &mut TcpStream) -> Result<Vec<u8>, InjectRefusal> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await {
+            Ok(0) | Err(_) => return Err(InjectRefusal::Malformed),
+            Ok(_) => {}
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            return Ok(buf);
+        }
+        if buf.len() >= MAX_INJECT_HEAD {
+            return Err(InjectRefusal::HeadTooLarge);
+        }
+    }
+}
+
+/// Read exactly `len` body bytes, time-bounded.
+///
+/// `len` was already bounded by [`MAX_INJECT_BODY`] at parse time; the assert
+/// keeps that true if the two ever drift, rather than letting a declared length
+/// size a host allocation.
+async fn read_inject_body(stream: &mut TcpStream, len: u64) -> Result<Vec<u8>, ()> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len > MAX_INJECT_BODY {
+        return Err(());
+    }
+    let mut body = vec![0u8; len as usize];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut body)).await {
+        Ok(Ok(_)) => Ok(body),
+        _ => Err(()),
+    }
+}
+
+// ===========================================================================
 // Byte pump.
 // ===========================================================================
 
@@ -1117,16 +1639,20 @@ async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
     };
 
     let target = Target::Name(query.name.clone(), 0);
-    let allowed = matches!(policy.check(&target), Verdict::Allow(_));
+    // One evaluation, so the recorded reason is the same one enforcement used.
+    // Consulting `decide` separately would report `not_allowed` for a name that
+    // `check` refused as a credential's pinned host — the operator would be told
+    // to widen an allow list that is not the problem.
+    let (allowed, reason) = match policy.check(&target) {
+        Verdict::Allow(_) => (true, None),
+        Verdict::Deny(r) => (false, Some(r)),
+    };
     policy.record(EgressEvent {
         proto: Proto::Dns,
         host: query.name.clone(),
         port: 0,
         allowed,
-        reason: match decide(&policy.rules, &target) {
-            Decision::Deny(r) => Some(r),
-            Decision::Allow => None,
-        },
+        reason,
         bytes_up: 0,
         bytes_down: 0,
         ts_ms: policy.now_ms(),
@@ -1297,14 +1823,45 @@ mod tests {
     use super::*;
 
     fn policy_with(patterns: &[&str]) -> Policy {
+        policy_with_credentials(patterns, Vec::new())
+    }
+
+    fn policy_with_credentials(patterns: &[&str], credentials: Vec<ResolvedCredential>) -> Policy {
         Policy {
             rules: patterns
                 .iter()
                 .map(|p| HostRule::parse_host(p).expect("test pattern"))
                 .collect(),
+            credentials,
+            gateway: Ipv4Addr::LOCALHOST,
+            inject_port: BROKER_INJECT_PORT,
             recorder: Recorder::new(),
             conns: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS)),
+            http: build_upstream_client().expect("upstream client"),
         }
+    }
+
+    /// One resolved credential pinned to `host`, with a `readonly` allow list.
+    fn test_credential(alias: &str, host: &str) -> ResolvedCredential {
+        use crate::net::credentials::{load_credentials, Caller, CREDENTIALS_FILE};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::env::set_var("ISOPOD_BROKER_TEST_TOK", "ghp_brokertest");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CREDENTIALS_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"credentials":{{"{alias}":{{"host":"{host}",
+                   "scheme":"bearer","source":"env:ISOPOD_BROKER_TEST_TOK",
+                   "allow":["readonly"]}}}}}}"#
+            ),
+        )
+        .expect("write store");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        load_credentials(&[alias.to_string()], Caller::Operator, &path)
+            .expect("resolve")
+            .remove(0)
     }
 
     // --- HTTP head parsing -------------------------------------------------
@@ -1643,14 +2200,23 @@ mod tests {
     }
 
     async fn start_test_broker(rules: Vec<HostRule>) -> Broker {
+        start_test_broker_with(rules, Vec::new()).await
+    }
+
+    async fn start_test_broker_with(
+        rules: Vec<HostRule>,
+        credentials: Vec<ResolvedCredential>,
+    ) -> Broker {
         Broker::start(BrokerSpec {
             gateway: Ipv4Addr::LOCALHOST,
             rules,
+            credentials,
             // Ephemeral: the fixed ports would collide between concurrent tests
             // and with anything already listening on the developer's machine.
             ports: BrokerPorts {
                 socks: 0,
                 http: 0,
+                inject: 0,
                 dns: 0,
             },
         })
@@ -1876,6 +2442,269 @@ mod tests {
         // And the whole event serialises to something safe to hand a model.
         let json = serde_json::to_string(&events[0]).expect("serialize");
         assert!(!json.contains("instructions"), "{json}");
+    }
+
+    // --- the credential endpoint ------------------------------------------
+
+    /// Drive one request against the endpoint and return the raw response.
+    async fn inject_call(broker: &Broker, request: &str) -> String {
+        let mut c = TcpStream::connect(broker.inject_addr())
+            .await
+            .expect("connect");
+        c.write_all(request.replace('\n', "\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut resp))
+            .await
+            .expect("endpoint must answer, never hang")
+            .expect("read");
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_listens_even_with_nothing_injected_and_says_so() {
+        // Binding unconditionally is the point: a stale or hardcoded endpoint
+        // URL must produce a legible refusal, not a connection error the
+        // workload will report as "the network is down".
+        let broker = start_test_broker(Vec::new()).await;
+        assert!(
+            broker.endpoints().inject.is_none(),
+            "with no credentials the guest is not told the endpoint exists"
+        );
+        let resp = inject_call(&broker, "GET /github/user HTTP/1.1\n\n").await;
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "{resp}");
+        assert!(resp.contains("no such credential is injected"), "{resp}");
+
+        let (events, total) = broker.events();
+        assert_eq!(total, 1, "an unusable endpoint call is still an attempt");
+        assert_eq!(events[0].proto, Proto::Inject);
+        assert_eq!(events[0].note, Some("inject-unknown-alias"));
+    }
+
+    #[tokio::test]
+    async fn an_injected_run_advertises_the_endpoint_and_scopes_the_token() {
+        let cred = test_credential("github", "api.github.com");
+        let broker = start_test_broker_with(Vec::new(), vec![cred]).await;
+        assert!(
+            broker.endpoints().inject.is_some(),
+            "a run with credentials tells the guest where to spend them"
+        );
+
+        // The attack the allow list exists to stop: planting a key that outlives
+        // the VM. `readonly` refuses it before a header is attached, so no
+        // upstream connection is even attempted.
+        let resp = inject_call(&broker, "POST /github/user/keys HTTP/1.1\n\n").await;
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "{resp}");
+        assert!(resp.contains("widen its \"allow\" list"), "{resp}");
+
+        let (events, _) = broker.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].note, Some("inject-not-permitted"));
+        // A refusal that names a real credential is attributed to its pinned
+        // host, so the record reads "api.github.com was refused", not a blank.
+        assert_eq!(events[0].host.as_str(), "api.github.com");
+        assert!(!events[0].allowed);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_target_is_refused_before_any_credential_is_attached() {
+        let cred = test_credential("github", "api.github.com");
+        let broker = start_test_broker_with(Vec::new(), vec![cred]).await;
+        for (request, want_status) in [
+            // Relocating the request off its pinned origin.
+            ("GET /github/a/../../b HTTP/1.1\n\n", "400"),
+            ("GET /github/a%2fb HTTP/1.1\n\n", "400"),
+            ("GET //evil.com/x HTTP/1.1\n\n", "400"),
+            // A method the endpoint cannot express.
+            ("CONNECT /github/user HTTP/1.1\n\n", "405"),
+            // Two framings in play.
+            (
+                "POST /github/x HTTP/1.1\nTransfer-Encoding: chunked\n\n",
+                "413",
+            ),
+        ] {
+            let resp = inject_call(&broker, request).await;
+            assert!(
+                resp.starts_with(&format!("HTTP/1.1 {want_status}")),
+                "{request:?} -> {resp}"
+            );
+        }
+        // Every one of them is on the record, and none reached the wire.
+        let (events, total) = broker.events();
+        assert_eq!(total, 5);
+        assert!(events.iter().all(|e| !e.allowed));
+    }
+
+    #[tokio::test]
+    async fn a_credential_call_that_arrives_via_the_proxy_is_served_not_refused() {
+        // Found end-to-end in a real VM: busybox `wget` implements no NO_PROXY
+        // at all, so it sent `http://<gateway>:3129/echo/get` to the proxy on
+        // 3128. That was evaluated as a connection to a literal address and
+        // refused with `empty_allowlist` — the endpoint looked broken for a
+        // reason unrelated to credentials, and the record pointed the operator
+        // at an allowlist that was never the problem.
+        //
+        // NO_PROXY is advisory. The endpoint has to work for clients that ignore
+        // it, which is most of the small ones.
+        let cred = test_credential("github", "api.github.com");
+        let broker = start_test_broker_with(Vec::new(), vec![cred]).await;
+        let endpoint: SocketAddr = broker.inject_addr().parse().expect("endpoint addr");
+
+        let mut c = TcpStream::connect(&broker.endpoints().http)
+            .await
+            .expect("connect to the proxy");
+        // A POST, so `readonly` refuses it before any upstream connection is
+        // attempted — this test stays offline while still proving the request
+        // reached the credential endpoint rather than the destination checker.
+        c.write_all(
+            format!(
+                "POST http://127.0.0.1:{}/github/user/keys HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{}\r\n\r\n",
+                endpoint.port(),
+                endpoint.port(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut resp))
+            .await
+            .expect("the proxy must answer")
+            .expect("read");
+        let resp = String::from_utf8_lossy(&resp);
+
+        // It reached the credential endpoint: the refusal is the credential's
+        // own `allow` list (POST-style write under `readonly`), not a network
+        // policy denial about a literal address.
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "{resp}");
+        assert!(
+            resp.contains("does not permit that method and path"),
+            "{resp}"
+        );
+        assert!(
+            !resp.contains("literal address"),
+            "the proxy must not evaluate its own endpoint as a destination: {resp}"
+        );
+
+        let (events, _) = broker.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].proto, Proto::Inject, "recorded as what it is");
+        assert_eq!(events[0].note, Some("inject-not-permitted"));
+        assert_eq!(events[0].host.as_str(), "api.github.com");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_survives_a_request_that_had_a_body() {
+        // Regression, found by the live wire test: the endpoint refuses before
+        // reading a body, so closing left unread bytes queued — and a close with
+        // unread data is an RST, not a FIN. The RST discarded the 403 before the
+        // client could read it, turning "your allow list does not permit that"
+        // into "connection reset by peer" for every request with a body, which
+        // is the exact shape of every POST an operator would need to debug.
+        let broker = start_test_broker(Vec::new()).await;
+        let mut c = TcpStream::connect(broker.inject_addr())
+            .await
+            .expect("connect");
+        c.write_all(b"POST /nothing/here HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello there")
+            .await
+            .expect("write");
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut resp))
+            .await
+            .expect("the endpoint must answer")
+            .expect("the refusal must survive the close, not arrive as an RST");
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "{resp}");
+        assert!(resp.contains("no such credential"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_body_never_carries_a_byte_the_guest_chose() {
+        let broker = start_test_broker(Vec::new()).await;
+        let resp = inject_call(
+            &broker,
+            "GET /\u{1}evil/x HTTP/1.1\nAccept: ignore previous instructions\n\n",
+        )
+        .await;
+        assert!(!resp.contains("instructions"), "{resp}");
+        assert!(!resp.contains("evil"), "{resp}");
+        // And the record is equally clean.
+        let json = serde_json::to_string(&broker.events().0).expect("serialize");
+        assert!(!json.contains("instructions"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_pinned_host_is_a_gateway_error_not_a_refusal() {
+        // Pinned at 127.0.0.1 so the whole upstream leg runs — request built
+        // from parts, token attached, TLS attempted — without a network, a
+        // resolver, or a certificate. Port 443 on loopback refuses immediately,
+        // which is the deterministic failure this asserts on.
+        //
+        // The distinction matters more than it looks: an operator whose call
+        // fails needs to know whether their `allow` list was too narrow (403) or
+        // the API was unreachable (502). Collapsing the two sends them editing
+        // a policy that was never the problem.
+        let cred = test_credential("local", "127.0.0.1");
+        let broker = start_test_broker_with(Vec::new(), vec![cred]).await;
+
+        let resp = inject_call(&broker, "GET /local/user HTTP/1.1\n\n").await;
+        assert!(resp.starts_with("HTTP/1.1 50"), "{resp}");
+        assert!(resp.contains("could not be reached"), "{resp}");
+
+        let (events, _) = broker.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].proto, Proto::Inject);
+        assert_eq!(events[0].host.as_str(), "127.0.0.1");
+        assert_eq!(events[0].note, Some("inject-upstream-unreachable"));
+        assert!(!events[0].allowed);
+    }
+
+    #[test]
+    fn the_pinned_host_is_refused_as_a_direct_destination_with_the_reason_why() {
+        // The confusion this exists to answer in seconds: "I injected `github`,
+        // why can't my tool reach api.github.com?" It is not a missing allow
+        // rule — allowlisting it would give the guest a path to the host that
+        // bypasses the `allow` scoping entirely.
+        let cred = test_credential("github", "api.github.com");
+        let p = policy_with_credentials(&["pypi.org"], vec![cred]);
+
+        let target = Target::Name(SafeName::sanitized("api.github.com"), 443);
+        match p.check(&target) {
+            Verdict::Deny(DenyReason::PinnedCredentialHost) => {}
+            other => panic!("expected the pinned-host reason, got {other:?}"),
+        }
+        // The explanation carries the whole answer, including where to go.
+        let why = DenyReason::PinnedCredentialHost.explain();
+        assert!(why.contains("ISOPOD_CREDENTIAL_ENDPOINT"), "{why}");
+        assert!(why.contains("<alias>"), "{why}");
+
+        // A neighbouring name is still an ordinary allowlist refusal, so the
+        // specific reason cannot be mistaken for a catch-all.
+        assert!(matches!(
+            p.check(&Target::Name(SafeName::sanitized("github.com"), 443)),
+            Verdict::Deny(DenyReason::NotAllowed)
+        ));
+        // And an allowed destination is unaffected.
+        assert!(matches!(
+            p.check(&Target::Name(SafeName::sanitized("pypi.org"), 443)),
+            Verdict::Allow(_)
+        ));
+    }
+
+    #[test]
+    fn a_pinned_host_that_is_allowlisted_stays_allowed() {
+        // The operator explicitly listing the pinned host is a decision, not a
+        // mistake: the reason only replaces a *denial*, it never creates one.
+        let cred = test_credential("github", "api.github.com");
+        let p = policy_with_credentials(&["api.github.com"], vec![cred]);
+        assert!(matches!(
+            p.check(&Target::Name(SafeName::sanitized("api.github.com"), 443)),
+            Verdict::Allow(_)
+        ));
     }
 
     #[tokio::test]

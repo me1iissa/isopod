@@ -66,13 +66,14 @@ pub fn proxy_env() -> Vec<(String, String)> {
 /// Both the upper- and lower-case spellings are set: the split is real and
 /// tool-dependent (curl reads lower-case, many Python and Node clients read
 /// upper-case), and setting only one silently strands half the ecosystem.
-fn set_proxy_env(socks: &str, http: &str) {
-    let pairs = build_proxy_env(socks, http);
+fn set_proxy_env(socks: &str, http: &str, inject: Option<&str>) {
+    let pairs = build_proxy_env(socks, http, inject);
     match PROXY_ENV.lock() {
         Ok(mut env) => {
             *env = pairs;
+            let creds = inject.unwrap_or("none");
             log(&format!(
-                "net: filtered egress via broker socks={socks} http={http}"
+                "net: filtered egress via broker socks={socks} http={http} credentials={creds}"
             ));
         }
         Err(_) => log("net: could not record the proxy environment (lock poisoned)"),
@@ -81,8 +82,8 @@ fn set_proxy_env(socks: &str, http: &str) {
 
 /// Build the proxy variable set for a pair of broker endpoints. Pure, so the
 /// exact names and URL schemes are unit-testable without touching the global.
-fn build_proxy_env(socks: &str, http: &str) -> Vec<(String, String)> {
-    let mut pairs = Vec::with_capacity(8);
+fn build_proxy_env(socks: &str, http: &str, inject: Option<&str>) -> Vec<(String, String)> {
+    let mut pairs = Vec::with_capacity(10);
     // socks5h, not socks5: the `h` keeps name resolution on the broker's side,
     // so the guest never needs — and never gets — a resolver of its own.
     let socks_url = format!("socks5h://{socks}");
@@ -95,28 +96,62 @@ fn build_proxy_env(socks: &str, http: &str) -> Vec<(String, String)> {
     }
     // Loopback must not be proxied: a workload talking to its own services would
     // otherwise be bounced off the host broker and denied.
+    //
+    // Neither must the gateway. Every broker endpoint — including the credential
+    // one — lives there, so without this a client asked for
+    // `http://10.107.<i>.1:3129/github/user` would dutifully send it to the
+    // proxy at `10.107.<i>.1:3128` as an absolute-form request, which the broker
+    // would then evaluate as a connection to a literal address and refuse. The
+    // endpoint would look broken for a reason that has nothing to do with
+    // credentials.
+    let mut no_proxy = String::from("localhost,127.0.0.1,::1");
+    if let Some(gateway) = endpoint_host(socks) {
+        no_proxy.push(',');
+        no_proxy.push_str(gateway);
+    }
     for name in ["NO_PROXY", "no_proxy"] {
-        pairs.push((name.to_string(), "localhost,127.0.0.1,::1".to_string()));
+        pairs.push((name.to_string(), no_proxy.clone()));
+    }
+    // Present only when this run has a credential to spend, so a workload can
+    // test for it rather than guessing whether the port is live.
+    if let Some(inject) = inject {
+        pairs.push((
+            "ISOPOD_CREDENTIAL_ENDPOINT".to_string(),
+            format!("http://{inject}"),
+        ));
     }
     pairs
 }
 
-/// Parse an `isopod.proxy=socks=HOST:PORT,http=HOST:PORT` token.
+/// The host part of a `HOST:PORT` endpoint. `None` if it is not in that form.
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    endpoint
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
+}
+
+/// Parse an `isopod.proxy=socks=HOST:PORT,http=HOST:PORT[,inject=HOST:PORT]`
+/// token.
 ///
 /// Keyed rather than positional so `/proc/cmdline` stays readable during a
 /// debugging session and the order cannot silently invert. Returns `None` unless
-/// both endpoints are present and non-empty.
-fn parse_proxy_token(raw: &str) -> Option<(String, String)> {
+/// both proxy endpoints are present and non-empty; `inject` is optional, and an
+/// unrecognised key is ignored rather than fatal — which is what lets a guest
+/// image built before a key existed keep booting.
+fn parse_proxy_token(raw: &str) -> Option<(String, String, Option<String>)> {
     let mut socks = None;
     let mut http = None;
+    let mut inject = None;
     for part in raw.split(',') {
         match part.split_once('=') {
             Some(("socks", v)) if !v.is_empty() => socks = Some(v.to_string()),
             Some(("http", v)) if !v.is_empty() => http = Some(v.to_string()),
+            Some(("inject", v)) if !v.is_empty() => inject = Some(v.to_string()),
             _ => {}
         }
     }
-    Some((socks?, http?))
+    Some((socks?, http?, inject))
 }
 
 /// Parsed static network configuration from the kernel command line.
@@ -151,7 +186,7 @@ pub fn configure_if_requested() {
     // addressing so the env is in place even if the NIC config degrades.
     if let Some(raw) = cmdline::value(&cmdline, "isopod.proxy") {
         match parse_proxy_token(raw) {
-            Some((socks, http)) => set_proxy_env(&socks, &http),
+            Some((socks, http, inject)) => set_proxy_env(&socks, &http, inject.as_deref()),
             None => log("net: malformed isopod.proxy token; no proxy env exported"),
         }
     }
@@ -189,7 +224,7 @@ pub fn configure(
     broker: Option<&isopod_proto::BrokerConfig>,
 ) -> io::Result<()> {
     if let Some(b) = broker {
-        set_proxy_env(&b.socks, &b.http);
+        set_proxy_env(&b.socks, &b.http, b.inject.as_deref());
     }
     // An empty gateway string is treated as "no default route" rather than a
     // parse error, so the host can deconfigure the gateway explicitly.
@@ -396,16 +431,24 @@ fn fmt_ip(a: [u8; 4]) -> String {
 mod tests {
     use super::*;
 
+    /// Look a variable up in a built proxy environment.
+    fn get<'a>(env: &'a [(String, String)], k: &str) -> &'a str {
+        env.iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("{k} must be set"))
+    }
+
     #[test]
     fn proxy_token_is_keyed_and_order_independent() {
         assert_eq!(
             parse_proxy_token("socks=10.107.8.1:1080,http=10.107.8.1:3128"),
-            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into()))
+            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into(), None))
         );
         // Keyed, so a reordered token still means the same thing.
         assert_eq!(
             parse_proxy_token("http=10.107.8.1:3128,socks=10.107.8.1:1080"),
-            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into()))
+            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into(), None))
         );
     }
 
@@ -421,35 +464,80 @@ mod tests {
     }
 
     #[test]
+    fn the_credential_endpoint_is_optional_and_unknown_keys_are_ignored() {
+        // A guest image built before a key existed must keep booting: an
+        // unrecognised token part is skipped, not fatal.
+        assert_eq!(
+            parse_proxy_token("socks=g:1080,http=g:3128,inject=g:3129"),
+            Some(("g:1080".into(), "g:3128".into(), Some("g:3129".into())))
+        );
+        assert_eq!(
+            parse_proxy_token("socks=g:1080,http=g:3128,somethingnew=g:9999"),
+            Some(("g:1080".into(), "g:3128".into(), None))
+        );
+    }
+
+    #[test]
     fn proxy_env_sets_both_cases_and_uses_socks5h() {
-        let env = build_proxy_env("10.107.8.1:1080", "10.107.8.1:3128");
-        let get = |k: &str| {
-            env.iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or_else(|| panic!("{k} must be set"))
-        };
+        let env = build_proxy_env("10.107.8.1:1080", "10.107.8.1:3128", None);
         // socks5h keeps resolution on the broker: the guest never gets a
         // resolver of its own, which is what closes DNS exfiltration.
-        assert_eq!(get("ALL_PROXY"), "socks5h://10.107.8.1:1080");
-        assert_eq!(get("all_proxy"), "socks5h://10.107.8.1:1080");
-        assert_eq!(get("HTTPS_PROXY"), "http://10.107.8.1:3128");
-        assert_eq!(get("https_proxy"), "http://10.107.8.1:3128");
-        assert_eq!(get("HTTP_PROXY"), "http://10.107.8.1:3128");
-        assert_eq!(get("http_proxy"), "http://10.107.8.1:3128");
+        assert_eq!(get(&env, "ALL_PROXY"), "socks5h://10.107.8.1:1080");
+        assert_eq!(get(&env, "all_proxy"), "socks5h://10.107.8.1:1080");
+        assert_eq!(get(&env, "HTTPS_PROXY"), "http://10.107.8.1:3128");
+        assert_eq!(get(&env, "https_proxy"), "http://10.107.8.1:3128");
+        assert_eq!(get(&env, "HTTP_PROXY"), "http://10.107.8.1:3128");
+        assert_eq!(get(&env, "http_proxy"), "http://10.107.8.1:3128");
         // Loopback stays direct, or a workload's own services would be bounced
         // off the broker and denied.
-        assert!(get("NO_PROXY").contains("127.0.0.1"));
-        assert!(get("no_proxy").contains("localhost"));
+        assert!(get(&env, "NO_PROXY").contains("127.0.0.1"));
+        assert!(get(&env, "no_proxy").contains("localhost"));
         // Both spellings of every variable: the split is real and tool-dependent.
         assert_eq!(env.len(), 8);
+        // Nothing injected, so nothing advertised: the variable's presence is
+        // how a workload tells "I have a credential" from "I do not".
+        assert!(!env.iter().any(|(n, _)| n == "ISOPOD_CREDENTIAL_ENDPOINT"));
+    }
+
+    #[test]
+    fn the_gateway_is_never_proxied_through_itself() {
+        // The footgun this closes: every broker endpoint lives on the gateway,
+        // so with the gateway missing from NO_PROXY a client asked for
+        // `http://10.107.8.1:3129/github/user` would send it to the HTTP proxy
+        // at `10.107.8.1:3128` as an absolute-form request — which the broker
+        // evaluates as a connection to a literal address and refuses. The
+        // credential endpoint would look broken for reasons unrelated to
+        // credentials.
+        let env = build_proxy_env(
+            "10.107.8.1:1080",
+            "10.107.8.1:3128",
+            Some("10.107.8.1:3129"),
+        );
+        for name in ["NO_PROXY", "no_proxy"] {
+            let value = get(&env, name);
+            assert!(value.contains("10.107.8.1"), "{name}={value}");
+            assert!(value.contains("127.0.0.1"), "{name}={value}");
+        }
+        assert_eq!(
+            get(&env, "ISOPOD_CREDENTIAL_ENDPOINT"),
+            "http://10.107.8.1:3129"
+        );
+        assert_eq!(env.len(), 9);
+    }
+
+    #[test]
+    fn endpoint_host_splits_off_the_port() {
+        assert_eq!(endpoint_host("10.107.8.1:1080"), Some("10.107.8.1"));
+        assert_eq!(endpoint_host("host.example:1"), Some("host.example"));
+        assert_eq!(endpoint_host("noport"), None);
+        assert_eq!(endpoint_host(":1080"), None);
     }
 
     #[test]
     fn unfiltered_runs_export_no_proxy_env() {
         // The global starts empty and an unfiltered run never touches it, so an
         // ordinary exec's environment is unchanged from 0.8.1.
-        assert!(build_proxy_env("a:1", "b:2").len() == 8);
+        assert!(build_proxy_env("a:1", "b:2", None).len() == 8);
         assert!(parse_proxy_token("nothing-here").is_none());
     }
 

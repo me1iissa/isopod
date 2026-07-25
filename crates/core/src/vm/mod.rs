@@ -23,6 +23,9 @@ use crate::image::{self, RootfsFlavor};
 use crate::net;
 use crate::net::broker;
 use crate::net::egress::DenyReason;
+// Re-exported below so the CLI and the MCP server can name a caller without
+// reaching into `net::credentials` for a two-variant enum.
+pub use crate::net::credentials::Caller;
 use crate::paths;
 use crate::snapshot::{self, SnapshotKey};
 use crate::stage::{self, StageMeta};
@@ -484,6 +487,12 @@ fn build_boot_args(
         ));
         if let Some(b) = broker {
             args.push_str(&format!(" isopod.proxy=socks={},http={}", b.socks, b.http));
+            // Only when something is injected: the token's presence in the
+            // guest environment is the run-specific signal that a credential is
+            // there to spend. An older guest agent ignores the unknown key.
+            if let Some(inject) = &b.inject {
+                args.push_str(&format!(",inject={inject}"));
+            }
         }
     }
     args
@@ -791,12 +800,37 @@ pub struct RunOptions {
 /// Kept as strings so the surface layers (CLI, MCP) stay free of core types and
 /// a bad pattern is reported with the caller's own spelling. Parsed into
 /// [`net::egress::HostRule`] by [`parse_egress_rules`] before boot.
+///
+/// # Why `inject` lives here and not beside it
+///
+/// Credential injection is a *property of a run's egress policy*, not a sibling
+/// of one. Had `inject` been a field on [`RunOptions`] next to `egress`, then
+/// `--inject github` with no `--allow-host` would leave `egress: None` — and
+/// `None` is the unfiltered path: a public slot with full NAT egress and no
+/// broker at all. The run would have claimed a credential and quietly received
+/// *more* network than a plain run, with nothing listening to enforce the
+/// `allow` list. Naming any of the three fields is what switches a run to a
+/// filtered slot, and there is deliberately no way to express one without the
+/// other two defaulting to "deny".
 #[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
     /// Host patterns: exact names or a single leading `*.` wildcard.
     pub hosts: Vec<String>,
     /// CIDR ranges, matched only against literal-address destinations.
     pub cidrs: Vec<String>,
+    /// Credential aliases to inject, named in `~/.isopod/credentials.json`.
+    ///
+    /// The run names an alias and nothing else: which secret, where it comes
+    /// from, which host it may be sent to, and which requests it may authorise
+    /// are all declared host-side ([`net::credentials`]).
+    pub inject: Vec<String>,
+    /// Who asked, which decides how much a credential failure may say.
+    ///
+    /// [`Caller::Model`] — the default, and the safe direction — renders every
+    /// credential refusal identically, so a poisoned context cannot enumerate
+    /// the operator's aliases by probing. The specific reason still reaches the
+    /// host's stderr.
+    pub caller: Caller,
 }
 
 /// One `--copy-out` mapping: a guest source path and its host destination.
@@ -968,8 +1002,31 @@ pub struct EgressDenied {
     pub port: u16,
     /// Why it was refused.
     pub reason: DenyReason,
+    /// A short machine-readable note, when the broker had one — the credential
+    /// endpoint's refusal tag, or `dial-failed` / `resolve-failed`.
+    ///
+    /// Broker-authored `&'static str` by construction, never guest text. It is
+    /// surfaced inline because the alternative is telling an operator only
+    /// "denied" for a request the endpoint refused for a specific, actionable
+    /// reason, and making them open `egress.jsonl` to find out which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
     /// Milliseconds after the broker started.
     pub ts_ms: u64,
+}
+
+/// One credential injected into a run, as reported back. Never the secret —
+/// [`net::secret::Secret`] has no `Serialize`, so a field holding one would not
+/// compile.
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectedCredential {
+    /// The alias the run named, and the first path segment at the endpoint.
+    pub alias: String,
+    /// The single host this credential may ever be sent to.
+    pub host: String,
+    /// The request shapes it may authorise, normalised — the answer to "what
+    /// exactly did I just grant this run?"
+    pub allow: Vec<String>,
 }
 
 /// The egress flight recorder for one filtered run.
@@ -992,6 +1049,15 @@ pub struct EgressReport {
     pub denied: Vec<EgressDenied>,
     /// Names the guest asked to resolve, deduplicated and capped.
     pub dns_queries: Vec<String>,
+    /// Credentials injected into this run and exactly what each may authorise.
+    /// Empty for the ordinary filtered run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub injected: Vec<InjectedCredential>,
+    /// Where the guest reaches the credential endpoint (`http://HOST:PORT`),
+    /// present only when something was injected. The same value the guest sees
+    /// as `$ISOPOD_CREDENTIAL_ENDPOINT`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_endpoint: Option<String>,
     /// Total decisions the broker made, including any beyond the inline caps.
     pub total_events: u64,
     /// `true` when any vector above was truncated; the full record is in
@@ -1096,6 +1162,12 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     // was asked for but the host has not been set up.
     if opts.network {
         require_network_setup()?;
+    }
+    // And fail fast if this host was provisioned before the credential endpoint
+    // existed: its nftables ruleset has no hole for that port, so the run would
+    // otherwise boot, bind a listener the guest cannot address, and hang.
+    if opts.egress.as_ref().is_some_and(|p| !p.inject.is_empty()) {
+        net::require_credential_endpoint()?;
     }
     // Validate the requested resource shape against real host capacity *before*
     // booting anything: an over-cap request must error with no VM launched.
@@ -1290,15 +1362,19 @@ async fn run_exec(
     let egress_broker = match (&opts.egress, &net_slot) {
         (Some(policy), Some(slot)) => {
             let rules = parse_egress_rules(policy)?;
+            // Resolve the named credentials host-side, all or nothing. This is
+            // the last step before a VM exists, so a bad alias, an unreadable
+            // store, or a permissive mode costs no boot. The resolved secrets
+            // live only inside the broker, which dies with the run.
+            let credentials = load_run_credentials(policy)?;
             let gateway = slot.host_ip().parse().with_context(|| {
                 format!("slot {} has an unparseable gateway address", slot.index())
             })?;
-            let broker = broker::Broker::start(broker::BrokerSpec::new(gateway, rules.clone()))
-                .await
-                .context(
-                    "starting the egress broker; a filtered run cannot proceed \
-                     without it",
-                )?;
+            let broker = broker::Broker::start(
+                broker::BrokerSpec::new(gateway, rules.clone()).with_credentials(credentials),
+            )
+            .await
+            .context("starting the egress broker; a filtered run cannot proceed without it")?;
             Some((broker, rules))
         }
         _ => None,
@@ -1675,7 +1751,26 @@ fn build_egress_report(
         }
         Err(e) => eprintln!("run: could not serialize the egress log: {e}"),
     }
-    summarize_egress(&events, total, rules, log_path)
+    let mut report = summarize_egress(&events, total, rules, log_path);
+    report.injected = broker
+        .credentials()
+        .iter()
+        .map(|c| InjectedCredential {
+            alias: c.alias().as_str().to_string(),
+            host: c.host().as_str().to_string(),
+            allow: c
+                .allow()
+                .iter()
+                .map(net::credentials::RequestRule::display)
+                .collect(),
+        })
+        .collect();
+    report.credential_endpoint = broker
+        .endpoints()
+        .inject
+        .as_ref()
+        .map(|addr| format!("http://{addr}"));
+    report
 }
 
 /// Cap the broker's events into the inline summary. Pure, so the truncation
@@ -1726,6 +1821,7 @@ fn summarize_egress(
                 host: event.host.as_str().to_string(),
                 port: event.port,
                 reason: event.reason.unwrap_or(DenyReason::NotAllowed),
+                note: event.note,
                 ts_ms: event.ts_ms,
             });
         } else {
@@ -1744,6 +1840,9 @@ fn summarize_egress(
         allowed,
         denied,
         dns_queries,
+        // Filled in by `build_egress_report`, which has the broker to ask.
+        injected: Vec::new(),
+        credential_endpoint: None,
         total_events: total,
         truncated,
         egress_log_path: log_path,
@@ -1769,6 +1868,25 @@ fn serialize_egress_jsonl(events: &[broker::EgressEvent]) -> Result<String, serd
 /// operator sees what they typed rather than a normalised form they never wrote.
 /// An empty policy parses to an empty rule set — filtered mode that denies
 /// everything while still recording every attempt.
+/// Resolve a run's named credential aliases into the form the broker uses.
+///
+/// An empty `inject` does **zero I/O**: a host with no credential store must
+/// keep working for every run that does not ask for one.
+///
+/// # Errors
+/// Whatever [`net::credentials::load_credentials`] refused, already rendered for
+/// the policy's caller — uniform for a model, specific for an operator.
+fn load_run_credentials(
+    policy: &EgressPolicy,
+) -> Result<Vec<net::credentials::ResolvedCredential>> {
+    if policy.inject.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = net::credentials::store_path()?;
+    net::credentials::load_credentials(&policy.inject, policy.caller, &path)
+        .map_err(anyhow::Error::from)
+}
+
 fn parse_egress_rules(policy: &EgressPolicy) -> Result<Vec<net::egress::HostRule>> {
     let mut rules = Vec::with_capacity(policy.hosts.len() + policy.cidrs.len());
     for raw in &policy.hosts {
@@ -2725,6 +2843,7 @@ mod tests {
         broker::BrokerEndpoints {
             socks: "10.107.8.1:1080".into(),
             http: "10.107.8.1:3128".into(),
+            inject: None,
             dns: "10.107.8.1".into(),
         }
     }
@@ -2775,7 +2894,7 @@ mod tests {
     fn parse_egress_rules_reports_the_callers_own_spelling() {
         let policy = EgressPolicy {
             hosts: vec!["*".into()],
-            cidrs: Vec::new(),
+            ..EgressPolicy::default()
         };
         let err = parse_egress_rules(&policy).expect_err("bare * must be rejected");
         let msg = format!("{err:#}");
@@ -2786,8 +2905,8 @@ mod tests {
         );
 
         let policy = EgressPolicy {
-            hosts: Vec::new(),
             cidrs: vec!["192.0.2.0/33".into()],
+            ..EgressPolicy::default()
         };
         let err = parse_egress_rules(&policy).expect_err("bad prefix must be rejected");
         assert!(format!("{err:#}").contains("--allow-cidr"));

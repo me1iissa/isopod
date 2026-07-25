@@ -73,6 +73,15 @@ pub const BROKER_SOCKS_PORT: u16 = 1080;
 /// The broker's HTTP `CONNECT` listener port on the slot gateway.
 pub const BROKER_HTTP_PORT: u16 = 3128;
 
+/// The broker's credential-injection listener port on the slot gateway.
+///
+/// Added in 0.10.0. A host provisioned before it has no nftables hole for this
+/// port, so its filtered guests cannot reach the endpoint at all — which is why
+/// [`Manifest::supports_credential_endpoint`] exists and why a run that asks for
+/// `--inject` on such a host fails closed rather than booting a guest that will
+/// see a silent connection refusal.
+pub const BROKER_INJECT_PORT: u16 = 3129;
+
 /// The broker's DNS listener port on the slot gateway.
 ///
 /// The guest sends to `:53`; a setup-time `redirect` rewrites that to this
@@ -80,6 +89,24 @@ pub const BROKER_HTTP_PORT: u16 = 3128;
 /// neither `ip_unprivileged_port_start` (host-global) nor `CAP_NET_BIND_SERVICE`
 /// (a runtime privilege) is an acceptable price for three lines of nft.
 pub const BROKER_DNS_PORT: u16 = 5353;
+
+/// Every broker TCP port a current `isopod setup` opens on a filtered slot's
+/// gateway, ascending — the exact set interpolated into the nftables ruleset and
+/// recorded in the manifest.
+///
+/// Single source of truth so the ruleset, the manifest and the runtime's
+/// reachability check cannot drift apart: adding a listener means adding it here
+/// and re-provisioning, and a host that has not re-provisioned is detectable.
+pub const BROKER_TCP_PORTS: [u16; 4] = [
+    BROKER_SOCKS_PORT,
+    BROKER_HTTP_PORT,
+    BROKER_INJECT_PORT,
+    BROKER_DNS_PORT,
+];
+
+/// The broker TCP ports a 0.9-era `isopod setup` baked in, before credential
+/// injection existed. What a manifest with no recorded port list means.
+const LEGACY_BROKER_TCP_PORTS: [u16; 3] = [BROKER_SOCKS_PORT, BROKER_HTTP_PORT, BROKER_DNS_PORT];
 
 /// Upper bound on the slot count: the slot index is the third octet of every
 /// slot's `10.107.<i>.0/30`, so it must fit a `u8`; this leaves generous
@@ -201,12 +228,28 @@ pub struct Manifest {
     /// [`Manifest::filtered_from`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filtered_from: Option<usize>,
+    /// The broker TCP ports this provisioning opened on each filtered slot's
+    /// gateway.
+    ///
+    /// Recorded rather than assumed, because the ruleset is baked once as root
+    /// and the unprivileged runtime cannot open a hole for a port added by a
+    /// later release. `None` — every manifest written before 0.10.0, and every
+    /// install with no filtered slots — resolves to
+    /// [`LEGACY_BROKER_TCP_PORTS`], the pre-credential-injection set. That is
+    /// the fail-closed reading: a port this host never opened must never be
+    /// assumed reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    broker_tcp_ports: Option<Vec<u16>>,
 }
 
 impl Manifest {
     /// Build a manifest, normalising `filtered_from` to its wire form (`None`
     /// when no slot is filtered, so a fresh manifest with the feature unused is
     /// byte-identical to a pre-0.9 one).
+    ///
+    /// The broker port list is recorded only when this host actually has
+    /// filtered slots, for the same reason: an install that uses none of this
+    /// still produces the pre-0.9 manifest verbatim.
     #[must_use]
     pub fn new(
         slot_count: usize,
@@ -215,14 +258,33 @@ impl Manifest {
         allow_lan_egress: bool,
         filtered_from: usize,
     ) -> Self {
+        let filtered = filtered_from < slot_count;
         Self {
             version: MANIFEST_VERSION,
             slot_count,
             default_iface,
             created_unix,
             allow_lan_egress,
-            filtered_from: (filtered_from < slot_count).then_some(filtered_from),
+            filtered_from: filtered.then_some(filtered_from),
+            broker_tcp_ports: filtered.then(|| BROKER_TCP_PORTS.to_vec()),
         }
+    }
+
+    /// The broker TCP ports this host's nftables ruleset opens on a filtered
+    /// slot's gateway. An unrecorded list reads as the pre-0.10 set.
+    #[must_use]
+    pub fn broker_tcp_ports(&self) -> Vec<u16> {
+        self.broker_tcp_ports
+            .clone()
+            .unwrap_or_else(|| LEGACY_BROKER_TCP_PORTS.to_vec())
+    }
+
+    /// Whether a filtered guest on this host can reach the credential-injection
+    /// endpoint — i.e. whether `sudo isopod setup` opened
+    /// [`BROKER_INJECT_PORT`].
+    #[must_use]
+    pub fn supports_credential_endpoint(&self) -> bool {
+        self.broker_tcp_ports().contains(&BROKER_INJECT_PORT)
     }
 
     /// Index of the first filtered slot. An absent field (pre-0.9 manifests, or
@@ -404,6 +466,54 @@ pub fn claim_filtered() -> Result<Slot> {
         );
     }
     claim_range_in(&root, manifest.filtered_from(), manifest.slot_count, true)
+}
+
+/// Verify this host was provisioned with the credential-injection port open.
+///
+/// The hole for [`BROKER_INJECT_PORT`] is baked into nftables once, as root. A
+/// host provisioned by 0.9.x has no such rule, and the unprivileged runtime
+/// cannot add one — so a run that asks for `--inject` there would boot, bind a
+/// listener the guest cannot address, and present as a hung request rather than
+/// a policy decision. Refusing up front, with the exact re-provisioning command,
+/// is the same trap `filtered_from` already taught us to close.
+///
+/// # Errors
+/// If setup has not run, or ran before this port existed.
+pub fn require_credential_endpoint() -> Result<()> {
+    let manifest = read_manifest().context(
+        "network manifest ~/.isopod/net/slots.json is missing or unreadable; \
+         run `sudo isopod setup` once",
+    )?;
+    if manifest.supports_credential_endpoint() {
+        return Ok(());
+    }
+    // A host with no filtered slots at all is a different problem with a
+    // different fix, and `claim_filtered` already words it well. Saying "you
+    // were provisioned before credential injection" to someone who ran
+    // `--filtered-slots 0` last week would be simply untrue, and would send them
+    // looking for a version mismatch that does not exist.
+    if manifest.filtered_count() == 0 {
+        return Ok(());
+    }
+    let opened = manifest
+        .broker_tcp_ports()
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Suggest the host's own shape, not the defaults: an operator who chose
+    // `--slots 24 --filtered-slots 8` must not be told to shrink their pool.
+    // Clamped, because a command that names more slots than `setup` accepts
+    // would be rejected by the very tool we are telling them to run.
+    let total = manifest.slot_count.min(MAX_SLOT_COUNT);
+    let filtered = manifest.filtered_count().min(total);
+    bail!(
+        "this host was provisioned before credential injection: its nftables ruleset \
+         opens only port(s) {opened} on a filtered slot's gateway, so a guest cannot \
+         reach the credential endpoint on {BROKER_INJECT_PORT}. Re-provision with \
+         `sudo isopod setup --slots {total} --filtered-slots {filtered}` (taps and \
+         in-flight runs are unaffected), or drop --inject."
+    )
 }
 
 /// Shared preamble for both claim paths: resolve the state root and read the
@@ -656,12 +766,42 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_0_10_manifest_reports_no_credential_endpoint() {
+        // THE 0.10 upgrade trap, structurally identical to `filtered_from`: a
+        // host provisioned by 0.9.x has no nftables hole for 3129, and the
+        // unprivileged runtime cannot open one. Assuming the port is there would
+        // boot a guest that hangs against an unreachable listener.
+        let legacy = r#"{"version":1,"slot_count":12,"default_iface":"eth0",
+                         "created_unix":1,"filtered_from":8}"#;
+        let m: Manifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.filtered_count(), 4, "this host does have filtered slots");
+        assert_eq!(m.broker_tcp_ports(), vec![1080, 3128, 5353]);
+        assert!(
+            !m.supports_credential_endpoint(),
+            "an unrecorded port list must never be read as 'the port is open'"
+        );
+
+        // A manifest this build writes records the full set.
+        let fresh = Manifest::new(12, "eth0".into(), 1, false, 8);
+        assert_eq!(fresh.broker_tcp_ports(), vec![1080, 3128, 3129, 5353]);
+        assert!(fresh.supports_credential_endpoint());
+
+        // And it survives a disk round-trip, because that is how it is read.
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest_in(dir.path(), &fresh).unwrap();
+        assert!(read_manifest_in(dir.path())
+            .unwrap()
+            .supports_credential_endpoint());
+    }
+
+    #[test]
     fn manifest_with_no_filtered_slots_serializes_like_pre_0_9() {
-        // `--filtered-slots 0` must not even write the key, so an install that
+        // `--filtered-slots 0` must not even write the keys, so an install that
         // does not use the feature produces a byte-identical manifest.
         let m = Manifest::new(8, "eth0".into(), 1, false, 8);
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("filtered_from"), "{json}");
+        assert!(!json.contains("broker_tcp_ports"), "{json}");
         assert_eq!(m.filtered_from(), 8);
     }
 
