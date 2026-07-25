@@ -6,7 +6,7 @@
 
 isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM, execs one command inside it over vsock, and tears the VM down — end to end in **~0.4 s** at p50, with a warm-pool resume in **~49 ms** ([measured](BENCHMARKS.md)). Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
 
-> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels). Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
+> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels) and, at 0.9.0, **per-run egress allowlists** the guest cannot rewrite. Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
 
 ---
 
@@ -22,6 +22,8 @@ sudo apt install ./isopod_*_amd64.deb   # or: sudo dnf install ./isopod-*.x86_64
 isopod image fetch-kernel   # pinned, digest-verified guest kernel
 isopod image build-all      # guest rootfs images (unprivileged)
 sudo isopod setup           # one-time host networking — the only root step
+                            # (sudo drops ~/.local/bin from PATH: use an
+                            #  explicit path, e.g. sudo ~/.local/bin/isopod setup)
 isopod run --stage base --base base-alpine -- python3 -c 'print("hello from a microVM")'
 ```
 
@@ -200,6 +202,18 @@ sandbox_run(cmd="python3 -c 'import numpy; print(numpy.__version__)'",
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
+**Or give it exactly one destination — default-deny egress, enforced on the host:**
+
+```
+sandbox_run(cmd="pip install requests",
+            allow_hosts=["pypi.org", "*.pythonhosted.org"])
+```
+
+Anything else the run reaches for — another host, a raw IP, a DNS query to an
+attacker's resolver — fails closed and is listed in the result's `egress`
+record. Pass `allow_hosts=[]` to deny everything while still recording every
+attempt, which is how you find out whether a dependency phones home.
+
 Beyond `cmd`, `stage`, and `network`, `sandbox_run` takes `timeout_s` (an **outer wall-clock budget that includes boot**), `commit_as`, `cwd`/`env`, `stdin`/`stdin_file`, per-VM sizing (`vcpus`, `mem_mib`, `scratch_mib`), and `copy_out` for streaming artifacts back to the host. The full parameter and result tables live in [docs/mcp-usage.md](docs/mcp-usage.md); every tool's schema is also self-describing.
 
 ### CLI
@@ -212,6 +226,13 @@ isopod run --stage base --base base-alpine --commit-as myproj/data-deps -- pip i
 
 # Fork that stage by name (auto-uses the base it was built on).
 isopod run --stage myproj/data-deps -- python3 -c 'import requests; print(requests.__version__)'
+
+# Default-deny egress: reach only these hosts, and record everything tried.
+isopod run --allow-host pypi.org --allow-host '*.pythonhosted.org' \
+  --stage base --base base-alpine -- pip install requests
+
+# Find out what a dependency contacts, without letting any of it succeed.
+isopod run --deny-egress --stage base --base base-alpine -- node index.js
 
 # Big builds: size the VM, feed stdin from a file, copy artifacts out.
 isopod run --stage myproj/data-deps --vcpus 4 --mem-mib 3072 --scratch-mib 8192 \
@@ -286,6 +307,7 @@ The short version:
 - **Guest egress is public-only by default.** A networked guest reaches the internet but not the host's private network: RFC1918, CGNAT, and link-local/metadata destinations are dropped, with per-tap anti-spoofing. (LAN reachability is an explicit opt-in: `isopod setup --allow-lan-egress`.)
 - An **optional rootless jail** (`ISOPOD_JAIL=1`) wraps each Firecracker in user/pid namespaces, a minimal chroot, and per-VM cgroup caps — a second isolation layer with no privileged host component. It is opt-in in this release; enable it (or keep the host single-tenant) before running mutually distrusting workloads.
 - Guest-controlled host sinks are **bounded**: exec/serial logs are size-capped, every RPC the host waits on is time-bounded, and resource requests are validated before boot.
+- **Per-run egress allowlists the guest cannot rewrite.** `--allow-host` / `allow_hosts` puts a run on a *filtered* slot that forwards nothing, reachable only through a host-side broker that enforces the allowlist and resolves names itself — so a root guest can neither reach an unlisted destination nor exfiltrate over DNS. The policy is nftables rules written once by `sudo isopod setup` plus a host process the guest cannot address; nothing inside the guest can edit it. Every allowed and denied destination lands in `RunReport.egress` and `~/.isopod/vms/<id>/egress.jsonl`. Allowlisting is destination control, not DLP — see [SECURITY.md](SECURITY.md) for what is and is not claimed.
 - For untrusted code, prefer **`--no-network` (CLI) / `network=false` (MCP)** — no NIC is attached at all; exec still works over vsock.
 
 To report a vulnerability, use **GitHub's private vulnerability reporting** on this repository (Security → Advisories → *Report a vulnerability*). Please do not open a public issue for security bugs.
@@ -303,6 +325,7 @@ All planned v1 milestones are complete, plus a post-v1 security-hardening wave:
 | **M2** | Exec — musl PID-1 guest agent, vsock exec, `isopod run`. |
 | **M3** | Stages — squashfs base + guest overlay chains, content-addressed stage store, commit/fork/stack. |
 | **M4** | Networking — `sudo isopod setup`, user-owned taps + nftables NAT, `--no-network`. |
+| **0.9** | Per-run egress allowlists — filtered slots, the host-side egress broker, host-side DNS, and the egress flight recorder. |
 | **M5** | MCP + skill — rmcp 2.2 stdio server, workflow skill, plugin packaging. |
 | **M5.5** | Flexible per-VM vCPU / memory sizing. |
 | **M6** | Warm pool — full-snapshot save/resume with post-resume net + clock reconfiguration over vsock. |

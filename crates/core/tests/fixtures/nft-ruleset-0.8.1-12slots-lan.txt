@@ -1,0 +1,32 @@
+add table inet isopod
+delete table inet isopod
+table inet isopod {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.107.0.0/16 oifname "eth0" masquerade
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		iifname "isopod-tap*" oifname "isopod-tap*" drop
+		iifname "isopod-tap0" ip saddr != 10.107.0.2 drop
+		iifname "isopod-tap1" ip saddr != 10.107.1.2 drop
+		iifname "isopod-tap2" ip saddr != 10.107.2.2 drop
+		iifname "isopod-tap3" ip saddr != 10.107.3.2 drop
+		iifname "isopod-tap4" ip saddr != 10.107.4.2 drop
+		iifname "isopod-tap5" ip saddr != 10.107.5.2 drop
+		iifname "isopod-tap6" ip saddr != 10.107.6.2 drop
+		iifname "isopod-tap7" ip saddr != 10.107.7.2 drop
+		iifname "isopod-tap8" ip saddr != 10.107.8.2 drop
+		iifname "isopod-tap9" ip saddr != 10.107.9.2 drop
+		iifname "isopod-tap10" ip saddr != 10.107.10.2 drop
+		iifname "isopod-tap11" ip saddr != 10.107.11.2 drop
+		iifname "isopod-tap*" meta nfproto ipv6 drop
+		iifname "eth0" oifname "isopod-tap*" ct state established,related accept
+		iifname "isopod-tap*" oifname "eth0" accept
+		iifname "isopod-tap*" drop
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "isopod-tap*" ct state new drop
+	}
+}

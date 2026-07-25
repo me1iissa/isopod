@@ -45,8 +45,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use super::{
-    guest_ip, host_cidr, net_dir, tap_name, write_manifest_in, Manifest, DEFAULT_SLOT_COUNT,
-    MANIFEST_VERSION, MAX_SLOT_COUNT, SLOT_SUPERNET,
+    guest_ip, host_cidr, host_ip, net_dir, tap_name, write_manifest_in, Manifest, BROKER_DNS_PORT,
+    BROKER_HTTP_PORT, BROKER_SOCKS_PORT, DEFAULT_FILTERED_SLOTS, DEFAULT_SLOT_COUNT,
+    MAX_SLOT_COUNT, SLOT_SUPERNET,
 };
 
 /// The single nftables table isopod owns.
@@ -76,6 +77,11 @@ pub struct SetupOptions {
     /// host's private LAN and cloud metadata). INSECURE — enables lateral
     /// movement / SSRF from untrusted guests; off by default (public-only egress).
     pub allow_lan_egress: bool,
+    /// How many of the provisioned slots are filtered-egress (the highest-
+    /// numbered ones). Filtered slots forward nothing and reach only the egress
+    /// broker on their own gateway. `0` provisions none, reproducing the pre-0.9
+    /// ruleset exactly.
+    pub filtered_slots: usize,
 }
 
 impl Default for SetupOptions {
@@ -85,6 +91,7 @@ impl Default for SetupOptions {
             remove: false,
             iface: None,
             allow_lan_egress: false,
+            filtered_slots: DEFAULT_FILTERED_SLOTS,
         }
     }
 }
@@ -98,6 +105,8 @@ pub struct SetupReport {
     pub removed: bool,
     /// Number of slots provisioned (0 on teardown).
     pub slots: usize,
+    /// How many of those slots are filtered-egress (0 on teardown).
+    pub filtered_slots: usize,
     /// Taps newly created this run (already-present taps are not re-listed).
     pub taps_created: Vec<String>,
     /// Taps deleted this run (`--remove` only).
@@ -134,6 +143,14 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     if slot_count == 0 || slot_count > MAX_SLOT_COUNT {
         bail!("--slots {slot_count} out of range (expected 1..={MAX_SLOT_COUNT})");
     }
+    if opts.filtered_slots > slot_count {
+        bail!(
+            "--filtered-slots {} exceeds --slots {slot_count}; filtered slots are \
+             taken from the top of the pool, so at most {slot_count} are available",
+            opts.filtered_slots
+        );
+    }
+    let filtered_from = slot_count - opts.filtered_slots;
     let user = sudo_user()?;
     let iface = match opts.iface {
         Some(i) => {
@@ -166,6 +183,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         &iface,
         slot_count,
         opts.allow_lan_egress,
+        filtered_from,
     ))?;
 
     // 3. ip_forward — live now, persisted for reboots.
@@ -178,13 +196,13 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     //    sudo, $HOME is often /root, which would strand the manifest where the
     //    unprivileged runtime never looks.
     let root = invoking_user_net_dir(&user)?;
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
+    let manifest = Manifest::new(
         slot_count,
-        default_iface: iface.clone(),
-        created_unix: now_unix(),
-        allow_lan_egress: opts.allow_lan_egress,
-    };
+        iface.clone(),
+        now_unix(),
+        opts.allow_lan_egress,
+        filtered_from,
+    );
     write_manifest_in(&root, &manifest)?;
     chown_recursive(&user, &root)?;
 
@@ -192,6 +210,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         ok: true,
         removed: false,
         slots: slot_count,
+        filtered_slots: opts.filtered_slots,
         taps_created,
         taps_removed: Vec::new(),
         nft_table: NFT_TABLE.to_string(),
@@ -237,6 +256,7 @@ fn teardown() -> Result<SetupReport> {
         ok: true,
         removed: true,
         slots: 0,
+        filtered_slots: 0,
         taps_created: Vec::new(),
         taps_removed,
         nft_table: NFT_TABLE.to_string(),
@@ -277,8 +297,40 @@ fn teardown() -> Result<SetupReport> {
 /// delivery (input hook), not forwarding, so the destination guard never touches
 /// it. In an `inet` table, `ip saddr`/`ip daddr` match IPv4 only and
 /// `meta nfproto ipv6` matches IPv6 only, so the v4 and v6 rules never overlap.
+///
+/// # Filtered slots
+///
+/// Slots `[filtered_from, slots)` are **filtered-egress**. For each, three
+/// blocks are emitted:
+///
+/// - **forward**: `iifname "isopod-tap<i>" drop` — not `oifname "<wan>" drop`.
+///   Dropping *all* forwarding from a filtered tap is simpler, strictly
+///   stronger, and cannot be widened by a future rule that introduces another
+///   egress interface. A filtered slot forwards nothing, ever. The rule sits
+///   after the destination guard and before the reply accept, which matches
+///   `iifname "<wan>"` (the inbound direction) and so is unaffected.
+/// - **prerouting**: `udp/tcp dport 53 redirect to :<BROKER_DNS_PORT>` — the
+///   guest keeps addressing its gateway on `:53` while the unprivileged broker
+///   binds a port it is allowed to bind.
+/// - **input**: an accept for the three broker ports, ahead of the existing
+///   generic `ct state new drop`. Pinned on `iifname` (a root guest cannot
+///   change which tap its packets arrive on), on the exact gateway address, and
+///   on the exact ports — the narrowest hole that makes the broker reachable.
+///
+/// > The input rule matches the **post-DNAT** DNS port
+/// > ([`BROKER_DNS_PORT`], 5353), not 53: the input hook runs after nat
+/// > prerouting, so a rule written against `dport 53` looks correct and
+/// > silently blackholes every DNS query.
+///
+/// `filtered_from >= slots` emits none of the above, producing a ruleset
+/// byte-identical to the pre-0.9 output (asserted against a checked-in fixture).
 #[must_use]
-pub fn build_nft_ruleset(wan: &str, slots: usize, allow_lan_egress: bool) -> String {
+pub fn build_nft_ruleset(
+    wan: &str,
+    slots: usize,
+    allow_lan_egress: bool,
+    filtered_from: usize,
+) -> String {
     // Per-tap anti-spoof: pin every tap to its slot's guest IP (one rule/slot).
     // A literal `isopod-tap<i>` name (not the `isopod-tap*` wildcard) is required
     // because each rule pins a different address.
@@ -296,6 +348,40 @@ pub fn build_nft_ruleset(wan: &str, slots: usize, allow_lan_egress: bool) -> Str
     } else {
         format!("\t\tiifname \"isopod-tap*\" ip daddr {{ {PRIVATE_V4_DESTS} }} drop\n")
     };
+
+    // Filtered slots: forward nothing, redirect :53 to the broker's
+    // unprivileged port, and open exactly the three broker ports on the gateway.
+    let mut filtered_forward = String::new();
+    let mut filtered_prerouting = String::new();
+    let mut filtered_input = String::new();
+    for i in filtered_from..slots {
+        filtered_forward.push_str(&format!("\t\tiifname \"isopod-tap{i}\" drop\n"));
+        filtered_prerouting.push_str(&format!(
+            "\t\tiifname \"isopod-tap{i}\" udp dport 53 redirect to :{BROKER_DNS_PORT}\n\
+             \t\tiifname \"isopod-tap{i}\" tcp dport 53 redirect to :{BROKER_DNS_PORT}\n"
+        ));
+        // NOTE: the input hook runs AFTER nat prerouting, so DNS is matched on
+        // the post-DNAT port. Writing 53 here blackholes every query silently.
+        filtered_input.push_str(&format!(
+            "\t\tiifname \"isopod-tap{i}\" ip daddr {gip} tcp dport \
+             {{ {BROKER_SOCKS_PORT}, {BROKER_HTTP_PORT}, {BROKER_DNS_PORT} }} accept\n\
+             \t\tiifname \"isopod-tap{i}\" ip daddr {gip} udp dport {BROKER_DNS_PORT} accept\n",
+            gip = host_ip(i),
+        ));
+    }
+    // The prerouting chain exists only when something needs it, so an install
+    // with no filtered slots emits the pre-0.9 table verbatim.
+    let prerouting_chain = if filtered_prerouting.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\tchain prerouting {{\n\
+             \t\ttype nat hook prerouting priority dstnat; policy accept;\n\
+             {filtered_prerouting}\
+             \t}}\n"
+        )
+    };
+
     format!(
         "add table inet isopod\n\
          delete table inet isopod\n\
@@ -304,18 +390,21 @@ pub fn build_nft_ruleset(wan: &str, slots: usize, allow_lan_egress: bool) -> Str
          \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
          \t\tip saddr {net} oifname \"{wan}\" masquerade\n\
          \t}}\n\
+         {prerouting_chain}\
          \tchain forward {{\n\
          \t\ttype filter hook forward priority filter; policy accept;\n\
          \t\tiifname \"isopod-tap*\" oifname \"isopod-tap*\" drop\n\
          {antispoof}\
          \t\tiifname \"isopod-tap*\" meta nfproto ipv6 drop\n\
          {dst_guard}\
+         {filtered_forward}\
          \t\tiifname \"{wan}\" oifname \"isopod-tap*\" ct state established,related accept\n\
          \t\tiifname \"isopod-tap*\" oifname \"{wan}\" accept\n\
          \t\tiifname \"isopod-tap*\" drop\n\
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority filter; policy accept;\n\
+         {filtered_input}\
          \t\tiifname \"isopod-tap*\" ct state new drop\n\
          \t}}\n\
          }}\n",
@@ -629,7 +718,7 @@ mod tests {
 
     #[test]
     fn nft_ruleset_has_masquerade_isolation_and_input_drop() {
-        let rs = build_nft_ruleset("eth0", 4, false);
+        let rs = build_nft_ruleset("eth0", 4, false, 4);
         // Atomic rebuild idiom.
         assert!(rs.contains("add table inet isopod"));
         assert!(rs.contains("delete table inet isopod"));
@@ -669,14 +758,14 @@ mod tests {
 
     #[test]
     fn nft_ruleset_interpolates_the_named_iface() {
-        let rs = build_nft_ruleset("wlp3s0", 8, false);
+        let rs = build_nft_ruleset("wlp3s0", 8, false, 8);
         assert!(rs.contains("oifname \"wlp3s0\" masquerade"));
         assert!(!rs.contains("eth0"));
     }
 
     #[test]
     fn nft_ruleset_allow_lan_egress_omits_dest_drops() {
-        let rs = build_nft_ruleset("eth0", 4, true);
+        let rs = build_nft_ruleset("eth0", 4, true, 4);
         assert!(
             !rs.contains("ip daddr {"),
             "opt-out must omit the destination guard"
@@ -691,7 +780,7 @@ mod tests {
 
     #[test]
     fn nft_ruleset_antispoof_is_per_provisioned_slot() {
-        let rs = build_nft_ruleset("eth0", 3, false);
+        let rs = build_nft_ruleset("eth0", 3, false, 3);
         for i in 0..3 {
             assert!(rs.contains(&format!(
                 "iifname \"isopod-tap{i}\" ip saddr != 10.107.{i}.2 drop"
@@ -700,9 +789,124 @@ mod tests {
         // No rule for an unprovisioned slot.
         assert!(!rs.contains("isopod-tap3"));
         // Zero slots ⇒ no anti-spoof lines, but the rest of the chain is intact.
-        let none = build_nft_ruleset("eth0", 0, false);
+        let none = build_nft_ruleset("eth0", 0, false, 0);
         assert!(!none.contains("ip saddr !="));
         assert!(none.contains("iifname \"isopod-tap*\" oifname \"eth0\" accept"));
+    }
+
+    // --- filtered slots ---------------------------------------------------
+
+    /// The regression gate for acceptance criterion #4: with no filtered slots,
+    /// the emitted ruleset must be **byte-identical** to the 0.8.1 output. The
+    /// expected text is a checked-in fixture captured from the 0.8.1 code, not
+    /// a string rebuilt from the same constants this function uses — otherwise a
+    /// refactor could redefine "identical" and the test would still pass.
+    #[test]
+    fn no_filtered_slots_is_byte_identical_to_0_8_1() {
+        let fixture = include_str!("../../tests/fixtures/nft-ruleset-0.8.1-12slots.txt");
+        assert_eq!(build_nft_ruleset("eth0", 12, false, 12), fixture);
+
+        let fixture_lan = include_str!("../../tests/fixtures/nft-ruleset-0.8.1-12slots-lan.txt");
+        assert_eq!(build_nft_ruleset("eth0", 12, true, 12), fixture_lan);
+    }
+
+    #[test]
+    fn filtered_slots_forward_nothing() {
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        // Every filtered slot drops ALL forwarding, not just tap->WAN, so a
+        // future second egress interface cannot widen the hole.
+        for i in 8..12 {
+            assert!(
+                rs.contains(&format!("\t\tiifname \"isopod-tap{i}\" drop\n")),
+                "slot {i} must drop all forwarding"
+            );
+        }
+        // Public slots keep the generic egress accept and gain no drop of their own.
+        for i in 0..8 {
+            assert!(!rs.contains(&format!("\t\tiifname \"isopod-tap{i}\" drop\n")));
+        }
+        assert!(rs.contains("iifname \"isopod-tap*\" oifname \"eth0\" accept"));
+
+        // Ordering: the filtered drop must precede the generic egress accept,
+        // or first-terminal-verdict-wins would let filtered traffic out.
+        let drop_at = rs.find("iifname \"isopod-tap8\" drop").unwrap();
+        let accept_at = rs
+            .find("iifname \"isopod-tap*\" oifname \"eth0\" accept")
+            .unwrap();
+        assert!(drop_at < accept_at, "filtered drop must come first");
+    }
+
+    #[test]
+    fn filtered_slots_redirect_dns_to_the_unprivileged_port() {
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        assert!(rs.contains("chain prerouting {"));
+        assert!(rs.contains("type nat hook prerouting priority dstnat; policy accept;"));
+        for i in 8..12 {
+            assert!(rs.contains(&format!(
+                "iifname \"isopod-tap{i}\" udp dport 53 redirect to :5353"
+            )));
+            assert!(rs.contains(&format!(
+                "iifname \"isopod-tap{i}\" tcp dport 53 redirect to :5353"
+            )));
+        }
+        // Public slots keep their direct path to the DEFAULT_DNS resolvers.
+        assert!(!rs.contains("iifname \"isopod-tap0\" udp dport 53"));
+    }
+
+    #[test]
+    fn filtered_input_accepts_the_broker_ports_on_the_post_dnat_port() {
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        for i in 8..12 {
+            // Pinned on all three axes: arrival tap, exact gateway, exact ports.
+            assert!(rs.contains(&format!(
+                "iifname \"isopod-tap{i}\" ip daddr 10.107.{i}.1 tcp dport \
+                 {{ 1080, 3128, 5353 }} accept"
+            )));
+            assert!(rs.contains(&format!(
+                "iifname \"isopod-tap{i}\" ip daddr 10.107.{i}.1 udp dport 5353 accept"
+            )));
+        }
+        // The input hook runs AFTER nat prerouting, so DNS is matched on 5353.
+        // A rule written against dport 53 here would blackhole every query while
+        // looking obviously correct.
+        assert!(
+            !rs.contains("udp dport 53 accept"),
+            "input must match the post-DNAT port, never 53"
+        );
+        // The generic guest->host drop stays, and stays last.
+        let accept_at = rs.find("tcp dport { 1080, 3128, 5353 } accept").unwrap();
+        let drop_at = rs
+            .find("iifname \"isopod-tap*\" ct state new drop")
+            .unwrap();
+        assert!(accept_at < drop_at, "broker accept must precede the drop");
+    }
+
+    #[test]
+    fn public_slots_cannot_reach_a_filtered_slots_broker() {
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        // Every broker accept names one tap and one gateway address, so there is
+        // no wildcard rule a public (or sibling filtered) slot could ride in on.
+        assert!(!rs.contains("iifname \"isopod-tap*\" ip daddr 10.107"));
+        for i in 8..12 {
+            let rule = format!("iifname \"isopod-tap{i}\" ip daddr 10.107.{i}.1");
+            assert_eq!(
+                rs.matches(&rule).count(),
+                2,
+                "slot {i} gets exactly one tcp + one udp accept"
+            );
+        }
+    }
+
+    #[test]
+    fn every_slot_filtered_still_produces_a_coherent_table() {
+        // The `--filtered-slots N == --slots N` edge: no public slots at all.
+        let rs = build_nft_ruleset("eth0", 2, false, 0);
+        assert!(rs.contains("iifname \"isopod-tap0\" drop"));
+        assert!(rs.contains("iifname \"isopod-tap1\" drop"));
+        assert!(rs.contains("chain prerouting {"));
+        // The anti-spoof and isolation rules are unaffected by the mode.
+        assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
+        assert!(rs.contains("iifname \"isopod-tap*\" oifname \"isopod-tap*\" drop"));
     }
 
     #[test]

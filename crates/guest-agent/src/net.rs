@@ -30,6 +30,7 @@
 //! the host learns the reconfiguration did not take.
 
 use std::io;
+use std::sync::Mutex;
 
 use crate::cmdline;
 use crate::server::log;
@@ -37,6 +38,86 @@ use crate::sys;
 
 /// Where the guest resolver config is written.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Proxy environment exported into every exec, or empty for an unfiltered run.
+///
+/// A filtered slot forwards nothing, so these variables are not a convenience —
+/// they are how a proxy-aware tool finds the only way out. They are stored
+/// process-wide rather than threaded through each exec because both entry points
+/// (kernel command line at boot, `ConfigureNet` after a warm resume) set them
+/// once for the lifetime of the VM.
+static PROXY_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// The proxy environment to layer onto an exec's baseline, newest config wins.
+///
+/// Returns empty for an unfiltered run. A poisoned lock yields an empty set
+/// rather than panicking: losing the proxy env degrades a filtered run to "no
+/// egress", which is the safe direction.
+#[must_use]
+pub fn proxy_env() -> Vec<(String, String)> {
+    match PROXY_ENV.lock() {
+        Ok(env) => env.clone(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Record the broker endpoints as proxy environment variables.
+///
+/// Both the upper- and lower-case spellings are set: the split is real and
+/// tool-dependent (curl reads lower-case, many Python and Node clients read
+/// upper-case), and setting only one silently strands half the ecosystem.
+fn set_proxy_env(socks: &str, http: &str) {
+    let pairs = build_proxy_env(socks, http);
+    match PROXY_ENV.lock() {
+        Ok(mut env) => {
+            *env = pairs;
+            log(&format!(
+                "net: filtered egress via broker socks={socks} http={http}"
+            ));
+        }
+        Err(_) => log("net: could not record the proxy environment (lock poisoned)"),
+    }
+}
+
+/// Build the proxy variable set for a pair of broker endpoints. Pure, so the
+/// exact names and URL schemes are unit-testable without touching the global.
+fn build_proxy_env(socks: &str, http: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::with_capacity(8);
+    // socks5h, not socks5: the `h` keeps name resolution on the broker's side,
+    // so the guest never needs — and never gets — a resolver of its own.
+    let socks_url = format!("socks5h://{socks}");
+    let http_url = format!("http://{http}");
+    for name in ["ALL_PROXY", "all_proxy"] {
+        pairs.push((name.to_string(), socks_url.clone()));
+    }
+    for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+        pairs.push((name.to_string(), http_url.clone()));
+    }
+    // Loopback must not be proxied: a workload talking to its own services would
+    // otherwise be bounced off the host broker and denied.
+    for name in ["NO_PROXY", "no_proxy"] {
+        pairs.push((name.to_string(), "localhost,127.0.0.1,::1".to_string()));
+    }
+    pairs
+}
+
+/// Parse an `isopod.proxy=socks=HOST:PORT,http=HOST:PORT` token.
+///
+/// Keyed rather than positional so `/proc/cmdline` stays readable during a
+/// debugging session and the order cannot silently invert. Returns `None` unless
+/// both endpoints are present and non-empty.
+fn parse_proxy_token(raw: &str) -> Option<(String, String)> {
+    let mut socks = None;
+    let mut http = None;
+    for part in raw.split(',') {
+        match part.split_once('=') {
+            Some(("socks", v)) if !v.is_empty() => socks = Some(v.to_string()),
+            Some(("http", v)) if !v.is_empty() => http = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    Some((socks?, http?))
+}
 
 /// Parsed static network configuration from the kernel command line.
 struct NetConfig {
@@ -66,6 +147,14 @@ pub fn configure_if_requested() {
         // No networking requested (e.g. --no-network): nothing to do.
         return;
     }
+    // Filtered-egress runs carry the broker endpoints; apply them before the
+    // addressing so the env is in place even if the NIC config degrades.
+    if let Some(raw) = cmdline::value(&cmdline, "isopod.proxy") {
+        match parse_proxy_token(raw) {
+            Some((socks, http)) => set_proxy_env(&socks, &http),
+            None => log("net: malformed isopod.proxy token; no proxy env exported"),
+        }
+    }
     match parse_config(&cmdline) {
         // Boot-time application is best-effort: a missing/broken NIC must not
         // stop exec-over-vsock, so the error (already logged) is swallowed.
@@ -87,9 +176,21 @@ pub fn configure_if_requested() {
 /// best-effort boot path, failures are returned so the host learns the
 /// reconfiguration did not take.
 ///
+/// A filtered-egress run also carries `broker`, whose endpoints become the exec
+/// environment's proxy variables. It is applied before the addressing so the
+/// environment is correct even if the NIC configuration degrades.
+///
 /// # Errors
 /// If `ip`/`gw` do not parse, or if `eth0` cannot be addressed (e.g. no NIC).
-pub fn configure(ip: &str, gw: &str, dns: &[String]) -> io::Result<()> {
+pub fn configure(
+    ip: &str,
+    gw: &str,
+    dns: &[String],
+    broker: Option<&isopod_proto::BrokerConfig>,
+) -> io::Result<()> {
+    if let Some(b) = broker {
+        set_proxy_env(&b.socks, &b.http);
+    }
     // An empty gateway string is treated as "no default route" rather than a
     // parse error, so the host can deconfigure the gateway explicitly.
     let gw = (!gw.is_empty()).then_some(gw);
@@ -294,6 +395,63 @@ fn fmt_ip(a: [u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_token_is_keyed_and_order_independent() {
+        assert_eq!(
+            parse_proxy_token("socks=10.107.8.1:1080,http=10.107.8.1:3128"),
+            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into()))
+        );
+        // Keyed, so a reordered token still means the same thing.
+        assert_eq!(
+            parse_proxy_token("http=10.107.8.1:3128,socks=10.107.8.1:1080"),
+            Some(("10.107.8.1:1080".into(), "10.107.8.1:3128".into()))
+        );
+    }
+
+    #[test]
+    fn proxy_token_needs_both_endpoints() {
+        // Half a broker is not a usable configuration: exporting only one of the
+        // two would strand every tool that reads the other.
+        assert_eq!(parse_proxy_token("socks=10.107.8.1:1080"), None);
+        assert_eq!(parse_proxy_token("http=10.107.8.1:3128"), None);
+        assert_eq!(parse_proxy_token("socks=,http=x:1"), None);
+        assert_eq!(parse_proxy_token(""), None);
+        assert_eq!(parse_proxy_token("garbage"), None);
+    }
+
+    #[test]
+    fn proxy_env_sets_both_cases_and_uses_socks5h() {
+        let env = build_proxy_env("10.107.8.1:1080", "10.107.8.1:3128");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("{k} must be set"))
+        };
+        // socks5h keeps resolution on the broker: the guest never gets a
+        // resolver of its own, which is what closes DNS exfiltration.
+        assert_eq!(get("ALL_PROXY"), "socks5h://10.107.8.1:1080");
+        assert_eq!(get("all_proxy"), "socks5h://10.107.8.1:1080");
+        assert_eq!(get("HTTPS_PROXY"), "http://10.107.8.1:3128");
+        assert_eq!(get("https_proxy"), "http://10.107.8.1:3128");
+        assert_eq!(get("HTTP_PROXY"), "http://10.107.8.1:3128");
+        assert_eq!(get("http_proxy"), "http://10.107.8.1:3128");
+        // Loopback stays direct, or a workload's own services would be bounced
+        // off the broker and denied.
+        assert!(get("NO_PROXY").contains("127.0.0.1"));
+        assert!(get("no_proxy").contains("localhost"));
+        // Both spellings of every variable: the split is real and tool-dependent.
+        assert_eq!(env.len(), 8);
+    }
+
+    #[test]
+    fn unfiltered_runs_export_no_proxy_env() {
+        // The global starts empty and an unfiltered run never touches it, so an
+        // ordinary exec's environment is unchanged from 0.8.1.
+        assert!(build_proxy_env("a:1", "b:2").len() == 8);
+        assert!(parse_proxy_token("nothing-here").is_none());
+    }
 
     #[test]
     fn parse_ipv4_valid() {

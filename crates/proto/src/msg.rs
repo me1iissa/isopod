@@ -47,6 +47,13 @@ pub enum RequestOp {
         /// DNS resolvers (dotted-quad strings) written to `/etc/resolv.conf`;
         /// malformed entries are dropped. Empty leaves `resolv.conf` untouched.
         dns: Vec<String>,
+        /// Egress-broker endpoints for a filtered-egress run.
+        ///
+        /// `None` — the serde default — is the unfiltered path, so this field is
+        /// wire-compatible in both directions with pre-0.9 peers: an old agent
+        /// ignores it, and a new agent reads its absence as "not filtered".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        broker: Option<BrokerConfig>,
     },
     /// Write a file into the guest (single-frame; fits within `MAX_FRAME_LEN`).
     PutFile {
@@ -86,6 +93,20 @@ pub enum RequestOp {
         /// If true, `sync()` before powering off.
         sync: bool,
     },
+}
+
+/// Where the egress broker listens for a filtered-egress run.
+///
+/// The guest cannot reach anything except these endpoints (its slot forwards
+/// nothing), so the agent exports them as the standard proxy environment
+/// variables and every proxy-aware tool finds its way out through the
+/// allowlist automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerConfig {
+    /// SOCKS5 endpoint as `HOST:PORT` (exported as `ALL_PROXY=socks5h://…`).
+    pub socks: String,
+    /// HTTP proxy endpoint as `HOST:PORT` (exported as `HTTP(S)_PROXY=http://…`).
+    pub http: String,
 }
 
 /// Parameters for `RequestOp::Exec`.
@@ -238,6 +259,7 @@ mod tests {
                 ip: "10.107.3.2/30".into(),
                 gw: "10.107.3.1".into(),
                 dns: vec!["1.1.1.1".into()],
+                broker: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

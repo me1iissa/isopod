@@ -81,6 +81,12 @@ fn run_exec(conn: &Conn, id: u64, req: &ExecRequest, reaper: &Reaper) -> io::Res
     for (k, v) in BASE_ENV {
         cmd.env(k, v);
     }
+    // Filtered-egress runs get the broker's proxy variables here: after the
+    // baseline (so they are always present) and before the request's own env (so
+    // a caller can still override them deliberately).
+    for (k, v) in crate::net::proxy_env() {
+        cmd.env(k, v);
+    }
     for (k, v) in &req.env {
         // Defense in depth behind the host's pre-boot validation: `Command::env`
         // forwards names verbatim, so a `FO=O` name would land in the child's

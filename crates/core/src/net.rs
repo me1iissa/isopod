@@ -42,10 +42,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+pub mod broker;
+pub mod egress;
 pub mod setup;
 
 /// Default number of tap slots `isopod setup` provisions.
-pub const DEFAULT_SLOT_COUNT: usize = 8;
+///
+/// Raised from 8 to 12 in 0.9.0 alongside [`DEFAULT_FILTERED_SLOTS`]: the four
+/// filtered slots are *added* to the pool rather than carved out of it, so the
+/// public-slot concurrency an existing install already has is unchanged.
+pub const DEFAULT_SLOT_COUNT: usize = 12;
+
+/// Default number of the provisioned slots that are filtered-egress.
+///
+/// Filtered slots forward nothing; their only reachable peer is the egress
+/// broker on their own gateway ([`setup::build_nft_ruleset`]).
+pub const DEFAULT_FILTERED_SLOTS: usize = 4;
+
+/// The broker's SOCKS5 listener port on the slot gateway.
+///
+/// The three broker ports are compile-time constants because `sudo isopod
+/// setup` bakes them into the nftables ruleset; the unprivileged runtime cannot
+/// re-open a hole for a port chosen later. All three are above 1024 so the
+/// runtime can bind them without privilege.
+pub const BROKER_SOCKS_PORT: u16 = 1080;
+
+/// The broker's HTTP `CONNECT` listener port on the slot gateway.
+pub const BROKER_HTTP_PORT: u16 = 3128;
+
+/// The broker's DNS listener port on the slot gateway.
+///
+/// The guest sends to `:53`; a setup-time `redirect` rewrites that to this
+/// port, because an unprivileged process cannot bind a port below 1024 and
+/// neither `ip_unprivileged_port_start` (host-global) nor `CAP_NET_BIND_SERVICE`
+/// (a runtime privilege) is an acceptable price for three lines of nft.
+pub const BROKER_DNS_PORT: u16 = 5353;
 
 /// Upper bound on the slot count: the slot index is the third octet of every
 /// slot's `10.107.<i>.0/30`, so it must fit a `u8`; this leaves generous
@@ -157,6 +188,61 @@ pub struct Manifest {
     /// (which lack the field) deserializable without a `MANIFEST_VERSION` bump.
     #[serde(default)]
     pub allow_lan_egress: bool,
+    /// Index of the first filtered-egress slot: slots `[filtered_from,
+    /// slot_count)` forward nothing and reach only their gateway broker.
+    ///
+    /// **`Option`, not `#[serde(default)]`.** A bare `usize` default is `0`,
+    /// which would read a pre-0.9 manifest (no such key) as "*every* slot is
+    /// filtered" and break every existing install's networking on upgrade.
+    /// `None` means "no filtered slots" and is resolved by
+    /// [`Manifest::filtered_from`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filtered_from: Option<usize>,
+}
+
+impl Manifest {
+    /// Build a manifest, normalising `filtered_from` to its wire form (`None`
+    /// when no slot is filtered, so a fresh manifest with the feature unused is
+    /// byte-identical to a pre-0.9 one).
+    #[must_use]
+    pub fn new(
+        slot_count: usize,
+        default_iface: String,
+        created_unix: u64,
+        allow_lan_egress: bool,
+        filtered_from: usize,
+    ) -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            slot_count,
+            default_iface,
+            created_unix,
+            allow_lan_egress,
+            filtered_from: (filtered_from < slot_count).then_some(filtered_from),
+        }
+    }
+
+    /// Index of the first filtered slot. An absent field (pre-0.9 manifests, or
+    /// a `--filtered-slots 0` provisioning) resolves to `slot_count`, i.e. no
+    /// slot is filtered — never `0`, which would mean "all of them".
+    #[must_use]
+    pub fn filtered_from(&self) -> usize {
+        self.filtered_from
+            .filter(|&f| f <= self.slot_count)
+            .unwrap_or(self.slot_count)
+    }
+
+    /// How many provisioned slots are filtered-egress.
+    #[must_use]
+    pub fn filtered_count(&self) -> usize {
+        self.slot_count.saturating_sub(self.filtered_from())
+    }
+
+    /// Whether slot `i` is a filtered-egress slot under this manifest.
+    #[must_use]
+    pub fn is_filtered(&self, i: usize) -> bool {
+        i >= self.filtered_from() && i < self.slot_count
+    }
 }
 
 /// A claimed network slot. Holds an `O_EXCL` lockfile for its lifetime;
@@ -166,6 +252,7 @@ pub struct Manifest {
 pub struct Slot {
     index: usize,
     lock_path: PathBuf,
+    filtered: bool,
 }
 
 impl Slot {
@@ -173,6 +260,13 @@ impl Slot {
     #[must_use]
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Whether this is a filtered-egress slot (forwards nothing; reaches only
+    /// the broker on its own gateway).
+    #[must_use]
+    pub fn is_filtered(&self) -> bool {
+        self.filtered
     }
 
     /// This slot's tap device name (`isopod-tap<i>`).
@@ -274,19 +368,50 @@ pub fn sweep_stale() -> Result<usize> {
     sweep_stale_in(&net_dir()?)
 }
 
-/// Claim the lowest-numbered free slot, first reclaiming any stale locks.
+/// Claim the lowest-numbered free **public** slot (NAT egress to the public
+/// internet), first reclaiming any stale locks.
 ///
 /// The returned [`Slot`] releases itself on drop.
 ///
 /// # Errors
-/// If setup has not run, the manifest cannot be read, or every slot is in use.
+/// If setup has not run, the manifest cannot be read, or every public slot is
+/// in use.
 pub fn claim() -> Result<Slot> {
+    let (root, manifest) = manifest_for_claim()?;
+    claim_range_in(&root, 0, manifest.filtered_from(), false)
+}
+
+/// Claim the lowest-numbered free **filtered-egress** slot.
+///
+/// # Errors
+/// If setup has not run, the host was provisioned without filtered slots (the
+/// error names the exact re-provisioning command), or every filtered slot is in
+/// use.
+pub fn claim_filtered() -> Result<Slot> {
+    let (root, manifest) = manifest_for_claim()?;
+    if manifest.filtered_count() == 0 {
+        bail!(
+            "this host has no filtered-egress slots: `sudo isopod setup` was run \
+             without --filtered-slots. Re-provision with \
+             `sudo isopod setup --slots {total} --filtered-slots {suggest}` \
+             (existing public slots are unaffected), or drop the --allow-host / \
+             --allow-cidr flags to run with unfiltered public egress.",
+            total = manifest.slot_count + DEFAULT_FILTERED_SLOTS,
+            suggest = DEFAULT_FILTERED_SLOTS,
+        );
+    }
+    claim_range_in(&root, manifest.filtered_from(), manifest.slot_count, true)
+}
+
+/// Shared preamble for both claim paths: resolve the state root and read the
+/// manifest, with the "setup has not run" guidance attached.
+fn manifest_for_claim() -> Result<(PathBuf, Manifest)> {
     let root = net_dir()?;
     let manifest = read_manifest_in(&root).context(
         "network manifest ~/.isopod/net/slots.json is missing or unreadable; \
          run `sudo isopod setup` once, or pass --no-network",
     )?;
-    claim_in(&root, manifest.slot_count)
+    Ok((root, manifest))
 }
 
 // ===========================================================================
@@ -324,37 +449,49 @@ fn write_manifest_in(root: &Path, manifest: &Manifest) -> Result<()> {
     fs::rename(&tmp, &path).with_context(|| format!("finalizing {}", path.display()))
 }
 
-fn claim_in(root: &Path, slot_count: usize) -> Result<Slot> {
-    if slot_count == 0 || slot_count > MAX_SLOT_COUNT {
-        bail!("invalid slot_count {slot_count} (expected 1..={MAX_SLOT_COUNT})");
+/// Claim the lowest-numbered free slot in `[lo, hi)`, marking it `filtered`.
+///
+/// Both pools share the lockfile namespace and the stale sweep; they differ
+/// only in which indices they scan, which is what makes the public/filtered
+/// split a pure setup-time decision with no runtime coordination.
+fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<Slot> {
+    if hi == 0 || hi > MAX_SLOT_COUNT || lo > hi {
+        bail!("invalid slot range {lo}..{hi} (expected 0..=hi, hi in 1..={MAX_SLOT_COUNT})");
     }
     // Reclaim crashed owners first so a busy scan does not spuriously exhaust.
     let _ = sweep_stale_in(root);
 
-    for i in 0..slot_count {
+    for i in lo..hi {
         // Validate the slot's derived names/addresses up front; a misconfigured
         // slot_count must never yield an out-of-range tap name or octet.
         tap_name(i)?;
         octet(i)?;
-        if let Some(slot) = try_claim_slot(root, i)? {
+        if let Some(slot) = try_claim_slot(root, i, filtered)? {
             return Ok(slot);
         }
     }
+    let kind = if filtered {
+        "filtered-egress"
+    } else {
+        "network"
+    };
     bail!(
-        "all {slot_count} network slots are in use; wait for a run to finish or \
-         provision more with `sudo isopod setup --slots N`"
+        "all {n} {kind} slots are in use; wait for a run to finish or provision \
+         more with `sudo isopod setup --slots N --filtered-slots M`",
+        n = hi - lo,
     )
 }
 
 /// Try to claim slot `i`: create its lockfile with `O_EXCL`. Returns `Ok(Some)`
 /// on success, `Ok(None)` if a live owner holds it, and reclaims-then-retries a
 /// single time if the existing lock is stale.
-fn try_claim_slot(root: &Path, i: usize) -> Result<Option<Slot>> {
+fn try_claim_slot(root: &Path, i: usize, filtered: bool) -> Result<Option<Slot>> {
     let lock = lock_path_in(root, i);
     match create_lock(&lock) {
         Ok(()) => Ok(Some(Slot {
             index: i,
             lock_path: lock,
+            filtered,
         })),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Stale (dead owner)? Reclaim and retry exactly once; if someone else
@@ -365,6 +502,7 @@ fn try_claim_slot(root: &Path, i: usize) -> Result<Option<Slot>> {
                     Ok(()) => Ok(Some(Slot {
                         index: i,
                         lock_path: lock,
+                        filtered,
                     })),
                     Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
                     Err(e2) => Err(anyhow::Error::new(e2).context(format!("claiming slot {i}"))),
@@ -477,16 +615,12 @@ mod tests {
     #[test]
     fn manifest_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let m = Manifest {
-            version: MANIFEST_VERSION,
-            slot_count: 8,
-            default_iface: "eth0".into(),
-            created_unix: 1_700_000_000,
-            allow_lan_egress: false,
-        };
+        let m = Manifest::new(12, "eth0".into(), 1_700_000_000, false, 8);
         write_manifest_in(dir.path(), &m).unwrap();
         assert!(manifest_path_in(dir.path()).is_file());
         assert_eq!(read_manifest_in(dir.path()).unwrap(), m);
+        assert_eq!(m.filtered_from(), 8);
+        assert_eq!(m.filtered_count(), 4);
 
         // Back-compat: a manifest written before allow_lan_egress existed parses
         // with the field defaulting to false (serde(default)).
@@ -496,22 +630,94 @@ mod tests {
     }
 
     #[test]
+    fn pre_0_9_manifest_reads_as_no_filtered_slots_not_all_of_them() {
+        // THE upgrade trap: `filtered_from` absent must mean "none filtered".
+        // A bare `#[serde(default)]` usize would yield 0 here, which reads as
+        // "every slot is filtered" and would break networking on every existing
+        // install the moment it upgraded.
+        let legacy = r#"{"version":1,"slot_count":8,"default_iface":"eth0","created_unix":1}"#;
+        let m: Manifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.filtered_from(), 8, "absent field must mean no filtering");
+        assert_eq!(m.filtered_count(), 0);
+        for i in 0..8 {
+            assert!(!m.is_filtered(i), "slot {i} must stay public");
+        }
+
+        // An out-of-range recorded value is clamped the same safe way rather
+        // than filtering slots that were never provisioned as filtered.
+        let bogus = r#"{"version":1,"slot_count":8,"default_iface":"eth0",
+                        "created_unix":1,"filtered_from":99}"#;
+        let m: Manifest = serde_json::from_str(bogus).unwrap();
+        assert_eq!(m.filtered_from(), 8);
+        assert_eq!(m.filtered_count(), 0);
+    }
+
+    #[test]
+    fn manifest_with_no_filtered_slots_serializes_like_pre_0_9() {
+        // `--filtered-slots 0` must not even write the key, so an install that
+        // does not use the feature produces a byte-identical manifest.
+        let m = Manifest::new(8, "eth0".into(), 1, false, 8);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("filtered_from"), "{json}");
+        assert_eq!(m.filtered_from(), 8);
+    }
+
+    #[test]
+    fn is_filtered_covers_exactly_the_top_of_the_pool() {
+        let m = Manifest::new(12, "eth0".into(), 1, false, 8);
+        for i in 0..8 {
+            assert!(!m.is_filtered(i), "slot {i} is public");
+        }
+        for i in 8..12 {
+            assert!(m.is_filtered(i), "slot {i} is filtered");
+        }
+        // Out of range on either side is not filtered.
+        assert!(!m.is_filtered(12));
+    }
+
+    #[test]
+    fn public_and_filtered_pools_claim_from_disjoint_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A 6-slot pool split 4 public / 2 filtered.
+        let p0 = claim_range_in(root, 0, 4, false).unwrap();
+        let p1 = claim_range_in(root, 0, 4, false).unwrap();
+        assert_eq!((p0.index(), p1.index()), (0, 1));
+        assert!(!p0.is_filtered());
+
+        let f0 = claim_range_in(root, 4, 6, true).unwrap();
+        assert_eq!(f0.index(), 4, "filtered claims start at filtered_from");
+        assert!(f0.is_filtered());
+
+        // Exhausting the filtered pool does not touch the free public slots.
+        let f1 = claim_range_in(root, 4, 6, true).unwrap();
+        assert_eq!(f1.index(), 5);
+        let err = claim_range_in(root, 4, 6, true).expect_err("filtered pool exhausted");
+        assert!(err.to_string().contains("filtered-egress"), "{err}");
+        // Slots 2 and 3 are still claimable as public.
+        assert_eq!(claim_range_in(root, 0, 4, false).unwrap().index(), 2);
+
+        let _ = (&p0, &p1, &f0, &f1);
+    }
+
+    #[test]
     fn claim_picks_lowest_free_and_releases_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let a = claim_in(root, 3).unwrap();
+        let a = claim_range_in(root, 0, 3, false).unwrap();
         assert_eq!(a.index(), 0);
         assert_eq!(a.tap_name(), "isopod-tap0");
         assert!(lock_path_in(root, 0).exists());
 
-        let b = claim_in(root, 3).unwrap();
+        let b = claim_range_in(root, 0, 3, false).unwrap();
         assert_eq!(b.index(), 1);
 
         // Releasing slot 0 (drop) frees it; the next claim reuses the lowest free.
         drop(a);
         assert!(!lock_path_in(root, 0).exists(), "drop must unlink the lock");
-        let c = claim_in(root, 3).unwrap();
+        let c = claim_range_in(root, 0, 3, false).unwrap();
         assert_eq!(c.index(), 0, "lowest free slot reused after release");
 
         // Keep b/c alive to the end so their locks persist for the exhaustion check.
@@ -522,9 +728,9 @@ mod tests {
     fn claim_exhaustion_errors_when_all_held() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let _s0 = claim_in(root, 2).unwrap();
-        let _s1 = claim_in(root, 2).unwrap();
-        let err = claim_in(root, 2).expect_err("all slots held must error");
+        let _s0 = claim_range_in(root, 0, 2, false).unwrap();
+        let _s1 = claim_range_in(root, 0, 2, false).unwrap();
+        let err = claim_range_in(root, 0, 2, false).expect_err("all slots held must error");
         assert!(err.to_string().contains("in use"), "{err}");
     }
 
@@ -543,7 +749,7 @@ mod tests {
         assert_eq!(reclaimed, 1);
         assert!(!stale.exists());
 
-        let s = claim_in(root, 1).unwrap();
+        let s = claim_range_in(root, 0, 1, false).unwrap();
         assert_eq!(s.index(), 0);
     }
 
@@ -565,14 +771,14 @@ mod tests {
         let root = dir.path();
         // Slot 0 held by a dead pid; claim must reclaim it rather than skip to 1.
         fs::write(lock_path_in(root, 0), "999999999").unwrap();
-        let s = claim_in(root, 4).unwrap();
+        let s = claim_range_in(root, 0, 4, false).unwrap();
         assert_eq!(s.index(), 0, "stale slot 0 reclaimed inline");
     }
 
     #[test]
     fn claim_rejects_bad_slot_count() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(claim_in(dir.path(), 0).is_err());
-        assert!(claim_in(dir.path(), MAX_SLOT_COUNT + 1).is_err());
+        assert!(claim_range_in(dir.path(), 0, 0, false).is_err());
+        assert!(claim_range_in(dir.path(), 0, MAX_SLOT_COUNT + 1, false).is_err());
     }
 }

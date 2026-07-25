@@ -23,8 +23,8 @@ use tokio::net::UnixStream;
 
 use isopod_proto::frame::{self, FrameError};
 use isopod_proto::{
-    b64_decode, b64_encode, ExecRequest, ExecStreamKind, Request, RequestOp, Response,
-    ResponseBody, EXEC_CHUNK_LEN, PROTO_VERSION, VSOCK_PORT,
+    b64_decode, b64_encode, BrokerConfig, ExecRequest, ExecStreamKind, Request, RequestOp,
+    Response, ResponseBody, EXEC_CHUNK_LEN, PROTO_VERSION, VSOCK_PORT,
 };
 
 /// Failures talking to the guest agent.
@@ -386,7 +386,9 @@ impl AgentClient {
     ///
     /// `ip_cidr` is the guest CIDR (`10.107.<i>.2/30`), `gw` the host side
     /// (`10.107.<i>.1`, empty string ⇒ leave the default route cleared), and `dns`
-    /// the resolver list written to the guest's `/etc/resolv.conf`.
+    /// the resolver list written to the guest's `/etc/resolv.conf`. `broker` is
+    /// `Some` only for a filtered-egress run, and carries the endpoints the
+    /// guest exports as its proxy environment.
     ///
     /// # Errors
     /// A connect/framing error, or [`AgentError::Guest`] if the guest could not
@@ -396,11 +398,13 @@ impl AgentClient {
         ip_cidr: &str,
         gw: &str,
         dns: &[String],
+        broker: Option<BrokerConfig>,
     ) -> Result<(), AgentError> {
         let op = RequestOp::ConfigureNet {
             ip: ip_cidr.to_string(),
             gw: gw.to_string(),
             dns: dns.to_vec(),
+            broker,
         };
         self.expect_ok("configure_net", op).await
     }
@@ -1259,7 +1263,7 @@ mod tests {
             let mut conn = accept_handshake(&listener).await;
             let req = read_req(&mut conn).await;
             match req.op {
-                RequestOp::ConfigureNet { ip, gw, dns } => {
+                RequestOp::ConfigureNet { ip, gw, dns, .. } => {
                     assert_eq!(ip, "10.107.3.2/30");
                     assert_eq!(gw, "10.107.3.1");
                     assert_eq!(dns, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
@@ -1274,6 +1278,7 @@ mod tests {
                 "10.107.3.2/30",
                 "10.107.3.1",
                 &["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+                None,
             )
             .await
             .expect("configure_net ok");
@@ -1299,7 +1304,7 @@ mod tests {
         });
         let client = AgentClient::new(&sock);
         let err = client
-            .configure_net("10.107.3.2/30", "10.107.3.1", &[])
+            .configure_net("10.107.3.2/30", "10.107.3.1", &[], None)
             .await
             .expect_err("guest error must surface");
         assert!(matches!(err, AgentError::Guest(m) if m == "eth0 missing"));

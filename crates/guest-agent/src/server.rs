@@ -88,11 +88,16 @@ fn dispatch(conn: &Conn, req: Request, reaper: &Reaper) {
             let res = sys::set_realtime(unix_secs as i64, nanos as i64);
             reply(conn, id, res.map(|()| ResponseBody::Ok));
         }
-        RequestOp::ConfigureNet { ip, gw, dns } => {
+        RequestOp::ConfigureNet {
+            ip,
+            gw,
+            dns,
+            broker,
+        } => {
             reply(
                 conn,
                 id,
-                net::configure(&ip, &gw, &dns).map(|()| ResponseBody::Ok),
+                net::configure(&ip, &gw, &dns, broker.as_ref()).map(|()| ResponseBody::Ok),
             );
         }
         RequestOp::PutFile {

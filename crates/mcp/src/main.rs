@@ -100,6 +100,21 @@ struct SandboxRunParams {
     /// untrusted code with no network at all (exec still works over vsock).
     #[serde(default)]
     network: Option<bool>,
+    /// Permit egress ONLY to these hosts (default-deny everything else). Setting
+    /// this — even to `[]` — switches the run to filtered egress: a slot that
+    /// forwards nothing, plus a host-side broker that enforces this list and
+    /// records every allowed and denied attempt in `egress`. Accepts exact names
+    /// (`pypi.org`) or one leading wildcard label (`*.pythonhosted.org`, which
+    /// does NOT match the apex). `[]` denies all egress while still recording
+    /// what the workload tried to reach. Cannot be combined with
+    /// `network: false`, which attaches no interface at all.
+    #[serde(default)]
+    allow_hosts: Option<Vec<String>>,
+    /// Permit egress to literal IP addresses in these CIDRs, for tools that dial
+    /// an address rather than a name. Also switches the run to filtered egress. A
+    /// literal address is never matched against `allow_hosts` patterns.
+    #[serde(default)]
+    allow_cidrs: Option<Vec<String>>,
     /// Outer wall-clock budget in seconds, covering **boot + exec** (boot costs
     /// ~0.4 s of the budget). Default 120, max 3600.
     #[serde(default)]
@@ -248,6 +263,104 @@ struct SandboxRunResult {
     /// Files streamed out of the guest via `copy_out` (omitted when none).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     copied: Vec<CopiedFileResult>,
+    /// The egress flight recorder: every destination this run reached and every
+    /// one it was refused. Present only when `allow_hosts`/`allow_cidrs` put the
+    /// run in filtered-egress mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egress: Option<EgressResult>,
+}
+
+/// The egress record for a filtered run, as returned by `sandbox_run`.
+///
+/// Host names here originate in untrusted guest code and are validated before
+/// recording: anything that is not a well-formed host name appears as
+/// `<invalid:N>` — the rejected byte count and nothing else — so a workload
+/// cannot inject text into the model's context through a destination name.
+#[derive(Debug, Serialize, JsonSchema)]
+struct EgressResult {
+    /// Always `"filtered"` when present.
+    mode: String,
+    /// The allowlist this run enforced, normalised.
+    allowed_rules: Vec<String>,
+    /// Connections the broker permitted (capped; see `truncated`).
+    allowed: Vec<EgressConnResult>,
+    /// Connections the broker refused, with a machine-readable `reason`.
+    denied: Vec<EgressDeniedResult>,
+    /// Names the workload asked to resolve, deduplicated. A name here that is
+    /// also in `denied` is a lookup that was refused — the signal that
+    /// something tried to reach a destination you did not allow.
+    dns_queries: Vec<String>,
+    /// Total decisions the broker made, including any beyond the inline caps.
+    total_events: u64,
+    /// `true` when a list above was capped; the full record is at
+    /// `egress_log_path`.
+    truncated: bool,
+    /// HOST path to the complete JSON Lines record for this run.
+    egress_log_path: String,
+}
+
+/// One permitted connection in [`EgressResult`].
+#[derive(Debug, Serialize, JsonSchema)]
+struct EgressConnResult {
+    /// Destination host or address.
+    host: String,
+    /// Destination port.
+    port: u16,
+    /// Milliseconds after the broker started listening.
+    ts_ms: u64,
+}
+
+/// One refused connection or lookup in [`EgressResult`].
+#[derive(Debug, Serialize, JsonSchema)]
+struct EgressDeniedResult {
+    /// Destination the workload asked for.
+    host: String,
+    /// Destination port (0 for a DNS lookup, which names no port).
+    port: u16,
+    /// Why it was refused: `not_allowed`, `literal_address`, `empty_allowlist`,
+    /// or `malformed`.
+    reason: String,
+    /// Milliseconds after the broker started listening.
+    ts_ms: u64,
+}
+
+impl From<vm::EgressReport> for EgressResult {
+    fn from(e: vm::EgressReport) -> Self {
+        Self {
+            mode: match e.mode {
+                vm::EgressMode::Filtered => "filtered".to_string(),
+                vm::EgressMode::Public => "public".to_string(),
+            },
+            allowed_rules: e.allowed_rules,
+            allowed: e
+                .allowed
+                .into_iter()
+                .map(|c| EgressConnResult {
+                    host: c.host,
+                    port: c.port,
+                    ts_ms: c.ts_ms,
+                })
+                .collect(),
+            denied: e
+                .denied
+                .into_iter()
+                .map(|d| EgressDeniedResult {
+                    host: d.host,
+                    port: d.port,
+                    // Reuse the serde spelling so CLI and MCP agree.
+                    reason: serde_json::to_value(d.reason)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "not_allowed".to_string()),
+                    ts_ms: d.ts_ms,
+                })
+                .collect(),
+            dns_queries: e.dns_queries,
+            total_events: e.total_events,
+            truncated: e.truncated,
+            egress_log_path: e.egress_log_path.to_string_lossy().into_owned(),
+        }
+    }
 }
 
 /// One file `copy_out` wrote to the host, as listed in [`SandboxRunResult`].
@@ -279,6 +392,7 @@ impl From<RunReport> for SandboxRunResult {
                 vm::RunPath::Warm => "warm".to_string(),
                 vm::RunPath::Cold => "cold".to_string(),
             },
+            egress: r.egress.map(EgressResult::from),
             resume_ms: r.resume_ms,
             snapshot_built: r.snapshot_built,
             commit_ms: r.commit_ms,
@@ -475,7 +589,10 @@ destroy). Use for executing code, builds, tests, package installs, or untrusted/
 commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the toolchain base \
 (Python/Node/git/gcc); pass `stage` to fork a committed stage, `commit_as` to persist the result \
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
-Networking on by default (network=false for untrusted code). timeout_s covers boot + exec \
+Networking on by default; pass network=false for no network at all, or \
+allow_hosts=['host', ...] for DEFAULT-DENY egress that reaches only those hosts \
+(host-enforced, outside the sandbox) and returns an `egress` record of every \
+allowed and denied destination. timeout_s covers boot + exec \
 (default 120, max 3600). Size the VM with vcpus (default 1) and mem_mib (default 512), both \
 host-capped. \
 For large stdin payloads pass stdin_file (a host path) instead of stdin; to extract build \
@@ -543,6 +660,25 @@ issue calls from separate agents.",
             (None, None) => None,
         };
 
+        // Either parameter present — even as an empty list — means "filtered".
+        // An absent parameter is the unfiltered default, byte-identical to 0.8.1.
+        let egress = match (&p.allow_hosts, &p.allow_cidrs) {
+            (None, None) => None,
+            (hosts, cidrs) => Some(isopod_core::vm::EgressPolicy {
+                hosts: hosts.clone().unwrap_or_default(),
+                cidrs: cidrs.clone().unwrap_or_default(),
+            }),
+        };
+        if egress.is_some() && p.network == Some(false) {
+            return Err(ErrorData::invalid_params(
+                "allow_hosts/allow_cidrs ask for a filtered network interface while \
+                 network=false attaches none at all. Pass allow_hosts for \
+                 default-deny egress, or network=false for no network."
+                    .to_string(),
+                None,
+            ));
+        }
+
         let opts = RunOptions {
             argv: vec!["/bin/sh".to_string(), "-c".to_string(), p.cmd],
             env,
@@ -551,6 +687,7 @@ issue calls from separate agents.",
             flavor: RootfsFlavor::DevAgent,
             keep: false,
             network: p.network.unwrap_or(true),
+            egress,
             stage,
             commit_as: p.commit_as,
             base,

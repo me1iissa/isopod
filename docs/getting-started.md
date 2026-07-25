@@ -151,26 +151,40 @@ sudo isopod setup
 
 This provisions, once:
 
-- **8 network slots** — tap devices `isopod-tap0..7`, owned by your user, so
-  no privilege is needed at runtime (`--slots N` for more);
+- **12 network slots** — tap devices `isopod-tap0..11`, owned by your user, so
+  no privilege is needed at runtime (`--slots N` for more). The pool is split:
+  - **8 public slots** — ordinary NAT egress to the public internet;
+  - **4 filtered slots** — used by runs with an egress allowlist (§5.1). They
+    forward *nothing*; their only reachable peer is a host-side broker.
+    `--filtered-slots M` changes the split; `--filtered-slots 0` provisions
+    none and reproduces the pre-0.9 ruleset exactly.
 - an **nftables table** doing NAT off your default-route interface
   (`--iface` to override) with guest→guest and guest→LAN blocking;
 - an **IP-forwarding sysctl** drop-in.
 
-Two things worth knowing:
+Three things worth knowing:
 
 - **Egress is public-only by default.** Guests can reach the internet but not
   your LAN, other RFC1918/CGNAT space, or link-local/metadata addresses.
   `--allow-lan-egress` disables that filter — it is explicitly insecure and
   exists for trusted-workload setups that need to reach LAN services.
+- **Filtered slots are a separate pool.** A run asking for an allowlist claims
+  one of the 4; a run without one claims from the 8 public slots. They never
+  compete. If the filtered pool is busy, the run waits for a filtered slot
+  rather than quietly falling back to unfiltered egress.
 - **Tap devices do not survive a reboot** (the sysctl does). If runs fail
   with a networking error after a host reboot — or a WSL2 shutdown — just
   re-run `sudo isopod setup`; it is idempotent.
 
 Verify it worked: `ip link | grep isopod-tap` should list the taps
-(`isopod-tap0` … `isopod-tap7`). If `setup` itself fails, the usual causes
+(`isopod-tap0` … `isopod-tap11`). If `setup` itself fails, the usual causes
 are `nft` missing (install `nftables`) or no default route to NAT off
 (pass `--iface <your-egress-interface>` explicitly).
+
+**Upgrading from 0.8.x?** An existing `slots.json` keeps working untouched and
+all your slots stay public. The first run that asks for an allowlist fails
+before boot and prints the exact command to re-provision — nothing changes
+underneath you until you run it.
 
 `sudo isopod setup --remove` tears everything back down (taps, nftables
 table, sysctl file).
@@ -186,6 +200,10 @@ isopod run --stage base --base base-alpine -- python3 -c 'print(6*7)'
 
 # Untrusted code: no NIC at all.
 isopod run --no-network --stage base --base base-alpine -- python3 suspicious.py
+
+# Untrusted code that still needs one dependency source: default-deny egress.
+isopod run --allow-host pypi.org --allow-host '*.pythonhosted.org' \
+  --stage base --base base-alpine -- pip install requests
 
 # Pull just the fields you care about.
 isopod run --stage base --base base-alpine -- uname -a | jq '{exit_code, stdout}'
@@ -210,6 +228,70 @@ A successful run prints one JSON object (host paths yours, of course):
 The fields you'll look at most: `exit_code` + `stdout` (your command's
 result), `path` (`"warm"` = snapshot resume, `"cold"` = full boot), and the
 `*_log_path`s (the full, uncapped output when `stdout_truncated` is true).
+
+### 5.1 Filtered egress — the allowlist the guest cannot rewrite
+
+`--allow-host` (repeatable) switches a run to **default-deny** egress. It
+claims a filtered slot, which the nftables ruleset drops all forwarding from,
+and reaches the network only through a broker running on the host — outside the
+sandbox, where no code in the guest can address it.
+
+```bash
+isopod run --allow-host pypi.org -- python3 -c \
+  "import urllib.request; print(urllib.request.urlopen('https://pypi.org/simple/').read(40))"
+```
+
+- `--allow-host pypi.org` — an exact name.
+- `--allow-host '*.pythonhosted.org'` — one wildcard label. It matches
+  `files.pythonhosted.org` but **not** the apex `pythonhosted.org` and not
+  `a.b.pythonhosted.org`. Quote it, or your shell will glob it.
+- `--allow-cidr 192.0.2.0/24` — for tools that dial an address rather than a
+  name. A literal address is never matched against `--allow-host` patterns.
+- `--deny-egress` — deny everything, but still record every attempt. This is
+  the one to reach for when you want to *find out* what a dependency contacts.
+
+Every run in this mode returns an `egress` block:
+
+```json
+"egress": {
+  "mode": "filtered",
+  "allowed_rules": ["pypi.org", "*.pythonhosted.org"],
+  "allowed": [{"host": "pypi.org", "port": 443, "ts_ms": 521}],
+  "denied": [
+    {"host": "example.com", "port": 443, "reason": "not_allowed", "ts_ms": 554},
+    {"host": "exfil.evil.example.com", "port": 0, "reason": "not_allowed", "ts_ms": 556}
+  ],
+  "dns_queries": ["exfil.evil.example.com"],
+  "total_events": 4, "truncated": false,
+  "egress_log_path": "/home/you/.isopod/vms/dev-b806c77a/egress.jsonl"
+}
+```
+
+A `denied` entry with `"port": 0` is a **DNS lookup** that was refused — the
+guest has no route to any resolver but the broker, so a name you did not allow
+cannot even be resolved, let alone contacted. The lists are capped at 64
+entries inline (`truncated` tells you when that bit); the complete record is
+JSON Lines at `egress_log_path`.
+
+Filtered runs stay warm-pool eligible, so this costs a normal warm resume
+(~74 ms measured), not a cold boot.
+
+**Common surprises:**
+
+- *"No filtered-egress slots"* — the host was provisioned before 0.9, or with
+  `--filtered-slots 0`. The error prints the exact `sudo isopod setup` line.
+- *`--no-network` with an allowlist is a hard error.* No NIC and a filtered NIC
+  are different modes; isopod refuses to guess.
+- *A tool reports a network error rather than a policy denial.* Anything that
+  reads neither the `*_PROXY` environment nor `getaddrinfo` never reaches the
+  broker, so the packet filter simply drops it. Busybox `wget` built without
+  TLS is the common case: it sends `GET https://…` to the proxy instead of
+  `CONNECT`, and gets a `501` that says so. Use a proxy-aware client (curl,
+  python, pip, npm, git all work) — the recorded `note` field names the cause.
+
+What this does **not** do: allowlisting is destination control, not data-loss
+prevention. If you allow `github.com`, data can leave to `github.com`.
+[SECURITY.md](../SECURITY.md) states the full set of claims and non-claims.
 
 `--stage base` starts from a fresh squashfs base image with zero committed
 layers. Two bases exist:

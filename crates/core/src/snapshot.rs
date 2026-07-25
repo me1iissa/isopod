@@ -646,6 +646,7 @@ pub async fn resume(
     slot: &net::Slot,
     vm_dir: &Path,
     jail_prefix: Vec<String>,
+    broker: Option<&net::broker::BrokerEndpoints>,
 ) -> Result<(FcProcess, AgentClient)> {
     let artifacts = artifacts_for(key)?;
     if !artifacts.is_complete() {
@@ -699,9 +700,22 @@ pub async fn resume(
             )
         })?;
     // Re-IP eth0 into the CLAIMED slot's /30 (the snapshot baked the build-time
-    // slot's address). Without this, NAT would not route.
+    // slot's address). Without this, NAT would not route. A filtered run also
+    // hands over its broker endpoints here and points the resolver at the
+    // gateway: the snapshot was built on a public slot, so its baked resolvers
+    // are exactly the ones this slot may not reach.
+    let (dns, broker_cfg) = match broker {
+        Some(b) => (
+            vec![b.dns.clone()],
+            Some(isopod_proto::BrokerConfig {
+                socks: b.socks.clone(),
+                http: b.http.clone(),
+            }),
+        ),
+        None => (default_dns_list(), None),
+    };
     agent
-        .configure_net(&slot.guest_cidr(), &slot.host_ip(), &default_dns_list())
+        .configure_net(&slot.guest_cidr(), &slot.host_ip(), &dns, broker_cfg)
         .await
         .context("reconfiguring guest network after resume")?;
     // The resumed guest's wall clock is as stale as the snapshot; resync it.

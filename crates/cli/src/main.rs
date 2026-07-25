@@ -73,6 +73,12 @@ struct SetupArgs {
     /// from untrusted guests. Default off (public-only egress).
     #[arg(long = "allow-lan-egress")]
     allow_lan_egress: bool,
+    /// How many of the provisioned slots are filtered-egress (taken from the top
+    /// of the pool). Filtered slots forward nothing and reach only the egress
+    /// broker on their own gateway; `isopod run --allow-host` claims one. Pass 0
+    /// to provision none, reproducing the pre-0.9 ruleset exactly.
+    #[arg(long = "filtered-slots", default_value_t = isopod_core::net::DEFAULT_FILTERED_SLOTS)]
+    filtered_slots: usize,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +154,24 @@ struct RunArgs {
     /// completed without timing out; a copy failure fails the run.
     #[arg(long = "copy-out", value_name = "GUEST:HOST")]
     copy_out: Vec<String>,
+    /// Permit egress to this host (repeatable). Presence switches the run to
+    /// FILTERED egress: a slot that forwards nothing, with a host-side broker
+    /// that allows only what is listed here. Accepts an exact name
+    /// (`pypi.org`) or one leading wildcard label (`*.pythonhosted.org`, which
+    /// does NOT match the apex). Requires `sudo isopod setup --filtered-slots`.
+    #[arg(long = "allow-host", value_name = "PATTERN")]
+    allow_host: Vec<String>,
+    /// Permit egress to literal addresses in this CIDR (repeatable), for tools
+    /// that dial an address rather than a name. Also switches the run to
+    /// filtered egress. A literal address is never matched against `--allow-host`
+    /// patterns.
+    #[arg(long = "allow-cidr", value_name = "CIDR")]
+    allow_cidr: Vec<String>,
+    /// Deny ALL egress while still recording every attempt (filtered mode with
+    /// an empty allowlist). Useful for watching what an untrusted dependency
+    /// tries to reach. Mutually exclusive with --allow-host / --allow-cidr.
+    #[arg(long = "deny-egress")]
+    deny_egress: bool,
     /// Command to run, after `--`, e.g. `isopod run -- /bin/sh -c "echo hi"`.
     #[arg(last = true, required = true)]
     argv: Vec<String>,
@@ -270,6 +294,7 @@ fn run_setup(args: SetupArgs) -> i32 {
             remove: args.remove,
             iface: args.iface,
             allow_lan_egress: args.allow_lan_egress,
+            filtered_slots: args.filtered_slots,
         },
     ))
 }
@@ -418,6 +443,34 @@ fn run_run(args: RunArgs) -> i32 {
                 )),
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // Filtered egress: any allow flag, or an explicit --deny-egress, moves
+        // the run onto a filtered slot. `--no-network` is a different mode
+        // entirely (no NIC at all), so combining them is a hard error rather
+        // than a silent precedence rule.
+        let wants_filtered = !args.allow_host.is_empty() || !args.allow_cidr.is_empty();
+        if args.deny_egress && wants_filtered {
+            anyhow::bail!(
+                "--deny-egress denies everything, so it cannot be combined with \
+                 --allow-host / --allow-cidr; drop one"
+            );
+        }
+        let egress = if wants_filtered || args.deny_egress {
+            if args.no_network {
+                anyhow::bail!(
+                    "--no-network attaches no network interface at all, while \
+                     --allow-host / --allow-cidr / --deny-egress ask for a filtered \
+                     one; pass only one of the two"
+                );
+            }
+            Some(vm::EgressPolicy {
+                hosts: args.allow_host,
+                cidrs: args.allow_cidr,
+            })
+        } else {
+            None
+        };
+
         vm::run_ephemeral(RunOptions {
             argv: args.argv,
             env,
@@ -434,6 +487,7 @@ fn run_run(args: RunArgs) -> i32 {
             mem_mib: args.mem_mib,
             scratch_mib: args.scratch_mib,
             copy_out,
+            egress,
         })
     })();
     emit(result)

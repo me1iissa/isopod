@@ -6,6 +6,40 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.9.0] — 2026-07-25
+
+- **Per-run egress allowlists — the allowlist the agent cannot rewrite.**
+  `isopod run --allow-host pypi.org --allow-host '*.pythonhosted.org'` (or
+  `sandbox_run(allow_hosts=[…])` over MCP) switches a run to **default-deny**
+  egress: it claims a *filtered* network slot, which the setup-time nftables
+  ruleset drops all forwarding from, and reaches the network only through a
+  host-side broker that enforces the allowlist. Policy lives on the host,
+  outside the guest boundary; a root guest can neither reach an unlisted
+  destination nor edit the rules.
+  - `--allow-cidr` permits literal addresses for tools that dial one. A literal
+    address is never matched against `--allow-host` patterns.
+  - `--deny-egress` denies everything while still recording every attempt —
+    for watching what an untrusted dependency tries to reach.
+- **DNS exfiltration is closed.** A filtered slot's `:53` is redirected to a
+  host-side responder that answers allowlisted names and `NXDOMAIN`s the rest,
+  so the guest has no path to an attacker-chosen resolver. Every query is
+  recorded.
+- **The egress flight recorder.** `RunReport.egress` lists every allowed and
+  denied connection and every name resolved, with the complete record at
+  `~/.isopod/vms/<id>/egress.jsonl`. All names are validated before recording:
+  anything that is not a well-formed host name is stored as `<invalid:N>`, so
+  guest-chosen bytes never reach an operator's terminal or a calling model's
+  context.
+- **Setup provisions 12 slots by default (8 public + 4 filtered).** The filtered
+  slots are *added* to the pool, so existing public concurrency is unchanged.
+  Tune with `sudo isopod setup --slots N --filtered-slots M`; `--filtered-slots
+  0` reproduces the 0.8.1 ruleset byte-for-byte.
+- **No behaviour change without the new flags.** A run with no allowlist takes
+  the same public slot, the same ruleset, and the same `RunReport` shape as
+  0.8.1 — asserted against a checked-in ruleset fixture and a report-shape test.
+  A pre-0.9 `slots.json` keeps working; the first filtered run against one fails
+  before boot with the exact re-provisioning command.
+
 ## [0.8.1] — 2026-07-23
 
 - Fix the release packaging: cargo-deb rejects explicit cross-target asset

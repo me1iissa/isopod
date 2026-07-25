@@ -129,6 +129,8 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `stage` | `"base"` | A committed stage's id/vanity-name/label to fork from, or the reserved word `"base"` for a fresh VM with zero committed layers on the toolchain image. |
 | `base` | `"base-alpine"` | Squashfs base for a `stage="base"` run: `base-alpine` (python3/pip, node, git, gcc) or `base-sqfs` (minimal busybox, no toolchain). Ignored when forking an existing stage — forks always reuse the base that stage was built on. |
 | `network` | `true` | Set `false` for untrusted code — no NIC is attached at all; exec still works (control RPC is vsock, not the network). |
+| `allow_hosts` | — | **Default-deny egress.** Setting it — even to `[]` — switches the run to a *filtered* slot that forwards nothing, plus a host-side broker enforcing this list. Exact names (`"pypi.org"`) or one leading wildcard label (`"*.pythonhosted.org"`, which does **not** match the apex). `[]` denies everything while still recording what was attempted. Cannot be combined with `network=false`. Needs `sudo isopod setup --filtered-slots`. |
+| `allow_cidrs` | — | Permit literal IP destinations (e.g. `["192.0.2.0/24"]`) for tools that dial an address rather than a name. Also switches the run to filtered egress. A literal address is never matched against `allow_hosts` patterns. |
 | `timeout_s` | `120` | **Outer wall-clock budget that includes VM boot** (~0.4 s), not exec-only time. |
 | `cwd` | guest default (`/root`) | Working directory inside the guest. |
 | `env` | `{}` | Extra environment variables as a flat `KEY: "VALUE"` object. |
@@ -144,14 +146,29 @@ Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
 total_ms, path, resume_ms?, snapshot_built, commit_ms?, vcpus, mem_mib,
 vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?, guest_ip?,
-stdout_log_path, stderr_log_path, serial_log_path, copied?}`. Highlights:
+stdout_log_path, stderr_log_path, serial_log_path, copied?, egress?}`. Highlights:
 `stdout`/`stderr` are 64 KiB **inline** heads with exact byte totals
 alongside and full logs at the `*_log_path`s (the on-disk logs have their
 own, much larger caps — see SECURITY.md); `path` says whether the run resumed
 `"warm"` or booted `"cold"` (with `resume_ms` on warm runs and
 `snapshot_built` flagging the one-time cache build); `stage_*` appear only
 when `commit_as` actually committed; `guest_ip`/`slot` only when networking
-was on.
+was on; `egress` only on a filtered run.
+
+### `egress` — the flight recorder
+
+A filtered run returns `egress: {mode, allowed_rules, allowed[], denied[],
+dns_queries[], total_events, truncated, egress_log_path}`. `allowed` and
+`denied` list every connection the broker permitted and refused (with a
+machine-readable `reason`), and `dns_queries` every name the workload asked to
+resolve — including the ones that were refused, which is the signal that
+something tried to phone home. Each list is capped at 64 entries inline with
+`truncated` set; the complete record is JSON Lines at `egress_log_path`.
+
+Host names in this structure come from untrusted guest code and are validated
+before recording: anything that is not a well-formed host name appears as
+`<invalid:N>` (the byte count, nothing else), so a malicious dependency cannot
+inject text into your context through a destination name.
 
 ## Example prompts
 
@@ -168,6 +185,15 @@ rest of this session."**
 `sandbox_run(..., stage="<project>/data-deps")` in the same or a later
 session forks that environment instead of reinstalling. Verify with
 `stage_info(reference="<project>/data-deps")`.
+
+**"Install this package but don't let anything else reach the network."**
+→ `sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org",
+"*.pythonhosted.org"])`. Anything the install tries to reach beyond those two
+fails closed and is listed in the result's `egress.denied`.
+
+**"Run this dependency and show me what it tries to contact."**
+→ `sandbox_run(cmd="node index.js", allow_hosts=[])` — everything is denied,
+but every attempted connection and DNS lookup is recorded in `egress`.
 
 **"Test this untrusted script without giving it network access, then clean
 up."**

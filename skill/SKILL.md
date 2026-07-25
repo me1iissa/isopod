@@ -80,7 +80,7 @@ memorable across a conversation the way a chosen label is.
 forking an existing stage always reuses whatever base it was built on
 (mixing bases mid-chain would silently break the overlay).
 
-## Untrusted code: turn networking off
+## Untrusted code: turn networking off, or lock it down
 
 Set `network=false` for anything you don't want reaching the internet —
 untrusted snippets, unreviewed scripts, adversarial input. Exec still works
@@ -90,6 +90,26 @@ route out.
 ```
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
+
+When the workload genuinely needs *one* source — a package index, one API —
+use `allow_hosts` instead of an all-or-nothing choice. The run gets
+**default-deny** egress: only the listed hosts are reachable, enforced on the
+host outside the sandbox, and everything else fails closed.
+
+```
+sandbox_run(cmd="pip install requests",
+            allow_hosts=["pypi.org", "*.pythonhosted.org"])
+```
+
+`*.pythonhosted.org` matches exactly one label and **not** the apex — list both
+if you need both. `allow_cidrs` does the same for literal IP destinations. This
+needs the host to have been provisioned with filtered slots (`sudo isopod setup
+--filtered-slots`, on by default since 0.9.0); if it wasn't, the call fails
+before boot with the command to fix it.
+
+Pass `allow_hosts=[]` to deny everything while still recording every attempt —
+the result's `egress` field then shows exactly what the code tried to contact,
+which is how you find out whether a dependency phones home.
 
 ## Big inputs and parallelism
 
@@ -134,6 +154,8 @@ auto-pruned**:
 | Save a built environment | `sandbox_run(cmd=..., stage="base", commit_as="proj/purpose")` |
 | Reuse a saved environment | `sandbox_run(cmd=..., stage="proj/purpose")` |
 | Untrusted input | `sandbox_run(cmd=..., network=false)` |
+| Untrusted input that needs one host | `sandbox_run(cmd=..., allow_hosts=["pypi.org"])` |
+| See what a dependency contacts | `sandbox_run(cmd=..., allow_hosts=[])`, then read `egress` |
 | Minimal image, no toolchain | `sandbox_run(cmd=..., stage="base", base="base-sqfs")` |
 | See what's stored | `stage_list()`, `vm_list()` |
 | Clean up | `vm_gc()`, `stage_rm(reference=...)` |
