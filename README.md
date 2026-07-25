@@ -232,7 +232,7 @@ sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
 ```
-sandbox_run(cmd="curl -sS $ISOPOD_CREDENTIAL_ENDPOINT/github/user", inject=["github"])
+sandbox_run(cmd="wget -qO- $ISOPOD_CREDENTIAL_ENDPOINT/github/user", inject=["github"])
 ```
 
 The run names the alias, never the secret. The broker builds each upstream

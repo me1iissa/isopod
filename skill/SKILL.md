@@ -118,7 +118,7 @@ declared on the host. You cannot name a secret, a host, or a permission from
 here — all of that lives in the operator's `~/.isopod/credentials.json`.
 
 ```
-sandbox_run(cmd="curl -sS $ISOPOD_CREDENTIAL_ENDPOINT/github/user",
+sandbox_run(cmd="wget -qO- $ISOPOD_CREDENTIAL_ENDPOINT/github/user",
             inject=["github"])
 ```
 

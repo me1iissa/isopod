@@ -125,7 +125,7 @@ way to say *which secret* or *which host* at call time.
 
 ```bash
 isopod run --inject github -- \
-  sh -c 'curl -sS "$ISOPOD_CREDENTIAL_ENDPOINT/github/user"'
+  sh -c 'wget -qO- "$ISOPOD_CREDENTIAL_ENDPOINT/github/user"'
 ```
 
 ```jsonc
@@ -137,6 +137,17 @@ Inside the guest, `$ISOPOD_CREDENTIAL_ENDPOINT` is set **only when this run has
 a credential**, so a script can test for it rather than guessing. The path is
 `/<alias>/<path>`; everything after the alias is the request the credential will
 authorise, if the `allow` list permits it.
+
+> **`curl` is not in the base images.** `base-alpine` ships `wget`, `python3`,
+> `node`, `git` and `gcc`; `base-sqfs` is busybox. Use `wget -qO-`, or
+> `urllib`/`fetch` from a language runtime. Installing `curl` works too, but
+> needs its package index on the allowlist (`--allow-host dl-cdn.alpinelinux.org`),
+> which is a wider grant than the credential itself.
+
+Any client works — the endpoint speaks ordinary HTTP/1.1 on the gateway. Note
+that `NO_PROXY` covers the gateway, but a client that ignores `NO_PROXY`
+(busybox `wget` does) still reaches the endpoint: a credential call arriving via
+the proxy port is served rather than refused.
 
 `--inject` also switches the run to **filtered egress**, exactly as
 `--allow-host` does. That is not a convenience — a credential arriving on a
