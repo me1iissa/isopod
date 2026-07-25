@@ -6,7 +6,7 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
-## Unreleased
+## Unreleased (0.10.0 line)
 
 - **Credential injection — the enforcement core.** Landing in 0.10.0. A run
   names an *alias*; the operator declares on the host which secret it is, the

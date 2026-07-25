@@ -2,13 +2,32 @@
 
 [![CI](https://github.com/me1iissa/isopod/actions/workflows/ci.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/ci.yml)
 
-**A Firecracker-microVM sandbox for Claude Code — run a command in a fast, hardware-isolated microVM that is destroyed after every call.**
+**Run untrusted code in a real microVM. Boots in ~0.4 s, destroyed after every call.**
 
-📖 **Documentation: [me1iissa.github.io/isopod](https://me1iissa.github.io/isopod/)** — rendered from the Markdown in this repository.
+isopod gives coding agents somewhere to run commands that isn't your machine. Each call boots a
+[Firecracker](https://firecracker-microvm.github.io/) microVM, runs one command inside it, and throws
+the VM away. Isolation is the KVM hardware boundary, not a shared kernel.
 
-isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM, execs one command inside it over vsock, and tears the VM down — end to end in **~0.4 s** at p50, with a warm-pool resume in **~49 ms** ([measured](BENCHMARKS.md)). Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
+- **Fast enough to use per-action** — ~0.4 s cold, **~49 ms** from the warm pool ([measured](BENCHMARKS.md)).
+- **Egress allowlists the guest cannot rewrite.** Name the hosts a run may reach; everything else fails
+  closed. Enforced by nftables and a host-side broker, outside the sandbox.
+- **A flight recorder for the network.** Every destination allowed and refused, every name resolved, with
+  byte volumes — so you can watch a dependency try to phone home.
+- **Nothing from your filesystem is shared in.** No bind mounts, no 9p. Files move only over explicit RPC.
+- **Environments persist as stages,** not long-lived sandboxes. Commit what a run changed, fork it later;
+  content-addressed and immutable.
+- **One core, two front ends** — an **MCP server** for Claude Code and a **CLI** for humans and CI.
+- **Auditable.** The whole enforcement path is a few files of Rust you can read, and the security claims
+  ship with [the bypass attempts that test them](docs/egress-ledger.md).
 
-> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels) and, at 0.9.0, **per-run egress allowlists** the guest cannot rewrite. In flight for 0.10.0: **host-declared credentials** a run can spend but never read. Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
+📖 **[Documentation](https://me1iissa.github.io/isopod/)** · [Security model](SECURITY.md) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md)
+
+```bash
+sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted.org"])
+```
+
+> Pre-1.0 and moving quickly; `main` is the supported line. Newest: per-run egress allowlists (0.9.0).
+> In flight: host-declared credentials a run can spend but never read ([design](docs/credentials.md)).
 
 ---
 
