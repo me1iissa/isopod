@@ -6,6 +6,29 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.9.1] — 2026-07-25
+
+- **The egress flight recorder now records volume.** `bytes_up`/`bytes_down`
+  were in the schema but always `0` — the byte pump discarded its counts.
+  Counting is now incremental (as bytes flow, not at close), because a run ends
+  with the guest vanishing rather than closing its sockets, so a close-triggered
+  count read `0` for exactly the transfers worth seeing. Volume per destination
+  is the one signal a destination allowlist cannot give on its own.
+- **Image staleness compares the guest agent, not just the protocol version.**
+  An additive, wire-compatible protocol change bumps no version, so a rebuilt
+  guest agent left every image reporting fresh while still embedding the old
+  one — which is exactly what happened to filtered egress in 0.9.0, and it
+  presented as an unexplained network outage rather than a policy decision. The
+  hash was already recorded in each image's sidecar; it is now checked, in
+  `image ls` (with a `stale_reason`) and in the pre-boot guard.
+- **Published the egress bypass ledger** ([docs/egress-ledger.md](docs/egress-ledger.md)):
+  ten attempted bypasses run against a real VM, each recording which of the two
+  layers caught it. Notably, DNS aimed straight at `8.8.8.8` is **transparently
+  intercepted** by the broker rather than dropped, so malware with a hardcoded
+  resolver is policy-enforced instead of merely failing.
+- CI now compiles the `#[ignore]`d live tests (`cargo test --no-run`) so they
+  cannot rot silently between hand-run ledger passes.
+
 ## [0.9.0] — 2026-07-25
 
 - **Per-run egress allowlists — the allowlist the agent cannot rewrite.**

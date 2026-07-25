@@ -348,6 +348,7 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 | [CHANGELOG.md](CHANGELOG.md) | Release history. |
 | [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
 | [docs/sandbox-build.md](docs/sandbox-build.md) | Building isopod inside its own sandboxes (dogfood recipe). |
+| [docs/egress-ledger.md](docs/egress-ledger.md) | Filtered-egress bypass attempts run against a real VM: what was tried, which layer caught it, and what the flight recorder saw. |
 | [docs/feasibility.md](docs/feasibility.md), [docs/m4-verify.md](docs/m4-verify.md), [docs/dogfood-findings.md](docs/dogfood-findings.md) | Engineering logs: the M0 spike results, M4 network verification, and the running dogfood findings ledger. |
 
 ---

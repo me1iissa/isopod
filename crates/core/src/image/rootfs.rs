@@ -324,6 +324,23 @@ pub struct ImageMeta {
     pub built_unix: u64,
 }
 
+/// The sha256 of this host's `isopod-guest-agent`, computed once per process.
+///
+/// `None` when the binary cannot be located or read — a packaged install that
+/// never builds images, or a workspace where the musl target has not been
+/// compiled. That case must stay usable: the agent binary is only *required*
+/// to build an image, not to run one, so its absence downgrades the freshness
+/// check to a no-op rather than failing the run.
+fn host_agent_sha256() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let agent = locate_guest_agent().ok()?;
+            paths::sha256_file(&agent).ok()
+        })
+        .as_deref()
+}
+
 /// Sidecar path for an image: `<image>.meta.json`.
 fn image_meta_path(image: &Path) -> PathBuf {
     let mut s = image.as_os_str().to_owned();
@@ -378,6 +395,13 @@ pub fn read_image_meta(image: &Path) -> Result<Option<ImageMeta>> {
 /// findings #17/#19). A missing or unreadable sidecar only warns: images built
 /// before stamping existed must keep working.
 pub fn check_image_proto(image: &Path) -> Result<()> {
+    check_image_freshness(image, host_agent_sha256())
+}
+
+/// Core of [`check_image_proto`] with the host's agent hash injected, so the
+/// mismatch/skip branches are unit-testable without a built musl agent on the
+/// machine running the tests.
+fn check_image_freshness(image: &Path, host_agent: Option<&str>) -> Result<()> {
     match read_image_meta(image) {
         Ok(Some(meta)) => {
             if let Some(v) = meta.proto_version {
@@ -387,6 +411,24 @@ pub fn check_image_proto(image: &Path) -> Result<()> {
                          v{} — rebuild every guest image together: `isopod image build-all`",
                         image.display(),
                         isopod_proto::PROTO_VERSION,
+                    );
+                }
+            }
+            // The agent binary can change without the protocol changing: an
+            // additive, wire-compatible field bumps no version, yet the guest
+            // BEHAVIOUR differs. 0.9.0 shipped exactly that (the proxy
+            // environment for filtered egress), and images kept reporting fresh
+            // while carrying the old agent — a feature that then failed as an
+            // unexplained network outage rather than a policy decision.
+            if let (Some(stamped), Some(host)) = (&meta.agent_sha256, host_agent) {
+                if stamped != host {
+                    bail!(
+                        "guest image {} embeds guest-agent {}…, but this isopod's agent is \
+                         {}… — the image predates the agent you are running. Rebuild every \
+                         guest image together: `isopod image build-all`",
+                        image.display(),
+                        &stamped[..stamped.len().min(12)],
+                        &host[..host.len().min(12)],
                     );
                 }
             }
@@ -440,8 +482,12 @@ pub struct ImageEntry {
     pub proto_version: Option<u32>,
     /// Present but carrying no sidecar (built before stamping landed).
     pub unstamped: bool,
-    /// Sidecar proto disagrees with this host build — rebuild required.
+    /// Sidecar disagrees with this host build — rebuild required.
     pub stale: bool,
+    /// Which check failed, when [`stale`](Self::stale) is set: `"proto"` or
+    /// `"agent"`. Absent on a fresh image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<&'static str>,
     /// Unix build time from the sidecar.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_unix: Option<u64>,
@@ -474,15 +520,31 @@ pub fn list_images() -> Result<ImageList> {
             .then(|| std::fs::metadata(&path).map(|m| m.len()).ok())
             .flatten();
         let proto_version = meta.as_ref().and_then(|m| m.proto_version);
-        let stale = matches!(proto_version, Some(v) if v != isopod_proto::PROTO_VERSION);
+        let proto_stale = matches!(proto_version, Some(v) if v != isopod_proto::PROTO_VERSION);
+        let agent_stale = match (
+            meta.as_ref().and_then(|m| m.agent_sha256.as_deref()),
+            host_agent_sha256(),
+        ) {
+            (Some(stamped), Some(host)) => stamped != host,
+            // No stamp or no local agent to compare against: not a mismatch.
+            _ => false,
+        };
+        let stale_reason = if proto_stale {
+            Some("proto")
+        } else if agent_stale {
+            Some("agent")
+        } else {
+            None
+        };
         images.push(ImageEntry {
+            stale_reason,
             flavor: flavor.slug().to_string(),
             path,
             present,
             bytes_apparent,
             proto_version,
             unstamped: present && meta.is_none(),
-            stale,
+            stale: proto_stale || agent_stale,
             built_unix: meta.as_ref().map(|m| m.built_unix),
         });
     }
@@ -1385,6 +1447,65 @@ mod tests {
     }
 
     #[test]
+    fn stale_agent_is_caught_even_when_the_proto_version_matches() {
+        // The trap this closes: an additive, wire-compatible protocol change
+        // bumps no version, so a rebuilt guest agent leaves every image
+        // reporting fresh while still carrying the OLD agent. 0.9.0 shipped
+        // exactly that shape (the proxy environment for filtered egress) and
+        // the feature failed as an unexplained network outage.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("base-alpine.sqfs");
+        std::fs::write(&img, b"fake image").unwrap();
+
+        let meta = ImageMeta {
+            flavor: "base-alpine".into(),
+            // Current protocol — the old check would pass this unconditionally.
+            proto_version: Some(isopod_proto::PROTO_VERSION),
+            agent_sha256: Some("aa".repeat(32)),
+            sha256: "cd".repeat(32),
+            built_unix: 1,
+        };
+        std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        // A host running a different agent must be told to rebuild.
+        let err = check_image_freshness(&img, Some(&"bb".repeat(32)))
+            .expect_err("a changed agent must fail the pre-boot guard")
+            .to_string();
+        assert!(err.contains("embeds guest-agent"), "{err}");
+        assert!(err.contains("isopod image build-all"), "{err}");
+        // The message names both hashes so the mismatch is diagnosable, but
+        // truncated — a full 64-char pair either side is noise in a terminal.
+        assert!(err.contains("aaaaaaaaaaaa"), "{err}");
+        assert!(err.contains("bbbbbbbbbbbb"), "{err}");
+
+        // The matching agent passes.
+        check_image_freshness(&img, Some(&"aa".repeat(32))).unwrap();
+
+        // No local agent to compare against (a packaged install that never
+        // builds images) must stay usable rather than failing every run.
+        check_image_freshness(&img, Some("")).unwrap_err();
+        check_image_freshness(&img, None).unwrap();
+    }
+
+    #[test]
+    fn agent_less_flavors_are_never_agent_stale() {
+        // busybox images carry no agent, so there is nothing to compare and the
+        // guard must not invent a mismatch.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("base.sqfs");
+        std::fs::write(&img, b"fake image").unwrap();
+        let meta = ImageMeta {
+            flavor: "base-sqfs".into(),
+            proto_version: None,
+            agent_sha256: None,
+            sha256: "cd".repeat(32),
+            built_unix: 1,
+        };
+        std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
+        check_image_freshness(&img, Some(&"bb".repeat(32))).unwrap();
+    }
+
+    #[test]
     fn image_meta_sidecar_round_trip_and_proto_check() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("base-alpine.sqfs");
@@ -1392,7 +1513,7 @@ mod tests {
 
         // No sidecar: read gives None, check warns-and-passes.
         assert!(read_image_meta(&img).unwrap().is_none());
-        check_image_proto(&img).unwrap();
+        check_image_freshness(&img, None).unwrap();
 
         // Current-proto sidecar: passes.
         let meta = ImageMeta {
@@ -1407,7 +1528,7 @@ mod tests {
             read_image_meta(&img).unwrap().unwrap().flavor,
             "base-alpine"
         );
-        check_image_proto(&img).unwrap();
+        check_image_freshness(&img, None).unwrap();
 
         // Stale-proto sidecar: refused, naming the rebuild command.
         let stale = ImageMeta {
@@ -1415,7 +1536,7 @@ mod tests {
             ..meta.clone()
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&stale).unwrap()).unwrap();
-        let err = check_image_proto(&img).unwrap_err().to_string();
+        let err = check_image_freshness(&img, None).unwrap_err().to_string();
         assert!(err.contains("build-all"), "error must name the fix: {err}");
 
         // Agent-less sidecar (proto None, dev-busybox): always passes.
@@ -1426,7 +1547,7 @@ mod tests {
             ..meta
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&busybox).unwrap()).unwrap();
-        check_image_proto(&img).unwrap();
+        check_image_freshness(&img, None).unwrap();
     }
 
     #[test]

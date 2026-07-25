@@ -164,11 +164,30 @@ impl Recorder {
 
     /// Record one event. A poisoned lock is swallowed: losing a log line must
     /// never take down a run, and the enforcement decision has already happened.
-    fn record(&self, event: EgressEvent) {
+    fn record(&self, event: EgressEvent) -> Option<usize> {
+        let mut shared = self.shared.lock().ok()?;
+        shared.total = shared.total.saturating_add(1);
+        if shared.events.len() >= MAX_RECORDED_EVENTS {
+            return None;
+        }
+        shared.events.push(event);
+        Some(shared.events.len() - 1)
+    }
+
+    /// Add to a recorded connection's running byte counts.
+    ///
+    /// Counting happens **as bytes flow**, not when the connection closes.
+    /// Closing is the wrong trigger: the splice has no idle timeout (a legitimate
+    /// long poll may send nothing for minutes), and when a run ends the guest
+    /// simply vanishes without a FIN — so a close-triggered count would read 0
+    /// for exactly the transfers an operator most wants to see. Accumulating
+    /// keeps the record accurate for a connection that is still open.
+    fn add_bytes(&self, slot: Option<usize>, bytes_up: u64, bytes_down: u64) {
+        let Some(i) = slot else { return };
         if let Ok(mut shared) = self.shared.lock() {
-            shared.total = shared.total.saturating_add(1);
-            if shared.events.len() < MAX_RECORDED_EVENTS {
-                shared.events.push(event);
+            if let Some(event) = shared.events.get_mut(i) {
+                event.bytes_up = event.bytes_up.saturating_add(bytes_up);
+                event.bytes_down = event.bytes_down.saturating_add(bytes_down);
             }
         }
     }
@@ -444,8 +463,8 @@ impl Policy {
         }
     }
 
-    fn record(&self, event: EgressEvent) {
-        self.recorder.record(event);
+    fn record(&self, event: EgressEvent) -> Option<usize> {
+        self.recorder.record(event)
     }
 
     fn now_ms(&self) -> u64 {
@@ -458,7 +477,11 @@ use super::egress::Decision;
 /// Resolve `target` host-side and connect, recording the outcome.
 ///
 /// Returns the connected stream and the name to attribute traffic to.
-async fn dial(policy: &Policy, target: &Target, proto: Proto) -> Result<TcpStream, DialFailure> {
+async fn dial(
+    policy: &Policy,
+    target: &Target,
+    proto: Proto,
+) -> Result<(TcpStream, Option<usize>), DialFailure> {
     let port = target.port();
     let name = match policy.check(target) {
         Verdict::Allow(name) => name,
@@ -514,7 +537,7 @@ async fn dial(policy: &Policy, target: &Target, proto: Proto) -> Result<TcpStrea
     for addr in addrs {
         match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                policy.record(EgressEvent {
+                let slot = policy.record(EgressEvent {
                     proto,
                     host: name,
                     port,
@@ -525,7 +548,7 @@ async fn dial(policy: &Policy, target: &Target, proto: Proto) -> Result<TcpStrea
                     ts_ms: policy.now_ms(),
                     note: None,
                 });
-                return Ok(stream);
+                return Ok((stream, slot));
             }
             _ => continue,
         }
@@ -577,11 +600,11 @@ async fn handle_socks(mut stream: TcpStream, policy: &Policy) {
         return;
     };
     match dial(policy, &target, Proto::Socks5).await {
-        Ok(upstream) => {
+        Ok((upstream, slot)) => {
             if socks_reply(&mut stream, socks_reply::OK).await.is_err() {
                 return;
             }
-            pump(stream, upstream).await;
+            pump(stream, upstream, &policy.recorder, slot).await;
         }
         Err(DialFailure::Denied(_)) => {
             // A clear refusal, not a hang: the workload should see a policy
@@ -731,7 +754,7 @@ async fn handle_http(mut stream: TcpStream, policy: &Policy) {
                 .await;
         }
         HttpKind::Connect => match dial(policy, &request.target, Proto::Http).await {
-            Ok(upstream) => {
+            Ok((upstream, slot)) => {
                 if stream
                     .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                     .await
@@ -739,7 +762,7 @@ async fn handle_http(mut stream: TcpStream, policy: &Policy) {
                 {
                     return;
                 }
-                pump(stream, upstream).await;
+                pump(stream, upstream, &policy.recorder, slot).await;
             }
             Err(DialFailure::Denied(reason)) => {
                 let _ = stream
@@ -756,14 +779,17 @@ async fn handle_http(mut stream: TcpStream, policy: &Policy) {
         },
         HttpKind::Absolute { rewritten } => {
             match dial(policy, &request.target, Proto::Http).await {
-                Ok(mut upstream) => {
+                Ok((mut upstream, slot)) => {
                     // Forward the rewritten head, then splice. `Connection: close`
                     // is forced during the rewrite so the connection cannot be
                     // reused for a different — unchecked — host.
                     if upstream.write_all(rewritten.as_bytes()).await.is_err() {
                         return;
                     }
-                    pump(stream, upstream).await;
+                    // The head the guest sent counts toward its upload: it is
+                    // the request it chose, forwarded on its behalf.
+                    policy.recorder.add_bytes(slot, rewritten.len() as u64, 0);
+                    pump(stream, upstream, &policy.recorder, slot).await;
                 }
                 Err(DialFailure::Denied(reason)) => {
                     let _ = stream
@@ -952,9 +978,64 @@ fn make_target(host: &str, port: u16) -> Target {
 // Byte pump.
 // ===========================================================================
 
-/// Splice a client and an upstream until either side closes.
-async fn pump(mut client: TcpStream, mut upstream: TcpStream) {
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+/// Splice a client and an upstream until either side closes, recording volume
+/// into `slot` as it flows.
+///
+/// Both directions run concurrently and each updates the record after every
+/// chunk, so the count is correct even for a connection that never closes —
+/// which is the normal case when a run ends and the guest disappears.
+async fn pump(client: TcpStream, upstream: TcpStream, recorder: &Recorder, slot: Option<usize>) {
+    let (mut guest_rx, mut guest_tx) = client.into_split();
+    let (mut dest_rx, mut dest_tx) = upstream.into_split();
+
+    let up = copy_counting(&mut guest_rx, &mut dest_tx, recorder, slot, Direction::Up);
+    let down = copy_counting(&mut dest_rx, &mut guest_tx, recorder, slot, Direction::Down);
+    // Either half finishing ends the splice: a half-closed proxied connection
+    // has nothing left to carry, and holding the other half open would leak a
+    // task for the run's lifetime.
+    tokio::select! {
+        () = up => {}
+        () = down => {}
+    }
+}
+
+/// Which side of a proxied connection a copy is carrying.
+#[derive(Clone, Copy)]
+enum Direction {
+    /// Guest → destination.
+    Up,
+    /// Destination → guest.
+    Down,
+}
+
+/// Copy `from` into `to`, adding each chunk to the connection's record.
+async fn copy_counting<R, W>(
+    from: &mut R,
+    to: &mut W,
+    recorder: &Recorder,
+    slot: Option<usize>,
+    dir: Direction,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // 64 KiB keeps the per-chunk bookkeeping (one uncontended lock) negligible
+    // against the copy itself, even on a multi-gigabyte transfer.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+        let n = n as u64;
+        match dir {
+            Direction::Up => recorder.add_bytes(slot, n, 0),
+            Direction::Down => recorder.add_bytes(slot, 0, n),
+        }
+    }
 }
 
 // ===========================================================================
@@ -1631,6 +1712,47 @@ mod tests {
         assert!(events[0].allowed);
         assert_eq!(events[0].proto, Proto::Socks5);
         assert_eq!(events[0].port, upstream.port());
+    }
+
+    #[tokio::test]
+    async fn allowed_connections_record_the_bytes_they_moved() {
+        // Regression: `bytes_up`/`bytes_down` were in the schema but always 0,
+        // because pump() discarded copy_bidirectional's return. Volume per
+        // destination is the one signal a destination allowlist cannot give on
+        // its own, so a field that always reads 0 is worse than no field.
+        let upstream = spawn_echo().await;
+        let broker =
+            start_test_broker(vec![HostRule::parse_cidr("127.0.0.0/8").expect("cidr")]).await;
+
+        let (code, mut stream) = socks_connect(&broker, upstream).await;
+        assert_eq!(code, socks_reply::OK);
+
+        // The echo server greets with 8 bytes, then mirrors what we send.
+        let mut greeting = [0u8; 8];
+        stream.read_exact(&mut greeting).await.expect("greeting");
+        stream.write_all(b"twelve bytes").await.expect("write");
+        let mut echoed = [0u8; 12];
+        stream.read_exact(&mut echoed).await.expect("echo");
+        // Close our side so the pump finishes and the record is amended.
+        drop(stream);
+
+        // The amend happens after the connection closes; give the task a moment.
+        let mut recorded = (0, 0);
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let (events, _) = broker.events();
+            if let Some(e) = events.first() {
+                if e.bytes_up > 0 || e.bytes_down > 0 {
+                    recorded = (e.bytes_up, e.bytes_down);
+                    break;
+                }
+            }
+        }
+        assert_eq!(recorded.0, 12, "guest->destination bytes");
+        assert_eq!(
+            recorded.1, 20,
+            "destination->guest bytes (8 greeting + 12 echo)"
+        );
     }
 
     #[tokio::test]

@@ -946,6 +946,14 @@ pub struct EgressConn {
     pub host: String,
     /// Destination port.
     pub port: u16,
+    /// Bytes the guest sent to this destination.
+    ///
+    /// Volume is the one signal a destination allowlist cannot give on its own:
+    /// an allowed host that received gigabytes is the exfiltration tell. `0` on
+    /// a connection still open when the run ended.
+    pub bytes_up: u64,
+    /// Bytes this destination returned to the guest.
+    pub bytes_down: u64,
     /// Milliseconds after the broker started.
     pub ts_ms: u64,
 }
@@ -1706,6 +1714,8 @@ fn summarize_egress(
                 allowed.push(EgressConn {
                     host: event.host.as_str().to_string(),
                     port: event.port,
+                    bytes_up: event.bytes_up,
+                    bytes_down: event.bytes_down,
                     ts_ms: event.ts_ms,
                 });
             } else {

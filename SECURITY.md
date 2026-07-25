@@ -108,6 +108,7 @@ A run started with `--allow-host` / `--allow-cidr` / `--deny-egress` (or MCP `al
 - A root guest **cannot exfiltrate over DNS**. Its `:53` is redirected to a responder that answers allowlisted names and `NXDOMAIN`s everything else. There is no route to any other resolver.
 - A root guest **cannot rewrite its allowlist**. The packet filter is set at `sudo isopod setup`; the broker's rules are memory in a process the guest cannot address at all.
 - A **literal IP address is never matched against a name pattern.** Allowlisting `pypi.org` does not permit dialling the address `pypi.org` resolves to — otherwise a guest could sidestep the allowlist by resolving names itself. (The broker does accept an address *it* returned for an allowed name, so proxy clients that resolve locally still work; that grants nothing a `CONNECT allowed-name:443` tunnel does not already grant.)
+- **DNS aimed at any resolver is intercepted, not merely dropped.** A query sent straight to `8.8.8.8` is redirected to the broker by a setup-time rule, so malware with a hardcoded resolver is policy-enforced rather than left to fail and fall back.
 - **Nothing the guest names reaches your terminal or your model verbatim.** Host headers, SNI values and DNS labels are validated before being recorded; anything that is not a well-formed host name is stored as `<invalid:N>` with the byte count and nothing else.
 
 ### What is explicitly **not** claimed
@@ -127,5 +128,7 @@ A run started with `--allow-host` / `--allow-cidr` / `--deny-egress` (or MCP `al
 - **Keep it single-tenant** unless the jail is enabled — do not rely on one unjailed isopod host to isolate mutually distrusting tenants from each other.
 - **Do not bake secrets into a stage** that will be forked and shared; forks inherit the stage's contents.
 - **Prune regularly.** `vm_gc` reaps orphaned Firecracker processes and old VM record directories; `stage_rm` removes stages you no longer need.
+
+The filtered-egress claims above are exercised against a real VM and recorded, attempt by attempt, in [docs/egress-ledger.md](docs/egress-ledger.md) — including which of the two layers caught each one.
 
 For the full design rationale behind these controls, see [PLAN.md](PLAN.md) (the "Security posture" section) and the milestone log. The pre-publication breakout assessment — live escape attempts plus an adversarially-verified static review of every host-side code path that ingests guest-controlled data, and the origin of the hardening items above — is published in full at [docs/security-assessment.md](docs/security-assessment.md).

@@ -306,6 +306,12 @@ struct EgressConnResult {
     host: String,
     /// Destination port.
     port: u16,
+    /// Bytes the workload sent to this destination. Volume is the signal a
+    /// destination allowlist cannot give on its own — an allowed host that
+    /// received gigabytes is the exfiltration tell.
+    bytes_up: u64,
+    /// Bytes this destination returned to the workload.
+    bytes_down: u64,
     /// Milliseconds after the broker started listening.
     ts_ms: u64,
 }
@@ -338,6 +344,8 @@ impl From<vm::EgressReport> for EgressResult {
                 .map(|c| EgressConnResult {
                     host: c.host,
                     port: c.port,
+                    bytes_up: c.bytes_up,
+                    bytes_down: c.bytes_down,
                     ts_ms: c.ts_ms,
                 })
                 .collect(),
