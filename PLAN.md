@@ -67,29 +67,33 @@ WSL2 kernel `6.6.114.1-microsoft-standard-WSL2`, Ubuntu 24.04.4, systemd PID 1, 
 
 ## Architecture
 
+Two front ends, one core library, one Firecracker process per VM, top to bottom:
+
+```mermaid
+flowchart TB
+    CC["Claude Code"] -->|"stdio, rmcp"| MCP["isopod mcp"]
+    HUM["Human / CI"] -->|"argv + JSON"| CLI["isopod subcommands"]
+    MCP --> CORE["isopod-core — one library behind both front ends<br/>vm — lifecycle: spawn FC, configure via the API, reap<br/>stage — store: commit / fork / stack / flatten / gc<br/>snapshot — warm pool: save, restore, invalidate<br/>net — netns slot pool claim and release<br/>agent — vsock RPC client, reconnect per request<br/>store — ~/.isopod on disk, file-locked across N sessions"]
+    CLI --> CORE
+    CORE --> FCC["isopod-fc — typed Firecracker client<br/>candidate standalone SDK"]
+    FCC -->|"HTTP/JSON over a per-VM unix socket"| FC["firecracker v1.16.1<br/>one process per VM, in a netns slot"]
+    FC -->|"virtio-blk × N · hybrid vsock on a host UDS · virtio-net tap"| GUEST
+    subgraph GBOX["Guest microVM"]
+        GUEST["custom vmlinux, 6.18 microvm config<br/>isopod-guest-agent = PID 1, static musl<br/>mounts overlay of base + stages + scratch, pivots root<br/>serves exec and file RPC on vsock, resyncs the clock"]
+    end
 ```
-Claude Code ── stdio (rmcp) ──> isopod mcp        ─┐
-Human / CI  ── argv + JSON  ──> isopod <subcmd>   ─┤  same binary, same core
-                                                   ▼
-                              isopod-core (lib)
-                              ├─ vm.rs        lifecycle: spawn FC, configure via API, reap
-                              ├─ stage.rs     stage store: commit / fork / stack / flatten / gc
-                              ├─ snapshot.rs  warm-pool: full-snapshot save/restore, invalidation
-                              ├─ net.rs       netns slot pool claim/release
-                              ├─ agent.rs     vsock RPC client (exec/files), reconnect-per-request
-                              └─ store.rs     ~/.isopod on-disk state, file-locked (N sessions)
-                                     │
-                              isopod-fc (crate: typed FC client, candidate standalone SDK)
-                                     │ HTTP/JSON over per-VM unix socket
-                              firecracker v1.16.1 (one process per VM, in a netns slot)
-                                     │ virtio-blk×N   hybrid vsock (host UDS)   virtio-net(tap)
-                              ┌──────┴───────────────────────────────────────────┐
-                              │ guest: custom vmlinux (6.18 microvm config)      │
-                              │ isopod-guest-agent = PID 1 (static musl)         │
-                              │   mounts overlay(base+stages+scratch), pivots,   │
-                              │   serves exec/file RPC on vsock, resyncs clock   │
-                              └──────────────────────────────────────────────────┘
-```
+
+This is the plan **as drawn on 2026-07-21**, kept unedited as a record. Two
+things it proposed are not what shipped:
+
+- **Network namespaces were dropped at M4.** Entering a netns at runtime needs
+  root, which would have broken isopod's no-root-at-runtime property. The
+  shipped design uses user-owned tap devices in the root netns plus an nftables
+  ruleset — see `crates/core/src/net.rs` and [SECURITY.md](SECURITY.md).
+- **`isopod-mcp` and `isopod-jail` became separate binaries**, and the module
+  set drifted (`paths`, `image`, `names` exist; `store` did not stay a module).
+  The crates as they actually shipped are mapped in
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Cargo workspace
 
