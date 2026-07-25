@@ -8,7 +8,7 @@
 
 isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM, execs one command inside it over vsock, and tears the VM down — end to end in **~0.4 s** at p50, with a warm-pool resume in **~49 ms** ([measured](BENCHMARKS.md)). Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
 
-> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels) and, at 0.9.0, **per-run egress allowlists** the guest cannot rewrite. Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
+> **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels) and, at 0.9.0, **per-run egress allowlists** the guest cannot rewrite. In flight for 0.10.0: **host-declared credentials** a run can spend but never read. Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
 
 ---
 
@@ -204,6 +204,21 @@ sandbox_run(cmd="python3 -c 'import numpy; print(numpy.__version__)'",
 sandbox_run(cmd="python3 suspicious_script.py", network=false)
 ```
 
+**Give a run one credential without giving it the token** *(landing in 0.10.0)*:
+
+```jsonc
+// ~/.isopod/credentials.json, mode 0600 — declared once, on the host
+"github": { "host": "api.github.com", "source": "env:GH_TOKEN",
+            "allow": ["readonly"] }        // GET+HEAD only. Required field.
+```
+
+The run names the alias, never the secret. The broker builds each upstream
+request **from its own parts** — the guest's `Host` and `Authorization` are
+discarded, the target is normalised against origin-relocation tricks, and the
+request goes out only if it matches a rule you wrote. `POST /user/keys` under a
+`readonly` credential is not refused so much as unexpressible. See
+[docs/credentials.md](docs/credentials.md).
+
 **Or give it exactly one destination — default-deny egress, enforced on the host:**
 
 ```
@@ -351,6 +366,7 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 | [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
 | [docs/sandbox-build.md](docs/sandbox-build.md) | Building isopod inside its own sandboxes (dogfood recipe). |
 | [The docs site](https://me1iissa.github.io/isopod/) | Everything below, rendered and navigable. Built by `scripts/build-docs-site.py` from this repo's own Markdown. |
+| [docs/credentials.md](docs/credentials.md) | Host-declared credentials: aliases, a pinned host, and a mandatory per-credential request allowlist — with the red-team argument for why the allowlist is not optional. |
 | [docs/egress-ledger.md](docs/egress-ledger.md) | Filtered-egress bypass attempts run against a real VM: what was tried, which layer caught it, and what the flight recorder saw. |
 | [docs/feasibility.md](docs/feasibility.md), [docs/m4-verify.md](docs/m4-verify.md), [docs/dogfood-findings.md](docs/dogfood-findings.md) | Engineering logs: the M0 spike results, M4 network verification, and the running dogfood findings ledger. |
 

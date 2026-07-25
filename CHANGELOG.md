@@ -6,6 +6,18 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## Unreleased
+
+- **Credential injection — the enforcement core.** Landing in 0.10.0. A run
+  names an *alias*; the operator declares on the host which secret it is, the
+  single host it may be sent to, and — mandatorily — which requests it may
+  authorise. Merged so far: the `Secret` newtype (no `Display`, deliberately no
+  `Serialize`, so a future `#[derive(Serialize)]` on a containing struct fails
+  to compile), the `~/.isopod/credentials.json` store with mode and symlink
+  checks and all-or-nothing pre-boot resolution, and the endpoint's decision
+  core. Not yet wired to a run: the listener, the upstream TLS leg, and the
+  `--inject` surface. See [docs/credentials.md](docs/credentials.md).
+
 ## [0.9.1] — 2026-07-25
 
 - **The egress flight recorder now records volume.** `bytes_up`/`bytes_down`

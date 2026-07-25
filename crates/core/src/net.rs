@@ -43,7 +43,10 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 pub mod broker;
+pub mod credentials;
 pub mod egress;
+pub mod inject;
+pub mod secret;
 pub mod setup;
 
 /// Default number of tap slots `isopod setup` provisions.

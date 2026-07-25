@@ -73,6 +73,8 @@ PAGES: list[Page] = [
          "isopod's threat model, isolation boundary, what holds, and what is explicitly not claimed."),
     Page("docs/egress-ledger.md", "egress-ledger", "Egress ledger", "Security",
          "Ten attempted egress bypasses run against a real microVM, and which layer caught each one."),
+    Page("docs/credentials.md", "credentials", "Credentials", "Security",
+         "Give a sandboxed run one credential without giving it the token: host-declared aliases, a pinned host, and a mandatory per-credential request allowlist."),
     Page("docs/security-assessment.md", "security-assessment", "Breakout assessment", "Security",
          "The pre-publication breakout assessment: live escape attempts and an adversarial review of host-side code."),
 
