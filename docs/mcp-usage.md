@@ -192,14 +192,67 @@ Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
 total_ms, path, resume_ms?, snapshot_built, commit_ms?, vcpus, mem_mib,
 vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?, guest_ip?,
-stdout_log_path, stderr_log_path, serial_log_path, copied?, egress?}`. Highlights:
-`stdout`/`stderr` are 64 KiB **inline** heads with exact byte totals
-alongside and full logs at the `*_log_path`s (the on-disk logs have their
-own, much larger caps — see SECURITY.md); `path` says whether the run resumed
-`"warm"` or booted `"cold"` (with `resume_ms` on warm runs and
-`snapshot_built` flagging the one-time cache build); `stage_*` appear only
-when `commit_as` actually committed; `guest_ip`/`slot` only when networking
-was on; `egress` only on a filtered run.
+stdout_log_path, stderr_log_path, serial_log_path, copied?, egress?}`.
+
+It is one flat object with two nested ones hanging off it. A `?` marks a field
+that is only there under a condition — which condition is the useful part:
+
+```mermaid
+classDiagram
+    direction TB
+    class RunReport {
+        +i32 exit_code
+        +bool timed_out
+        +String stdout
+        +u64 stdout_bytes
+        +bool stdout_truncated
+        +String stdout_log_path
+        +u64 duration_ms
+        +u64 total_ms
+        +String path
+        +bool snapshot_built
+        +u64 resume_ms?
+        +u64 commit_ms?
+        +String stage_id?
+        +String stage_name?
+        +u32 slot?
+        +String guest_ip?
+    }
+    class EgressReport {
+        +String mode
+        +Vec~String~ allowed_rules
+        +Vec~String~ dns_queries
+        +u64 total_events
+        +bool truncated
+        +String egress_log_path
+    }
+    class EgressEvent {
+        +String host
+        +u16 port
+        +bool allowed
+        +String reason?
+        +u64 bytes_up
+        +u64 bytes_down
+        +u64 ts_ms
+    }
+    class CopiedFile {
+        +String guest
+        +String host
+        +u64 bytes
+    }
+    RunReport --> "0..1" EgressReport : egress? — only on a filtered run
+    RunReport --> "*" CopiedFile : copied? — one per copy_out mapping
+    EgressReport --> "*" EgressEvent : allowed[] and denied[]
+```
+
+`stderr` mirrors every `stdout` field. `resume_ms` and `snapshot_built` track
+`path` — `"warm"` means a snapshot resume, `"cold"` a full boot. `stage_*` and
+`commit_ms` appear only when `commit_as` actually committed; `slot`/`guest_ip`
+only when networking was on.
+
+The inline `stdout`/`stderr` are 64 KiB **heads**, with exact byte totals
+alongside them and the complete streams on disk at the `*_log_path`s — those
+on-disk logs have their own, much larger caps (see SECURITY.md).
 
 ### `egress` — the flight recorder
 

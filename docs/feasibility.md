@@ -40,7 +40,8 @@ target is comfortably realistic.
 2. **S3 CI-artifact layout changed**: no `firecracker-ci/v1.16/` prefix exists (last versioned is
    v1.15); current kernels live under date-stamped prefixes (spike used
    `20260717-5ac3f5ffdcd7-0`). `isopod image fetch-kernel` must enumerate bucket prefixes, not
-   template `v<major.minor>/` (the getting-started doc's own recipe 404s).
+   template `v<major.minor>/` (the recipe in *Firecracker's* own
+   getting-started doc 404s — not isopod's).
 3. **Upstream rootfs recipe needs root** (`sudo mkfs.ext4 -d`) — our unprivileged path works:
    populate dir → `mkfs.ext4 -d` as user; CI kernels have `DEVTMPFS_MOUNT=y` so `/dev/console`
    appears without mknod.

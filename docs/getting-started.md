@@ -359,6 +359,24 @@ isopod stage rm demo/requests
 Committing again on top of a forked stage **stacks** a new layer. Chains keep
 one base flavor throughout; the chain depth limit is 10 layers.
 
+Nothing above ever mutates a parent. A run assembles a fresh overlay from the
+read-only base, the read-only stage layers, and its own scratch — so forks are
+free to diverge and a stage can have as many children as you like:
+
+```mermaid
+flowchart TB
+    BASE["base-alpine<br/>squashfs, read-only"]
+    BASE -->|"run, then commit_as"| S1["demo/requests<br/>ext4 layer, immutable"]
+    S1 -->|"fork, run, commit again = stack"| S2["demo/requests+app<br/>stacked layer, immutable"]
+    S1 -.->|"fork"| F1["ephemeral run"]
+    S1 -.->|"fork"| F2["ephemeral run"]
+    S2 -.->|"fork"| F3["ephemeral run"]
+    F1 -.->|"exit 0 and no commit_as"| GONE["discarded with the VM"]
+```
+
+Only a clean exit commits: a setup command that fails never leaves a broken
+stage behind.
+
 ### Sizing a VM
 
 | Flag | Default | Bounds |
@@ -395,13 +413,28 @@ automatically (paying the one-time cost, a few seconds, inside that run —
 you'll see `snapshot_built: true` in its result). Prebuilding just moves that
 cost off your first run.
 
-The complete eligibility list — a run resumes warm when it starts from a
-fresh base (no committed layers), has networking **on**, does **not** commit
-(`commit_as` unset), and does **not** pass `--scratch-mib`. The snapshot key
-covers the Firecracker build, host kernel, CPU model, base flavor, vCPUs,
-memory, and snapshot format — any mismatch falls back to a cold boot and
-refreshes the cache. This is the canonical statement of the rules; other
-docs paraphrase it.
+Whether a given run resumes warm or cold-boots is decided here. This is the
+canonical statement of the rules; other docs paraphrase it.
+
+```mermaid
+flowchart TB
+    START["a run starts"] --> Q1{"starts from a fresh base<br/>with no committed layers?"}
+    Q1 -->|"no, it forks a stage"| COLD["cold boot"]
+    Q1 -->|"yes"| Q2{"networking on?"}
+    Q2 -->|"no, --no-network"| COLD
+    Q2 -->|"yes"| Q3{"commit_as unset?"}
+    Q3 -->|"no, it commits"| COLD
+    Q3 -->|"yes"| Q4{"--scratch-mib unset?"}
+    Q4 -->|"no, sized scratch"| COLD
+    Q4 -->|"yes"| Q5{"does the cached snapshot<br/>key still match this host?"}
+    Q5 -->|"no"| REFRESH["cold boot, then rebuild the cache"]
+    Q5 -->|"yes"| WARM["warm resume, ~49 ms"]
+```
+
+The key checked at the last step covers the Firecracker build, host kernel, CPU
+model, base flavor, vCPUs, memory, and snapshot format. Change any one of them —
+a kernel upgrade, a different `--mem-mib` — and the next run cold-boots once and
+re-caches.
 
 ## 7. The rootless jail (optional second isolation layer)
 

@@ -54,6 +54,23 @@ egress restriction (F1), the unbounded-log DoS (F3), and the jailer (F2) land.
 
 ## Findings (ranked by host impact)
 
+All nine, mapped onto the part of the boundary each one stresses. None is an
+escape — the verdict above holds. Note that three of them are not reachable
+from a guest at all: they are host-side governance and supply-chain gaps that a
+breakout assessment surfaced on the way past.
+
+```mermaid
+flowchart TB
+    G["untrusted code, root inside the guest"]
+    G --> L1["1 · Firecracker VMM + KVM<br/>the hardware boundary"]
+    G --> L2["2 · host code ingesting guest bytes<br/>vsock RPC · stage image · exec and serial output"]
+    G --> L3["3 · the network fabric<br/>tap devices and nftables"]
+    L1 --> A["F2 single-layer isolation · MEDIUM<br/>F5 no I/O or network rate limiters · LOW-MED"]
+    L2 --> B["F3 unbounded log tees · HIGH<br/>F8 unbounded vsock reads · MEDIUM<br/>F7 guest output reaches the agent · LOW"]
+    L3 --> C["F1 egress to the private network · HIGH"]
+    HOST["host-side only — no guest involvement"] --> D["F4 concurrent-VM RAM exhaustion · MEDIUM<br/>F6 lax artifact permissions · LOW-MED<br/>F9 kernel checksum unverified · LOW"]
+```
+
 ### F1 — Unrestricted egress to the host's private network — HIGH
 
 The forward rule (`net/setup.rs:244`) accepts **any** tap-sourced packet routed

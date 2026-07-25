@@ -53,6 +53,20 @@ individual sandbox slows down under load. Figures are the range observed across 
 | 6 | 830–873 | ~5.8× | 406 | 426 | **0 across all sweeps** |
 | 8 | 892–1077 | ~6–7× | 412 | 518 | **0 in 2/4 trials, 13–14/48 in the others** |
 
+Bars are the measured throughput (midpoint of each sweep's range); the line is
+what perfectly linear scaling from the 1-way baseline would look like. The gap
+between them opens at 4-way — the point where concurrency passes the host's
+4 vCPUs:
+
+```mermaid
+xychart-beta
+    title "Throughput vs concurrency, 48-run warm batches"
+    x-axis "concurrent runs" [1, 2, 4, 6, 8]
+    y-axis "completed VMs per minute" 0 --> 1200
+    bar [147, 299, 564, 852, 985]
+    line [147, 294, 588, 882, 1176]
+```
+
 **Throughput scales near-linearly to the host's core count** (~3.8× at 4-way on 4 vCPUs)
 and keeps climbing to **~5.8× (~850 VMs/min) at 6-way with no observed failures** — and
 individual runs barely slow down (p50 stays ~0.4 s; only the p90 tail grows once you

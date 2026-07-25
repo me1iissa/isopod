@@ -636,12 +636,20 @@ pre {
   margin: 0.3rem 0;
 }
 
-.doc .mermaid {
+/* Unscoped: the landing page carries a diagram too, and it has no .doc
+ * wrapper. Scoping this to .doc left that one block falling back to the bare
+ * `pre` rules — left-aligned, code-sized padding. */
+.mermaid {
   background: var(--hull);
   border: 1px solid var(--rule);
   border-radius: 4px;
   padding: 1.25rem;
   text-align: center;
+  /* Mermaid replaces the block's text with an SVG, so the monospace metrics
+   * inherited from `pre` are meaningless and the pre-wrap would add stray
+   * whitespace before the swap. */
+  white-space: normal;
+  font-size: 1rem;
 }
 
 .doc-foot {

@@ -309,6 +309,24 @@ always in `~/.isopod`, never under plugin root (GC'd on update).
 
 ## Milestones (each lands with a JSON-asserting smoke test)
 
+Six of the eight landed on the first day; the two that needed the others in
+place followed on the second.
+
+```mermaid
+timeline
+    title Milestones
+    section 2026-07-21
+        M0 Feasibility spike : all gates passed, M1 unblocked
+        M1 Boots from Rust : the isopod-fc typed client
+        M2 Exec : musl PID 1 agent serving vsock
+        M3 Stages : squashfs base plus guest overlay chains
+        M4 Network : user-owned taps from sudo isopod setup
+        M5 MCP and skill : rmcp 2.2 stdio server
+    section 2026-07-22
+        M5.5 Flex resources : per-VM vcpus and mem_mib
+        M6 Warm pool : full-snapshot save and resume
+```
+
 - **M0 — Feasibility spike (no product code).** *[✅ COMPLETE 2026-07-21, all gates passed — see
   docs/feasibility.md: ~117 ms cold boot, ~30 ms restore, resume-not-reboot proven; NAT egress
   works under mirrored networking (no .wslconfig change); unprivileged open of root-created tap

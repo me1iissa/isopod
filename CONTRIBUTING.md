@@ -78,7 +78,25 @@ A few notes on the test suite:
 
 ## Crate map
 
-isopod is a Cargo workspace of seven crates:
+isopod is a Cargo workspace of seven crates. Solid arrows are Cargo
+dependencies; dashed arrows are runtime relationships that no `Cargo.toml`
+records:
+
+```mermaid
+flowchart TB
+    CLI["crates/cli<br/>isopod"] --> CORE
+    MCP["crates/mcp<br/>isopod-mcp"] --> CORE["crates/core<br/>isopod-core"]
+    CORE --> FCC["crates/fc-client<br/>isopod-fc"]
+    CORE --> PROTO["crates/proto<br/>isopod-proto"]
+    GA["crates/guest-agent<br/>isopod-guest-agent"] --> PROTO
+    CORE -.->|"execs it when ISOPOD_JAIL=1"| JAIL["crates/jail<br/>isopod-jail"]
+    FCC -.->|"HTTP/JSON over a per-VM unix socket"| FCB["firecracker<br/>not a crate — the vendored VMM"]
+    GA -.->|"baked into the image, runs as PID 1"| VM["guest microVM<br/>not a crate — the sandbox itself"]
+```
+
+`isopod-proto` is the only crate compiled into both sides of the boundary — the
+host links it through `isopod-core`, the guest through `isopod-guest-agent` —
+which is why its `PROTO_VERSION` gates host/guest compatibility.
 
 | Path | Package | Responsibility |
 |---|---|---|

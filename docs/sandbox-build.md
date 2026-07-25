@@ -13,6 +13,21 @@ gauntlet section).
 | `isopod-src` | workspace source at `/root/src` on top of `rust-stable` | source refresh |
 | `isopod-build` | source + crates.io cache + `target/` (≈1.5 GiB layer) | after a clean build |
 
+The chain is built once; every build after that forks `isopod-build` and throws
+the VM away. Source goes in over stdin, binaries come out over `copy_out`, and
+the stage is only re-committed when you want the refreshed `target/` kept:
+
+```mermaid
+flowchart TB
+    RS["rust-stable<br/>rustup toolchain in /root/.rustup and /root/.cargo"]
+    RS -->|"commit_as"| SRC["isopod-src<br/>workspace source at /root/src"]
+    SRC -->|"commit_as"| BLD["isopod-build<br/>source + crates.io cache + target/, about 1.5 GiB"]
+    BLD -->|"fork, on every build"| RUN["ephemeral build VM<br/>4 vcpu · 3072 MiB · 8192 MiB scratch"]
+    TREE["host working tree"] -.->|"stdin_file, a tar of the changed crates"| RUN
+    RUN -.->|"copy_out target/release/isopod"| BIN["host binary, static-pie musl"]
+    RUN -.->|"commit_as isopod-build/DATE, only when you want it kept"| BLD
+```
+
 Every build cmd starts with:
 
 ```sh

@@ -270,7 +270,15 @@ def main() -> int:
     (out / "assets").mkdir(parents=True)
 
     shutil.copy2(SITE / "assets" / "style.css", out / "assets" / "style.css")
-    shutil.copy2(SITE / "index.html", out / "index.html")
+
+    # The landing page is hand-authored HTML and never goes through the Markdown
+    # pipeline, so it cannot pick up the loader the way a rendered page does. It
+    # can still carry a `<pre class="mermaid">` block, so apply the same rule by
+    # hand: ship the loader only when the page actually has a diagram.
+    landing = (SITE / "index.html").read_text(encoding="utf-8")
+    if 'class="mermaid"' in landing:
+        landing = landing.replace("</body>", f"{MERMAID}\n</body>", 1)
+    (out / "index.html").write_text(landing, encoding="utf-8")
 
     written: list[str] = []
     all_unresolved: list[str] = []

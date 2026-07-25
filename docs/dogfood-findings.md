@@ -2,7 +2,27 @@
 
 > Gaps found by *using* isopod, per the standing rule: dogfooding is the primary
 > gap-discovery mechanism. Every entry gets a severity and a fix-or-file decision.
-> Newest first. Format: `[status] severity — finding → decision`.
+> Oldest first — the sessions read as a chronology. Format:
+> `[status] severity — finding → decision`.
+
+Eight sessions over three days, each one a gauntlet thrown at whatever had just
+landed:
+
+```mermaid
+timeline
+    title Dogfood sessions
+    section 2026-07-21
+        M2 surface gauntlet : exit codes, streams, truncation, timeout, concurrency
+        M4 networking : live, after sudo isopod setup
+        M4 acceptance : pip and git through isopod on the Alpine base
+    section 2026-07-22
+        Self-build : isopod builds its own workspace : M6 warm-pool verification
+        MCP v2 gauntlet : all-MCP, including the self-build via MCP
+        Findings-fix wave : 15 to 25 closed : proto v3 : images rebuilt
+        Proto-v3 verification : the next-gauntlet checklist, post-restart
+    section 2026-07-23
+        Fix wave : 26 and 27, built in-sandbox and verified live
+```
 
 ## 2026-07-21 — M2 surface gauntlet (exit codes, streams, truncation, timeout, env/cwd, binary, errors, concurrency)
 

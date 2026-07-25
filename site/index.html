@@ -79,6 +79,16 @@
     reachable peer is a broker on the host. Neither control is reachable from inside
     the sandbox, and neither needs root at run time.
   </p>
+  <pre class="mermaid">flowchart TB
+    G["guest code, running as root on a filtered slot"]
+    G --> NFT{"nftables, written once as root"}
+    NFT -->|"port 53, to any destination"| DNS["broker DNS responder"]
+    NFT -->|"the slot gateway on 1080 or 3128"| PX["broker SOCKS5 and HTTP proxy"]
+    NFT -->|"everything else"| DROP["dropped at the tap"]
+    DNS --> POL{"on this run's allowlist?"}
+    PX --> POL
+    POL -->|"yes"| OK["resolved and dialled by the broker"]
+    POL -->|"no"| NO["NXDOMAIN or 403, and recorded"]</pre>
   <table class="spec">
     <tr>
       <th>Packet filter</th>
