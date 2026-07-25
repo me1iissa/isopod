@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>isopod — run untrusted code in a real microVM</title>
+<meta name="description" content="A Firecracker-microVM sandbox for coding agents. Untrusted code runs as root inside, and still cannot reach any destination you did not allow. ~0.4s boot, destroyed after every call.">
+<meta property="og:title" content="isopod — run untrusted code in a real microVM">
+<meta property="og:description" content="Untrusted code runs as root. It still can't reach anything you didn't allow. Enforced on the host, in code you can read.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <a class="wordmark" href="index.html">isopod</a>
+  <nav>
+    <a href="getting-started.html">Get started</a>
+    <a href="security.html">Security</a>
+    <a href="mcp-usage.html">MCP</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="https://github.com/me1iissa/isopod">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+
+<section class="hero">
+  <p class="eyebrow">Firecracker microVM sandbox · Apache-2.0</p>
+  <h1>Untrusted code runs as root. It still can't reach <em>anything you didn't allow.</em></h1>
+  <p class="lede">
+    isopod boots a real hardware-isolated microVM, runs one command inside it, and
+    destroys it — in about 0.4&nbsp;seconds. Egress policy lives on the host, outside
+    the sandbox, where nothing in the guest can reach it.
+  </p>
+
+  <div class="actions">
+    <a class="btn btn--primary" href="getting-started.html">Get started</a>
+    <a class="btn" href="security.html">Read the threat model</a>
+  </div>
+
+  <!-- The signature: the product's own flight recorder. Left is what the guest
+       attempted, right is what the host wrote down. Every row below is copied
+       from a real run recorded in the egress ledger. -->
+  <div class="ledger">
+    <div class="ledger__col">
+      <div class="ledger__head">A dependency inside the sandbox tried</div>
+      <div class="ledger__row ledger__row--anim" style="animation-delay:.10s"><span class="ledger__mark">›</span><span>GET https://pypi.org/simple/</span></div>
+      <div class="ledger__row ledger__row--anim" style="animation-delay:.22s"><span class="ledger__mark">›</span><span>GET https://example.com/</span></div>
+      <div class="ledger__row ledger__row--anim" style="animation-delay:.34s"><span class="ledger__mark">›</span><span>resolve c2VjcmV0.evil.example.com</span></div>
+      <div class="ledger__row ledger__row--anim" style="animation-delay:.46s"><span class="ledger__mark">›</span><span>connect 93.184.216.34:443</span></div>
+      <div class="ledger__row ledger__row--anim" style="animation-delay:.58s"><span class="ledger__mark">›</span><span>query 8.8.8.8 directly</span></div>
+    </div>
+    <div class="ledger__col">
+      <div class="ledger__head">The host recorded</div>
+      <div class="ledger__row ledger__row--anim is-allow" style="animation-delay:.16s"><span class="ledger__mark">✓</span><span>pypi.org:443 <span class="ledger__note">· 1&nbsp;739&nbsp;up / 329&nbsp;158&nbsp;down</span></span></div>
+      <div class="ledger__row ledger__row--anim is-deny" style="animation-delay:.28s"><span class="ledger__mark">✗</span><span>example.com:443 <span class="ledger__note">· not_allowed</span></span></div>
+      <div class="ledger__row ledger__row--anim is-deny" style="animation-delay:.40s"><span class="ledger__mark">✗</span><span>NXDOMAIN <span class="ledger__note">· recorded in dns_queries</span></span></div>
+      <div class="ledger__row ledger__row--anim is-drop" style="animation-delay:.52s"><span class="ledger__mark">·</span><span>dropped at the tap <span class="ledger__note">· never reached the proxy</span></span></div>
+      <div class="ledger__row ledger__row--anim is-deny" style="animation-delay:.64s"><span class="ledger__mark">✗</span><span>intercepted <span class="ledger__note">· answered by the host, not Google</span></span></div>
+    </div>
+  </div>
+  <p class="caption">
+    Real rows from a real run. The fourth one never reached the proxy at all — the packet
+    filter dropped it, which is how you can tell the two enforcement layers are
+    independent. Every attempt above is reproducible from the
+    <a href="egress-ledger.html">egress ledger</a>.
+  </p>
+</section>
+
+<section class="section">
+  <h2>Two layers, both outside the guest</h2>
+  <p>
+    A run given an allowlist claims a network slot that forwards nothing. Its only
+    reachable peer is a broker on the host. Neither control is reachable from inside
+    the sandbox, and neither needs root at run time.
+  </p>
+  <table class="spec">
+    <tr>
+      <th>Packet filter</th>
+      <td><strong>nftables, written once as root</strong><br>
+      <span>A filtered slot drops all forwarding. The only way in is a three-port accept on that slot's own gateway, pinned to the arrival interface and exact destination.</span></td>
+    </tr>
+    <tr>
+      <th>Egress broker</th>
+      <td><strong>SOCKS5 · HTTP · DNS, on the host</strong><br>
+      <span>Resolves and dials on the guest's behalf, only for allowlisted destinations. DNS aimed at any resolver is intercepted, so hardcoded 8.8.8.8 is policy-enforced rather than merely broken.</span></td>
+    </tr>
+    <tr>
+      <th>Flight recorder</th>
+      <td><strong>Every decision, with volume</strong><br>
+      <span>Allowed and denied destinations, bytes moved, and every name resolved — inline in the result and complete on disk as JSON Lines.</span></td>
+    </tr>
+    <tr>
+      <th>Isolation</th>
+      <td><strong>KVM + Firecracker seccomp</strong><br>
+      <span>Not a shared kernel. Firecracker runs unprivileged with all capabilities dropped; an optional rootless jail adds user namespaces and per-VM cgroup caps.</span></td>
+    </tr>
+  </table>
+</section>
+
+<section class="section">
+  <h2>What holds, and what we don't claim</h2>
+  <p>
+    Both columns are part of the product. A sandbox that only advertises its strengths
+    is asking you to trust it; the limits below are the ones we would want to know.
+  </p>
+  <div class="split">
+    <ul class="claims claims--holds">
+      <h3>Holds</h3>
+      <li>A root guest cannot reach a destination that is not on its allowlist, by any protocol.</li>
+      <li>A root guest cannot exfiltrate over DNS. Queries to any resolver address are answered by the host.</li>
+      <li>A root guest cannot rewrite its own allowlist — the policy is nftables plus a process it cannot address.</li>
+      <li>A literal IP is never matched against a name rule, so resolving a name yourself is not a bypass.</li>
+      <li>Nothing the guest names reaches your terminal or your model verbatim.</li>
+    </ul>
+    <ul class="claims claims--limits">
+      <h3>Not claimed</h3>
+      <li>This is destination control, not data-loss prevention. Allow <code>github.com</code> and data can leave to <code>github.com</code>.</li>
+      <li>No TLS interception, so a tunnel to a shared CDN address can carry any SNI the guest chooses.</li>
+      <li>Without the optional jail, isolation is single-layer: a hypothetical VMM escape lands as your own user.</li>
+      <li>The bypass ledger is re-run per release, not on every push — GitHub's runners have no <code>/dev/kvm</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Try it</h2>
+  <p>One root step to provision host networking. Everything after that is unprivileged.</p>
+<pre><code class="hl"><span class="c1"># One-time, the only step that needs root</span>
+sudo isopod setup
+
+<span class="c1"># Default-deny egress: only these two hosts are reachable</span>
+isopod run --allow-host pypi.org --allow-host <span class="s1">'*.pythonhosted.org'</span> \
+  --stage base --base base-alpine -- pip install requests
+
+<span class="c1"># Or: deny everything, and find out what the code reaches for</span>
+isopod run --deny-egress --stage base -- node index.js</code></pre>
+  <p class="caption">
+    Driven the same way from Claude Code as an MCP tool —
+    <code>sandbox_run(cmd=…, allow_hosts=["pypi.org"])</code> returns the same
+    verdict record. See <a href="mcp-usage.html">MCP usage</a>.
+  </p>
+</section>
+
+<section class="section">
+  <h2>Measured, on a real host</h2>
+  <p>Timings read from isopod's own JSON output, so they are isopod's overhead — not a workload's runtime.</p>
+  <table class="spec">
+    <tr><th>Warm resume</th><td><strong>~49 ms</strong> <span>p50, snapshot restore</span></td></tr>
+    <tr><th>Cold boot</th><td><strong>~0.44 s</strong> <span>p50, boot → exec → destroy</span></td></tr>
+    <tr><th>Throughput</th><td><strong>~850 VMs/min</strong> <span>6-way concurrency on a 4-vCPU host</span></td></tr>
+    <tr><th>Filtered egress</th><td><strong>no extra boot cost</strong> <span>allowlisted runs stay warm-pool eligible</span></td></tr>
+  </table>
+  <p class="caption">Full distributions, methodology and caveats in <a href="benchmarks.html">Benchmarks</a>.</p>
+</section>
+
+</main>
+
+<footer class="site-foot">
+  <span>Apache-2.0</span>
+  <a href="https://github.com/me1iissa/isopod">Source</a>
+  <a href="security.html">Security policy</a>
+  <a href="contributing.html">Contributing</a>
+  <a href="plan.html">Design notes</a>
+</footer>
+
+</body>
+</html>

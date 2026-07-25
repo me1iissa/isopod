@@ -1,0 +1,63 @@
+name: Docs site
+
+# The site is rendered from the repository's own Markdown by
+# scripts/build-docs-site.py — the docs stay readable in the repo and are never
+# rewritten to suit the site. Deploys on a push that touches any source the site
+# renders, so a docs-only change ships without a release.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "scripts/build-docs-site.py"
+      - "docs/**"
+      - "README.md"
+      - "SECURITY.md"
+      - "BENCHMARKS.md"
+      - "CONTRIBUTING.md"
+      - "CHANGELOG.md"
+      - "PLAN.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy midway; queue instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install renderer
+        run: pip install --quiet markdown==3.5.2 pygments==2.17.2
+
+      # --check fails the build if any in-repo Markdown link has no rendered
+      # destination, so a renamed doc breaks here rather than shipping a 404.
+      - name: Build
+        run: python3 scripts/build-docs-site.py --out _site --check
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

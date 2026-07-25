@@ -5,3 +5,6 @@
 *.squashfs
 vmlinux*
 /images/out/
+
+# Rendered documentation site (built by scripts/build-docs-site.py)
+_site/

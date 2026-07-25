@@ -4,6 +4,8 @@
 
 **A Firecracker-microVM sandbox for Claude Code — run a command in a fast, hardware-isolated microVM that is destroyed after every call.**
 
+📖 **Documentation: [me1iissa.github.io/isopod](https://me1iissa.github.io/isopod/)** — rendered from the Markdown in this repository.
+
 isopod boots a real [Firecracker](https://firecracker-microvm.github.io/) microVM, execs one command inside it over vsock, and tears the VM down — end to end in **~0.4 s** at p50, with a warm-pool resume in **~49 ms** ([measured](BENCHMARKS.md)). Nothing on the host filesystem is shared into the guest; isolation is the KVM hardware boundary plus Firecracker's seccomp filter, not a shared kernel. It is driven two ways over one shared core: as an **MCP server** for Claude Code, and as a **CLI** for humans and CI.
 
 > **Status:** milestones M0–M6 complete (feasibility → boot-from-Rust → exec → stages → networking → MCP+skill → warm pool), followed by a security-hardening wave (default public-only guest egress, an opt-in rootless jail, bounded guest-controlled host sinks, digest-pinned guest kernels) and, at 0.9.0, **per-run egress allowlists** the guest cannot rewrite. Pre-1.0; `main` is the supported line. See [CHANGELOG.md](CHANGELOG.md) and [PLAN.md](PLAN.md).
@@ -348,6 +350,7 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 | [CHANGELOG.md](CHANGELOG.md) | Release history. |
 | [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
 | [docs/sandbox-build.md](docs/sandbox-build.md) | Building isopod inside its own sandboxes (dogfood recipe). |
+| [The docs site](https://me1iissa.github.io/isopod/) | Everything below, rendered and navigable. Built by `scripts/build-docs-site.py` from this repo's own Markdown. |
 | [docs/egress-ledger.md](docs/egress-ledger.md) | Filtered-egress bypass attempts run against a real VM: what was tried, which layer caught it, and what the flight recorder saw. |
 | [docs/feasibility.md](docs/feasibility.md), [docs/m4-verify.md](docs/m4-verify.md), [docs/dogfood-findings.md](docs/dogfood-findings.md) | Engineering logs: the M0 spike results, M4 network verification, and the running dogfood findings ledger. |
 
