@@ -151,7 +151,9 @@ struct RunArgs {
     stdin_file: Option<String>,
     /// Stream a guest file to the host after the command finishes (repeatable):
     /// `--copy-out /guest/path:/host/path`. Attempted only when the exec
-    /// completed without timing out; a copy failure fails the run.
+    /// completed without timing out; a copy failure fails the run. The host
+    /// path is opened without following a symlink at its final component, so
+    /// guest-authored bytes land on the path you named or nowhere.
     #[arg(long = "copy-out", value_name = "GUEST:HOST")]
     copy_out: Vec<String>,
     /// Permit egress to this host (repeatable). Presence switches the run to

@@ -588,6 +588,14 @@ pub fn authorize<'a>(
     // Built from parts. The scheme is always https and the authority is always
     // the pinned host — neither is derived from anything the guest sent, so
     // there is no join for a scheme-relative or absolute-form target to subvert.
+    //
+    // What the *client* makes of that authority is a separate question, and it
+    // was answered elsewhere: `reqwest` parses this string with the WHATWG URL
+    // host parser, which rewrites decimal, hex and short-form IPv4 to a dotted
+    // quad before hyper dials it. `broker::classify_pinned_host` refuses at
+    // startup any pinned host that does not survive that parse unchanged, so the
+    // authority interpolated here is the authority that gets dialled and the one
+    // recorded below.
     let url = format!("https://{}{}", cred.host().as_str(), intent.path);
 
     Ok((

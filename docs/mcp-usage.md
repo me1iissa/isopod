@@ -262,18 +262,31 @@ not the sandbox. Since 0.11.0 both are confined:
 
 ```mermaid
 flowchart TB
-    C["a sandbox_run argument<br/>naming a host path"] --> R{"resolved — symlinks<br/>followed first"}
+    C["a sandbox_run argument<br/>naming a host path"] --> N["normalised — trailing separators<br/>and '.' dropped, '..' refused"]
+    N --> R{"resolved — symlinks<br/>followed first"}
     R -->|"inside the host-I/O root"| OK["allowed"]
     R -->|"outside it"| NO["refused, naming the root<br/>and the variable that moves it"]
     OK --> M{"which direction?"}
     M -->|"stdin_file"| RD["regular files only,<br/>4 MiB ceiling"]
-    M -->|"copy_out[].host"| WR["mode masked: never setuid,<br/>setgid, sticky, group/other write"]
+    M -->|"copy_out[].host"| WR["opened O_NOFOLLOW, so the write<br/>refuses a symlink whatever the check said"]
+    WR --> MO["mode masked: never setuid,<br/>setgid, sticky, group/other write"]
 ```
 
 The root defaults to **the server's working directory** — the project a coding
 agent is working in, which is what artifact extraction and large stdin payloads
 are for. Symlinks are resolved *before* the check, so a link the sandbox planted
 inside the root cannot reach out of it.
+
+A write destination is **normalised first**: trailing separators and `.`
+components are dropped so that every guard sees the same final component the
+kernel will, and `..` stays refused. That matters because it went wrong — the
+guard that refuses a dangling symlink was skipped entirely by writing the link as
+`link/` rather than `link`, since `symlink_metadata` on a path with a trailing
+separator reports `ENOTDIR`. The write then opens the final component with
+`O_NOFOLLOW`, so it refuses to traverse a symlink whatever the check concluded; a
+check and an open are two lookups of one name, and only the syscall can close the
+gap. The same flag applies to the `isopod` CLI's `--copy-out`, which now writes to
+the path you named or fails, rather than to wherever it points.
 
 | Variable | Effect |
 |---|---|

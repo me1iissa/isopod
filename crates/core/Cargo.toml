@@ -30,6 +30,13 @@ dirs = "6"
 # the raw-libc style of the sibling crates (no `nix`); already in the lockfile
 # via isopod-fc, so this adds no crate and no compile time.
 libc = "0.2"
+# The WHATWG URL host parser, so a pinned credential host can be classified by
+# the *same* parser that will dial it. `reqwest` re-exports only `Url`, not
+# `Host`, and the broker's guard has to match on the variant. This resolves to
+# the one `reqwest` already depends on (semver-unified, and pinned in the
+# lockfile), which is the whole point — a second parser is what the guard got
+# wrong. `net::broker` asserts the identity at compile time.
+url = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -104,6 +104,30 @@ link, not its target.
 }
 ```
 
+### `host` is checked against the parser that will dial it
+
+`host` is a name or an address literal, exactly as it will be dialled. Two
+refusals happen before the broker starts, both naming the alias:
+
+- **An address this broker will not dial** — loopback, link-local (the metadata
+  service at `169.254.169.254`), a slot's own `10.107.0.0/16` gateway, or a
+  private address on a host that was not provisioned with `--allow-lan-egress`.
+  A literal never reaches a resolver: the HTTP client parses the authority and
+  dials it, so the floor a *name* goes through does not apply and the run is
+  refused instead.
+- **An address written in a form the URL parser rewrites.** `2852039166`,
+  `0xa9fea9fe`, `127.1` and `0177.0.0.1` are all valid spellings of an address
+  to a WHATWG URL parser, which is what the client uses — it normalises them to
+  a dotted quad before the connection is made. A store, a flight-recorder entry
+  and a destination that disagree are refused outright, even when the address
+  itself is one isopod would dial: an `egress.denied` record saying
+  `host: "2852039166"` is one no operator will grep for `169.254.169.254`.
+  Write the dotted quad.
+
+A pinned **name** is untouched by both, and is floored where it belongs — at
+resolution, so a name whose DNS answers `127.0.0.1` gets no connection rather
+than an `Authorization` header.
+
 ### `allow` is mandatory
 
 There is no default. A credential without an `allow` list fails to load, because

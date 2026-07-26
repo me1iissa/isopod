@@ -395,7 +395,9 @@ Over-cap requests fail fast with a clear message, before any VM boots.
 - `--copy-out GUEST:HOST` (repeatable) streams guest files to host paths
   after a successful exec — the binary-safe artifact channel. Copies are
   attempted only when the command didn't time out; a failed copy fails the
-  run.
+  run. `HOST` is opened with `O_NOFOLLOW`: if it is a symlink the copy is
+  refused rather than writing through it, so guest-authored bytes only ever
+  land on the path you named. A symlinked *directory* in the path is fine.
 
 ## 6. Warm pool (optional, recommended)
 

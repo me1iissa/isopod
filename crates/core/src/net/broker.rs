@@ -604,6 +604,76 @@ fn build_upstream_client(allow_private: bool, allow_loopback: bool) -> Result<re
         .context("building the credential endpoint's upstream HTTPS client")
 }
 
+/// What the HTTP client will make of a pinned host — an address it dials
+/// directly, or a name it hands to a resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinnedOrigin {
+    /// An address literal. No resolver is consulted, so the floor applies here
+    /// or nowhere.
+    Literal(IpAddr),
+    /// A name, resolved through [`FlooredResolver`] at dial time.
+    Name,
+}
+
+/// Classify a pinned host with the parser that will dial it.
+///
+/// The credential's upstream leg is `format!("https://{host}{path}")` handed to
+/// `reqwest` ([`super::inject::authorize`]), and `reqwest` parses that with the
+/// **WHATWG** URL host parser — which accepts spellings `IpAddr::from_str` does
+/// not, and rewrites them to a dotted quad *before* hyper ever sees the
+/// authority. `"2852039166"`, `"0xa9fea9fe"`, `"127.1"` and `"0177.0.0.1"` are
+/// all addresses to that parser and all names to `IpAddr::from_str`; a guard
+/// built on the latter waved every one of them through as "a name, the resolver
+/// will floor it", and no resolver was ever consulted.
+///
+/// A host that does not survive the round trip unchanged is refused outright,
+/// even when the address it normalises to would be dialable. Two reasons, and
+/// the second is the one that matters longer:
+///
+/// * The flight recorder writes `egress.denied`/`egress.allowed` with the
+///   *stored* string, so `"2852039166"` in the store produced a record an
+///   operator cannot grep for `169.254.169.254` — the log and the destination
+///   disagreed by construction.
+/// * It leaves exactly one spelling of an origin, so every later reader of
+///   [`PinnedHost`](super::credentials::PinnedHost) — the guard, the recorder,
+///   the URL builder — is looking at the same string the connector will.
+///
+/// A name is left alone: `example.com` is classified as a name here and floored
+/// by [`FlooredResolver`] where it belongs.
+///
+/// # Errors
+/// The reason, as one sentence the caller prefixes with the alias — every
+/// refusal on this path has to name the stored spelling *and* what it would
+/// actually dial, because the operator can fix both and the difference between
+/// them is the whole defect.
+fn classify_pinned_host(host: &str) -> Result<PinnedOrigin, String> {
+    // The annotation is the assertion: `reqwest::Url` *is* `url::Url`, so this
+    // fails to compile the day the two stop being the same parser — which is the
+    // only way this guard can silently go back to checking something the dialer
+    // does not.
+    let url: reqwest::Url = url::Url::parse(&format!("https://{host}/"))
+        .map_err(|e| format!("the pinned host {host:?} is not a usable HTTPS authority: {e}"))?;
+    let Some(parsed) = url.host() else {
+        return Err(format!(
+            "the pinned host {host:?} yields a URL with no authority at all"
+        ));
+    };
+    let dialed = url.host_str().unwrap_or_default();
+    if dialed != host {
+        return Err(format!(
+            "the pinned host {host:?} is rewritten to {dialed:?} by the URL parser before the \
+             connection is made, so the store, the flight recorder and the destination would \
+             disagree — the record would say {host:?} while the token went to {dialed:?}. \
+             Write it as {dialed:?} if that is what you meant"
+        ));
+    }
+    Ok(match parsed {
+        url::Host::Ipv4(v4) => PinnedOrigin::Literal(IpAddr::V4(v4)),
+        url::Host::Ipv6(v6) => PinnedOrigin::Literal(IpAddr::V6(v6)),
+        url::Host::Domain(_) => PinnedOrigin::Name,
+    })
+}
+
 /// Refuse to start if any credential is pinned to an address the broker would not
 /// dial.
 ///
@@ -616,12 +686,23 @@ fn build_upstream_client(allow_private: bool, allow_loopback: bool) -> Result<re
 /// an attack to block — but it is a mistake that ends with a token on a network
 /// isopod says it will not dial, so it fails the run rather than warning.
 ///
+/// Which spellings count as an address is [`classify_pinned_host`]'s problem,
+/// and it is the whole problem: the first version of this guard asked
+/// `IpAddr::from_str` while the connector asked `url`, and the two disagreed
+/// about every non-dotted-quad spelling of an address.
+///
 /// # Errors
 /// Naming the alias and the address, because the operator can fix both.
 fn refuse_floored_pinned_hosts(spec: &BrokerSpec) -> Result<()> {
     for cred in &spec.credentials {
         let host = cred.host().as_str();
-        let Ok(ip) = host.parse::<IpAddr>() else {
+        let origin = classify_pinned_host(host).map_err(|why| {
+            anyhow::anyhow!(
+                "credential {:?} cannot be used: {why}",
+                cred.alias().as_str()
+            )
+        })?;
+        let PinnedOrigin::Literal(ip) = origin else {
             continue; // a name: resolved through FlooredResolver at dial time
         };
         let ok = (spec.allow_loopback && ip.is_loopback())
@@ -2407,6 +2488,158 @@ mod tests {
             Broker::start(spec).await.is_ok(),
             "a public literal is fine"
         );
+    }
+
+    /// Every spelling of a pinned host, judged against what `url` will dial.
+    ///
+    /// The guard above asked `IpAddr::from_str` and treated a parse failure as
+    /// "a name, the resolver will floor it". The upstream leg is
+    /// `format!("https://{host}{path}")` handed to `reqwest`, whose URL parser
+    /// is WHATWG's — and that one reads decimal, hex and short-form IPv4 as
+    /// addresses, normalising them to a dotted quad before hyper sees the
+    /// authority. So `"2852039166"` was classified as a name, no resolver was
+    /// ever consulted, and the token went to `169.254.169.254`.
+    ///
+    /// The expectation is derived from `url` in the loop rather than written
+    /// out, so the table cannot drift from the parser it is meant to track: a
+    /// `url` release that changes how a spelling is read changes what this test
+    /// demands of the guard, in the same direction.
+    #[test]
+    fn the_pinned_host_guard_agrees_with_the_parser_that_dials() {
+        // Dotted-quad, decimal, hex and short form of the same four addresses,
+        // plus a name (which must keep working) and a public address in a
+        // spelling the parser rewrites (which must not, even though the address
+        // itself is dialable).
+        let spellings = [
+            "169.254.169.254", // link-local, dotted quad     -> floored
+            "2852039166",      // ... in decimal              -> rewritten
+            "0xa9fea9fe",      // ... in hex                  -> rewritten
+            "127.0.0.1",       // loopback, dotted quad       -> floored
+            "2130706433",      // ... in decimal              -> rewritten
+            "127.1",           // ... in short form           -> rewritten
+            "0177.0.0.1",      // ... with an octal first octet -> rewritten
+            "10.107.8.1",      // a sibling run's gateway     -> floored
+            "0x0a6b0801",      // ... in hex                  -> rewritten
+            "3627734734",      // a PUBLIC address in decimal -> rewritten anyway
+            "93.184.216.34",   // a public dotted quad        -> allowed
+            "example.com",     // a name                      -> allowed
+            "api.github.com",  // a name with a dot-heavy shape
+        ];
+
+        for stored in spellings {
+            // What the dialer will actually do with this string.
+            let dialed = url::Url::parse(&format!("https://{stored}/"))
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            let rewritten = dialed != stored;
+            let floored = dialed
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| !super::super::egress::is_dialable(&ip, false));
+
+            let spec = BrokerSpec {
+                gateway: Ipv4Addr::LOCALHOST,
+                guest: Ipv4Addr::LOCALHOST,
+                rules: Vec::new(),
+                credentials: vec![test_credential("probe", stored)],
+                allow_private: false,
+                allow_loopback: false,
+                ports: BrokerPorts {
+                    socks: 0,
+                    http: 0,
+                    inject: 0,
+                    dns: 0,
+                },
+            };
+            let verdict = refuse_floored_pinned_hosts(&spec);
+
+            if rewritten {
+                let err = verdict
+                    .expect_err(&format!(
+                        "{stored:?} is dialled as {dialed:?}; a store, a log and a \
+                         destination that disagree must not start a run"
+                    ))
+                    .to_string();
+                assert!(err.contains("probe"), "names the alias: {err}");
+                assert!(err.contains(stored), "names what was written: {err}");
+                assert!(err.contains(&dialed), "names what would be dialled: {err}");
+            } else if floored {
+                let err = verdict
+                    .expect_err(&format!(
+                        "{stored:?} is an address this broker will not dial"
+                    ))
+                    .to_string();
+                assert!(err.contains("probe"), "names the alias: {err}");
+                assert!(err.contains(stored), "names the address: {err}");
+            } else {
+                assert!(
+                    verdict.is_ok(),
+                    "{stored:?} is dialled as {dialed:?} and is dialable: {:?}",
+                    verdict.err().map(|e| e.to_string())
+                );
+            }
+        }
+
+        // The classification itself, stated once so a reader can see that a name
+        // is still a name — `example.com` has to reach `FlooredResolver`, which is
+        // the only thing that can judge where it points.
+        assert_eq!(
+            classify_pinned_host("example.com").unwrap(),
+            PinnedOrigin::Name
+        );
+        assert_eq!(
+            classify_pinned_host("93.184.216.34").unwrap(),
+            PinnedOrigin::Literal("93.184.216.34".parse().unwrap())
+        );
+
+        // A private literal is a floor question, not a spelling one: allowed
+        // when the host was provisioned for LAN egress, refused otherwise.
+        let lan = |allow_private| BrokerSpec {
+            gateway: Ipv4Addr::LOCALHOST,
+            guest: Ipv4Addr::LOCALHOST,
+            rules: Vec::new(),
+            credentials: vec![test_credential("lan", "192.168.1.10")],
+            allow_private,
+            allow_loopback: false,
+            ports: BrokerPorts {
+                socks: 0,
+                http: 0,
+                inject: 0,
+                dns: 0,
+            },
+        };
+        assert!(refuse_floored_pinned_hosts(&lan(false)).is_err());
+        assert!(refuse_floored_pinned_hosts(&lan(true)).is_ok());
+    }
+
+    #[test]
+    fn an_ipv6_literal_never_reaches_the_pinned_host_guard() {
+        // The neighbouring family. `SafeName` admits only ASCII alphanumerics,
+        // `-`, `_` and `.`, so `::1` and `[::1]` are refused when the store is
+        // read — before the guard sees them. That is the reason
+        // `classify_pinned_host` still handles `Host::Ipv6`: the guard must not
+        // depend on a restriction that lives in another module.
+        use crate::net::credentials::{load_credentials, Caller, CREDENTIALS_FILE};
+        use std::os::unix::fs::PermissionsExt as _;
+        std::env::set_var("ISOPOD_BROKER_TEST_TOK", "ghp_brokertest");
+        for host in ["::1", "[::1]", "[fd00::1]", "::ffff:127.0.0.1"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(CREDENTIALS_FILE);
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"version":1,"credentials":{{"v6":{{"host":"{host}",
+                       "scheme":"bearer","source":"env:ISOPOD_BROKER_TEST_TOK",
+                       "allow":["readonly"]}}}}}}"#
+                ),
+            )
+            .expect("write store");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+            assert!(
+                load_credentials(&["v6".to_string()], Caller::Operator, &path).is_err(),
+                "{host:?} must be refused when the store is read"
+            );
+        }
     }
 
     #[tokio::test]

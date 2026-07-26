@@ -682,13 +682,27 @@ fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<S
     if hi == 0 || hi > MAX_SLOT_COUNT || lo > hi {
         bail!("invalid slot range {lo}..{hi} (expected 0..=hi, hi in 1..={MAX_SLOT_COUNT})");
     }
+    // A slot whose lockfile cannot be opened is *that slot's* problem. It used
+    // to be the whole pool's: one `?` here turned a single stray inode — a
+    // directory left where `slot-0.lock` belongs, say — into "no network at
+    // all" while eleven slots stood free. The scan carries the reasons instead
+    // and only fails when there is nothing left to try, which is also the only
+    // case where an operator has to act.
+    let mut unusable: Vec<String> = Vec::new();
     for i in lo..hi {
         // Validate the slot's derived names/addresses up front; a misconfigured
         // slot_count must never yield an out-of-range tap name or octet.
         tap_name(i)?;
         octet(i)?;
-        if let Some(slot) = try_claim_slot(root, i, filtered)? {
-            return Ok(slot);
+        match try_claim_slot(root, i, filtered) {
+            Ok(Some(slot)) => return Ok(slot),
+            Ok(None) => {}
+            Err(e) => {
+                // Once per slot, on stderr, so a degraded pool is visible in the
+                // run that survived it rather than only in the one that does not.
+                eprintln!("isopod: skipping slot {i}: {e:#}");
+                unusable.push(format!("slot {i}: {e:#}"));
+            }
         }
     }
     let kind = if filtered {
@@ -696,10 +710,31 @@ fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<S
     } else {
         "network"
     };
+    let n = hi - lo;
+    // "Every slot is in use" and "no slot is openable" call for different
+    // actions, so they must not share a message: the first says wait, and
+    // waiting for a directory to stop being a directory never ends.
+    if !unusable.is_empty() && unusable.len() == n {
+        bail!(
+            "none of the {n} {kind} slots is usable — every one of them failed to open its \
+             lockfile in {root}. Each lockfile has to be an ordinary file; remove whatever \
+             is in their place and isopod will recreate them:\n  {why}",
+            root = root.display(),
+            why = unusable.join("\n  "),
+        );
+    }
+    let also = if unusable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ". {u} further slot(s) could not be opened and were skipped:\n  {why}",
+            u = unusable.len(),
+            why = unusable.join("\n  "),
+        )
+    };
     bail!(
         "all {n} {kind} slots are in use; wait for a run to finish or provision \
-         more with `sudo isopod setup --slots N --filtered-slots M`",
-        n = hi - lo,
+         more with `sudo isopod setup --slots N --filtered-slots M`{also}",
     )
 }
 
@@ -738,6 +773,25 @@ fn try_claim_slot(root: &Path, i: usize, filtered: bool) -> Result<Option<Slot>>
 ///
 /// The descriptor is close-on-exec (Rust's default), so firecracker does not
 /// inherit the claim and cannot outlive the run holding it.
+///
+/// # What the open flags are for
+///
+/// The claim used to be `O_CREAT|O_EXCL`, which incidentally refused every path
+/// that was not a fresh regular file. Dropping `O_EXCL` — required, because the
+/// lockfile is now durable and reclaimed rather than created once — dropped that
+/// refusal with it, and three shapes stopped being handled:
+///
+/// | `slot-<i>.lock` is | without these flags |
+/// |---|---|
+/// | a FIFO | `open(O_WRONLY)` **blocks until a reader arrives** — forever, with no timeout on this path, wedging an MCP blocking-pool thread |
+/// | a symlink | followed, so the `flock` lands on an inode outside the `0700` directory, where anything can hold or replace it |
+/// | a directory, socket, device | `EISDIR`/`ENXIO`, which the caller used to treat as a failure of the whole pool |
+///
+/// `O_NOFOLLOW` refuses the symlink at the final component. `O_NONBLOCK` turns
+/// the FIFO's indefinite wait into an immediate `ENXIO`, and is ignored for
+/// regular files. The `fstat` then refuses everything that is not a regular
+/// file, because a lock on a device or a socket is not a lock on a slot. The
+/// caller treats all of these as "this slot is unusable" and keeps scanning.
 fn claim_lock(path: &Path) -> std::io::Result<Option<fs::File>> {
     let file = fs::OpenOptions::new()
         .write(true)
@@ -746,7 +800,19 @@ fn claim_lock(path: &Path) -> std::io::Result<Option<fs::File>> {
         // Only applies when this call creates the file; the enclosing directory
         // is already 0700.
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let kind = file.metadata()?.file_type();
+    if !kind.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file ({kind:?}); a slot lock has to be one, so isopod \
+                 will not flock this and claim the slot is held",
+                path.display()
+            ),
+        ));
+    }
     // SAFETY: `flock` takes a raw fd and an operation, mutating no memory. `file`
     // owns the descriptor and outlives the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -1164,6 +1230,99 @@ mod tests {
         assert_ne!(first.index(), second.index(), "two runs, two slots");
         assert_ne!(first.tap_name(), second.tap_name());
         assert_ne!(first.guest_ip(), second.guest_ip());
+    }
+
+    /// Put something that is not a lockfile where a lockfile belongs.
+    ///
+    /// One helper, four shapes, so the test below cannot quietly cover only the
+    /// one that reproduced. A FIFO is the shape that hangs; a symlink is the one
+    /// that silently relocates the lock; a directory is the one that used to
+    /// fail the whole pool; a socket is the neighbour of the FIFO that nobody
+    /// thinks of.
+    fn plant(path: &Path, shape: &str) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        match shape {
+            "fifo" => assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo"),
+            "symlink" => {
+                // Pointing outside the 0700 directory, which is the harm: the
+                // flock would land on an inode anyone can hold or replace.
+                let target = path.with_file_name("elsewhere-outside-the-dir");
+                std::os::unix::fs::symlink(&target, path).unwrap();
+            }
+            "directory" => fs::create_dir(path).unwrap(),
+            // Dropping a `UnixListener` closes the descriptor and leaves the
+            // socket inode on disk, which is exactly the shape wanted here.
+            "socket" => drop(std::os::unix::net::UnixListener::bind(path).unwrap()),
+            other => panic!("unknown shape {other}"),
+        }
+    }
+
+    #[test]
+    fn a_lockfile_that_is_not_a_file_costs_its_own_slot_and_no_other() {
+        // All three regressed together when `O_CREAT|O_EXCL` became `O_CREAT`.
+        // The FIFO is the one that matters most: `open(O_WRONLY)` on it blocks
+        // until a reader arrives, and nothing on this path has a timeout — under
+        // the MCP server that wedges a blocking-pool thread for good. So the
+        // first assertion each time is that the call *returns*.
+        for shape in ["fifo", "symlink", "directory", "socket"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            plant(&lock_path_in(root, 0), shape);
+
+            let started = std::time::Instant::now();
+            let slot = claim_range_in(root, 0, 4, false)
+                .unwrap_or_else(|e| panic!("{shape}: the rest of the pool must still work: {e:#}"));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{shape}: the claim must return promptly, not block"
+            );
+            assert_eq!(slot.index(), 1, "{shape}: slot 0 is skipped, not fatal");
+
+            // Nothing may have been written through the planted inode: the
+            // symlink's target in particular must not have been created.
+            assert!(
+                !root.join("elsewhere-outside-the-dir").exists(),
+                "{shape}: the lock must not have landed outside the state directory"
+            );
+            // And the claim reports the shape rather than swallowing it.
+            let why = try_claim_slot(root, 0, false)
+                .expect_err("slot 0 is unusable")
+                .to_string();
+            assert!(why.contains("claiming slot 0"), "{shape}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_pool_of_nothing_but_unusable_slots_says_so() {
+        // The other end of the same change: skipping a bad slot must not turn a
+        // wholly broken directory into the ordinary "all slots are in use"
+        // message, which would send an operator looking for a run to wait for
+        // that does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..3 {
+            plant(&lock_path_in(root, i), "directory");
+        }
+        let err = claim_range_in(root, 0, 3, false)
+            .expect_err("nothing is claimable")
+            .to_string();
+        assert!(err.contains("none of the 3"), "{err}");
+        assert!(err.contains("slot 0:"), "names each one: {err}");
+        assert!(err.contains("slot 2:"), "names each one: {err}");
+
+        // A partly-broken pool that is otherwise full says both things.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        plant(&lock_path_in(root, 0), "fifo");
+        let _held = claim_range_in(root, 0, 2, false).expect("slot 1");
+        let err = claim_range_in(root, 0, 2, false)
+            .expect_err("slot 1 is held and slot 0 is unusable")
+            .to_string();
+        assert!(err.contains("in use"), "{err}");
+        assert!(err.contains("skipped"), "{err}");
+        assert!(err.contains("slot 0:"), "{err}");
     }
 
     #[test]

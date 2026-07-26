@@ -39,6 +39,77 @@ not:
   *long-lived server* — so every record the server ever wrote reported `live`
   forever. Observed on a real host: 12 of 33 records live with one VM running.
 
+A **third** pass, over the second pass's fixes, found four more. Two of them were
+in the second pass's own new code, and both are stated here rather than folded in,
+because the pattern is the finding: a fix that closes the case it was shown is not
+the same thing as a fix that closes the class.
+
+- **0.11.0's own `copy_out` confinement had a second escape, one spelling away
+  from the first.** The dangling-symlink guard above calls
+  `std::fs::symlink_metadata(path)` — and `symlink_metadata("link/")` returns
+  `ENOTDIR`, because a trailing separator forces directory resolution. So the
+  guard never ran. `Path::file_name()`/`parent()` then normalised the separator
+  away again, the walk-up returned the bare in-root path, the prefix test passed,
+  and `File::create` followed the link. Four spellings did it — `link/`, `link//`,
+  `link/.`, `link/./` — and they **overwrote** an existing host file, not merely
+  created one, which put `~/.isopod/credentials.json` back within reach through a
+  planted link and defeated the state-directory carve-out. The result still
+  reported the in-root path in `copied[].host`, so the operator saw a path inside
+  the root while the bytes landed outside. Demonstrated end to end against a real
+  `isopod-mcp`. The regression test the second pass added missed it because it
+  built the destination with no trailing separator — the one spelling that already
+  worked.
+
+  The fix is in two places on purpose. The destination is normalised (trailing
+  separators and `.` components dropped, `..` still refused) before any guard
+  runs, so no guard can be shown a different final component from the one that
+  will be opened. And the write itself now opens with **`O_NOFOLLOW`**, so it
+  refuses to traverse a link whatever the check concluded — because a path check
+  and a `File::create` are two lookups of one name, and a symlink planted between
+  them defeats any amount of checking. `O_NONBLOCK` goes on with it, so a FIFO
+  destination fails instead of blocking a thread forever. This is on the shared
+  path, so the CLI gets it too: `isopod run --copy-out g:/host/p` now writes to
+  `/host/p` or fails, rather than to wherever `/host/p` points. The read path
+  (`stdin_file`) was verified unaffected — it canonicalises, and both spellings
+  were already refused.
+- **The pinned-host floor checked a different parser than the dialer uses.** The
+  guard added earlier in this release classified a credential's pinned host with
+  `host.parse::<IpAddr>()` and skipped anything that failed, reasoning that a name
+  goes through the floored resolver. But the upstream leg is
+  `format!("https://{host}{path}")` handed to `reqwest`, whose URL crate uses the
+  **WHATWG** host parser — which reads decimal, hex and short-form IPv4 as
+  addresses and normalises them to a dotted quad *before* hyper sees the
+  authority, so no resolver is ever consulted. `2852039166`, `0xa9fea9fe`,
+  `2130706433`, `127.1`, `0177.0.0.1` and `0x0a6b0801` all failed
+  `IpAddr::from_str`, all skipped the guard, and all dial `169.254.169.254`,
+  `127.0.0.1` or a sibling run's broker gateway. The guard now classifies the host
+  with the same parser the dialer uses, and additionally refuses any pinned host
+  the parser rewrites at all — `egress.denied` recorded `host: "2852039166"`,
+  which an operator cannot grep for `169.254.169.254`, so the store, the log and
+  the destination are now required to be one string. A pinned *name* is untouched
+  and still floored at resolution.
+- **Three lockfile shapes the `flock` claim stopped handling.** Replacing
+  `O_CREAT|O_EXCL` with `O_CREAT` (necessary — the lockfile is now durable)
+  incidentally dropped the refusal `O_EXCL` was providing. A **FIFO** at
+  `slot-<i>.lock` made the claim block in `open` forever, with no timeout on that
+  path, which under the MCP server wedges a blocking-pool thread for good; a
+  **symlink** was followed, putting the `flock` on an inode outside the `0700`
+  state directory; a **directory** failed the entire pool with every other slot
+  free. The claim now opens with `O_NOFOLLOW|O_NONBLOCK` and `fstat`s the
+  descriptor, refusing anything that is not a regular file, and a slot that cannot
+  be opened is skipped with a warning instead of failing the scan — the exhaustion
+  error says how many were skipped and why. Not guest- or MCP-reachable (the
+  directory is `0700` and `hostio` refuses `~/.isopod` for every root), so this is
+  robustness rather than a boundary crossing, but the hang was new in this release.
+- **`SECURITY.md` claimed a property the code does not have.** The `flock` bullet
+  said the slot was "reclaimable immediately with nothing to sweep and no liveness
+  guess". The *lock* is — the kernel drops it, `kill -9` included, verified. The
+  *slot* is not: a `kill -9` of the supervisor leaves its Firecracker holding the
+  tap, and the next run's `registry::reap_orphans` has to SIGKILL it first, on a
+  pid-and-start-time liveness test. Reproduced: the lock read free within 2 s while
+  the orphaned VMM still held `isopod-tap0`. Both that bullet and the CHANGELOG's
+  "correct the instant after" now say what actually happens.
+
 ### Fixed — the MCP surface could read and write arbitrary host files
 
 `sandbox_run`'s two arguments that name a **host** path, `stdin_file` (read) and
@@ -58,11 +129,17 @@ yet — see the note above). `ISOPOD_MCP_HOST_IO_ROOT` moves the root
 arguments outright. The startup log line says which is in force. The CLI is
 deliberately unaffected — there the caller is the operator.
 
-The confinement is a path check, so it is also given the two things a path check
-cannot infer: a **dangling symlink** is refused rather than written through (where
+The confinement is a path check, so it is also given the things a path check
+cannot infer. A **dangling symlink** is refused rather than written through (where
 the write would land cannot be resolved, so it cannot be checked), and a
 **multiply-linked file** is refused outright (a hard link is a second name for an
-inode and resolves to itself, so no prefix test can see it). isopod's own state
+inode and resolves to itself, so no prefix test can see it). The destination is
+**normalised before any guard runs** — trailing separators and `.` components
+dropped, `..` still refused — so no guard can be shown a different final component
+from the one that will be opened. And the write opens the final component with
+**`O_NOFOLLOW`**, so it refuses to traverse a symlink whatever the check
+concluded; a check and an open are two lookups of one name, and only the syscall
+can close the gap between them. isopod's own state
 directory is refused whatever the root is, including with the confinement off.
 An empty `ISOPOD_MCP_HOST_IO_ROOT` no longer reads as a root — `Path::starts_with("")`
 is true for every path, so it admitted everything while the log said "confined to " —
@@ -161,10 +238,15 @@ process cannot read the live ruleset to confirm it.
 - **A network slot is now claimed with `flock`, and the staleness heuristic is
   gone.** A run holds an exclusive `flock` on `~/.isopod/net/slot-<i>.lock` for
   its whole lifetime. That deletes the entire class of bug this release spent
-  three attempts on: there is no staleness to decide, no pid liveness to guess,
-  no write grace, no startup sweep, and no unlink — the kernel releases the lock
-  when the owning process dies, `kill -9` included, so a crashed run's slot is
-  free the instant it dies and correct the instant after. `flock` also belongs to
+  three attempts on: there is no staleness to decide, no write grace, and no
+  unlink — the kernel releases the lock when the owning process dies, `kill -9`
+  included, so the *lock* is free the instant its owner dies, with nothing to
+  reconcile. The *slot* is a separate question and always was: a `kill -9` of the
+  supervisor leaves its Firecracker alive and still holding the tap, so the next
+  run's `registry::reap_orphans` still has to SIGKILL it before it can boot, and
+  that check is a pid-and-start-time liveness test. What is gone is deciding
+  *occupancy* by guessing; what remains is killing a process that is demonstrably
+  still there. `flock` also belongs to
   the **open file description** rather than the process, so two concurrent runs
   under one MCP server are told apart for free; `fcntl` record locking would have
   handed the second one a lock the first still needed. The lockfiles now carry no

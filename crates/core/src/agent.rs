@@ -626,9 +626,7 @@ impl AgentClient {
         )
         .await?;
 
-        let mut file = tokio::fs::File::create(dest)
-            .await
-            .map_err(io_err(format!("creating copy-out dest {}", dest.display())))?;
+        let mut file = create_copy_out_dest(dest).await?;
         let mut written: u64 = 0;
         let result = loop {
             // Idle-bounded per frame (F8): a healthy guest streams chunks
@@ -700,7 +698,13 @@ impl AgentClient {
         if result.is_ok() {
             use std::os::unix::fs::PermissionsExt;
             let mode = host_mode_for(result.as_ref().map(|c| c.mode).unwrap_or(0o644));
-            let _ = tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).await;
+            // Through the descriptor, not the path. A path-based `chmod` here is
+            // a second lookup of a name that was already resolved once, so a
+            // symlink swapped in after the open would take the guest's mode bits
+            // — including an exec bit — to a file of somebody else's choosing.
+            let _ = file
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .await;
         } else {
             let _ = tokio::fs::remove_file(dest).await;
         }
@@ -780,6 +784,59 @@ impl AgentClient {
             other => Err(unexpected(label, &other)),
         }
     }
+}
+
+/// Open a `copy_out` destination for writing, refusing to traverse a symlink.
+///
+/// `File::create` follows a symlink at the final component, which makes every
+/// path-based confinement a statement about a *name* rather than about the file
+/// that name will open. Two ways that came apart in practice:
+///
+/// * The MCP server's host-I/O root checked one spelling of the destination and
+///   `File::create` opened another. `<root>/link` was refused as a dangling
+///   symlink; `<root>/link/` was not, because `symlink_metadata` on a path with
+///   a trailing separator reports `ENOTDIR` — and the create then wrote the
+///   guest's bytes to the link's target outside the root.
+/// * Even with the spellings agreed, a check and an open are two lookups of one
+///   name. Anything that can create a file in the destination's directory can
+///   replace it with a symlink in between.
+///
+/// `O_NOFOLLOW` moves the guarantee from the check to the syscall: the write
+/// refuses to traverse a link whatever the check concluded. It applies to the
+/// **final** component only, so a destination reached through a symlinked
+/// directory still works, and the MCP path — which passes the already
+/// canonicalised destination — is unaffected in every legitimate case.
+///
+/// This is on the shared path rather than the MCP one because the CLI does not
+/// want a surprise traversal either. `isopod run --copy-out g:/host/p` says
+/// "write the artifact to `/host/p`"; if `/host/p` is a link, the bytes land
+/// somewhere the operator did not name, and the mode bits the guest chose land
+/// there too. The operator keeps every unconfined destination they had — they
+/// are only asked to name the file rather than a link to it, and the refusal
+/// says so.
+///
+/// `O_NONBLOCK` is set for a different failure: `open(O_WRONLY)` on a FIFO
+/// blocks until a reader arrives, which under the MCP server would wedge a
+/// blocking-pool thread with no timeout of its own. It is ignored for regular
+/// files, so it costs the ordinary case nothing, and it leaves a device
+/// destination such as `/dev/null` working.
+async fn create_copy_out_dest(dest: &Path) -> Result<tokio::fs::File, AgentError> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dest)
+        .await
+        .map_err(|e| {
+            let hint = if e.raw_os_error() == Some(libc::ELOOP) {
+                " (it is a symbolic link, and isopod will not write through one: \
+                  name the file the link points at)"
+            } else {
+                ""
+            };
+            io_err(format!("creating copy-out dest {}{hint}", dest.display()))(e)
+        })
 }
 
 /// The mode a copied-out file lands with on the host.
@@ -1611,6 +1668,110 @@ mod tests {
         );
         // The partial host file must not survive.
         assert!(!dest.exists());
+        server.await.unwrap();
+    }
+
+    /// `O_NOFOLLOW` on the destination, across every neighbouring class.
+    ///
+    /// A path check and a `File::create` are two lookups of one name, so they
+    /// can always be made to disagree — by a spelling the check normalises
+    /// differently, or by a symlink planted between them. The MCP server's
+    /// host-I/O root was defeated both ways. This asserts the syscall refuses
+    /// on its own, whatever any caller's check concluded.
+    #[tokio::test]
+    async fn a_copy_out_destination_is_opened_without_following_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Live link (the overwrite case) and dangling link (the create case).
+        let precious = outside.path().join("precious");
+        std::fs::write(&precious, b"must survive").unwrap();
+        let absent = outside.path().join("not-yet");
+        let live = dir.path().join("livelink");
+        let dangling = dir.path().join("danglink");
+        std::os::unix::fs::symlink(&precious, &live).unwrap();
+        std::os::unix::fs::symlink(&absent, &dangling).unwrap();
+
+        for link in [&live, &dangling] {
+            let err = create_copy_out_dest(link)
+                .await
+                .expect_err("a symlink destination must be refused");
+            assert!(
+                format!("{err}").contains("symbolic link"),
+                "the refusal must say why: {err}"
+            );
+        }
+        assert_eq!(std::fs::read(&precious).unwrap(), b"must survive");
+        assert!(!absent.exists(), "nothing may have been created");
+
+        // A FIFO: `open(O_WRONLY)` on one blocks until a reader arrives, which
+        // under the MCP server wedges a blocking-pool thread with no timeout of
+        // its own. `O_NONBLOCK` turns that into ENXIO. The assertion that
+        // matters is that this call *returns*.
+        let fifo = dir.path().join("pipe");
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            create_copy_out_dest(&fifo).await.is_err(),
+            "a FIFO with no reader must fail rather than block"
+        );
+
+        // A directory is refused by the kernel (EISDIR), and the ordinary cases
+        // — a new file, and an existing one to truncate — still work.
+        assert!(create_copy_out_dest(dir.path()).await.is_err());
+        let fresh = dir.path().join("artifact.bin");
+        drop(create_copy_out_dest(&fresh).await.expect("a new file"));
+        std::fs::write(&fresh, b"stale bytes to be replaced").unwrap();
+        drop(
+            create_copy_out_dest(&fresh)
+                .await
+                .expect("an existing file"),
+        );
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0, "truncated");
+
+        // A symlinked *directory* in the path is still fine: O_NOFOLLOW applies
+        // to the final component only, so a project laid out through links keeps
+        // working.
+        let via = dir.path().join("via");
+        std::os::unix::fs::symlink(outside.path(), &via).unwrap();
+        drop(
+            create_copy_out_dest(&via.join("through-a-linked-dir"))
+                .await
+                .expect("a linked directory is not the final component"),
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_out_refuses_a_symlinked_destination_end_to_end() {
+        // The same guarantee through the real `copy_out`, so the flag cannot be
+        // dropped by a future refactor of the create site without a test noticing.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let precious = outside.path().join("precious");
+        std::fs::write(&precious, b"must survive").unwrap();
+        let dest = dir.path().join("artifact.bin");
+        std::os::unix::fs::symlink(&precious, &dest).unwrap();
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let _req = read_req(&mut conn).await;
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        });
+        let client = AgentClient::new(&sock);
+        let err = client
+            .copy_out("/artifact", &dest, 1 << 20)
+            .await
+            .expect_err("a symlinked destination must be refused");
+        assert!(format!("{err}").contains("symbolic link"), "{err:?}");
+        assert_eq!(
+            std::fs::read(&precious).unwrap(),
+            b"must survive",
+            "the link's target must be untouched"
+        );
         server.await.unwrap();
     }
 }

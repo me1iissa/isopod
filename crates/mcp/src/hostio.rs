@@ -43,7 +43,7 @@
 //! confining them to their own project directory would be a regression with no
 //! threat behind it.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Which host-path argument is being checked. Only used to name the right
 /// variable in a refusal, so an operator is told the exact knob.
@@ -326,6 +326,27 @@ impl HostIo {
     }
 }
 
+/// Strip the components that say nothing about *which file* is named, so every
+/// guard below sees the same final component the kernel will.
+///
+/// `Path::components` already drops repeated separators, a trailing separator
+/// and any interior `.`, which is the whole set of spellings that made the
+/// dangling-symlink guard skippable: `symlink_metadata("link/")` reports
+/// `ENOTDIR`, so the guard never fired, while `file_name()`/`parent()`
+/// normalised the trailing component away again and handed the walk-up loop the
+/// bare in-root name. Four spellings — `link/`, `link//`, `link/.`, `link/./` —
+/// all reached `File::create`, which followed the link out of the root.
+///
+/// `..` is deliberately **kept**. It is not a spelling of the same file: it
+/// names a different one, and it stays refused the way it already is — by
+/// canonicalising the existing prefix (which collapses it) and failing the
+/// root test, or by [`Path::file_name`] returning `None` for it in the walk-up.
+fn normalize_destination(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
+}
+
 /// Resolve a write destination whose final component may not exist.
 ///
 /// Walks up to the deepest existing ancestor, canonicalises **that**, then
@@ -333,7 +354,14 @@ impl HostIo {
 /// rather than normalised: it cannot be resolved against a directory that does
 /// not exist yet, and guessing would be exactly the matcher/filesystem
 /// disagreement this check exists to prevent.
-fn resolve_for_write(path: &Path) -> Result<PathBuf, String> {
+fn resolve_for_write(raw: &Path) -> Result<PathBuf, String> {
+    // Before any guard runs, so no guard can be shown a different final
+    // component from the one the write will open.
+    let normalized = normalize_destination(raw);
+    let path: &Path = &normalized;
+    if path.as_os_str().is_empty() {
+        return Err("the destination names no file".into());
+    }
     // An existing destination is resolved outright — including a symlink, whose
     // target is where a write would actually land.
     if path.exists() {
@@ -531,6 +559,108 @@ mod tests {
                 Access::Write
             )
             .is_ok());
+    }
+
+    /// Every spelling of the same symlink, dangling and live.
+    ///
+    /// The fix above was tested with exactly one spelling — `link`, with no
+    /// trailing separator — and the escape survived one character away.
+    /// `symlink_metadata("link/")` returns `ENOTDIR`, so the guard never ran,
+    /// while `file_name()`/`parent()` normalised the separator away again and
+    /// handed the walk-up the bare in-root name. Four spellings reached
+    /// `File::create`; on a real MCP server all four overwrote a file outside
+    /// the root while reporting the in-root path back to the operator.
+    ///
+    /// The table is the point: a refusal branch is only as good as the input
+    /// classes next to the one that reproduced it.
+    #[test]
+    fn every_spelling_of_a_symlink_is_refused_not_just_the_bare_one() {
+        let dir = tmp();
+        let elsewhere = tmp();
+        let p = policy(dir.path());
+
+        // A link to a file that exists (the overwrite case) and one to a file
+        // that does not (the create case). Both are outside the root.
+        let live_target = elsewhere.path().join("precious");
+        std::fs::write(&live_target, b"must survive").expect("write");
+        let dangling_target = elsewhere.path().join("not-yet"); // deliberately absent
+        std::os::unix::fs::symlink(&live_target, dir.path().join("livelink")).expect("symlink");
+        std::os::unix::fs::symlink(&dangling_target, dir.path().join("danglink")).expect("symlink");
+        // And a link to a directory outside the root, written *through*.
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("dirlink")).expect("symlink");
+
+        let root = dir.path().display().to_string();
+        for link in ["livelink", "danglink"] {
+            for suffix in ["", "/", "//", "/.", "/./", "/././", "/.//./"] {
+                let raw = format!("{root}/{link}{suffix}");
+                let err = p
+                    .check(&raw, Access::Write)
+                    .expect_err("{raw} must not be writable through");
+                assert!(
+                    err.contains("outside this server's host-I/O root")
+                        || err.contains("does not exist"),
+                    "{raw}: refused for the wrong reason: {err}"
+                );
+            }
+        }
+        for suffix in ["new.txt", "sub/new.txt", "./new.txt", ".//new.txt"] {
+            let raw = format!("{root}/dirlink/{suffix}");
+            assert!(
+                p.check(&raw, Access::Write).is_err(),
+                "{raw} must not be writable through a symlinked directory"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&live_target).expect("read"),
+            b"must survive",
+            "no check may have written anything"
+        );
+        assert!(!dangling_target.exists(), "nothing may have been created");
+
+        // The same spellings of an ordinary in-root destination still resolve,
+        // and to the same file — a normalisation that refused these would break
+        // every legitimate trailing-separator path an operator writes.
+        let plain = format!("{root}/artifact.tar");
+        let want = p.check(&plain, Access::Write).expect("plain destination");
+        for suffix in ["", "/", "//", "/.", "/./"] {
+            let raw = format!("{plain}{suffix}");
+            assert_eq!(
+                p.check(&raw, Access::Write).expect("in-root destination"),
+                want,
+                "{raw} must resolve to the same file as {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_separator_does_not_normalise_a_parent_hop_away() {
+        // `.` is dropped because it names the same file; `..` names a different
+        // one and stays refused. Both directions matter: dropping `..` too would
+        // turn `<root>/a/../../etc/passwd` into an in-root path.
+        let dir = tmp();
+        let p = policy(dir.path());
+        let root = dir.path().display().to_string();
+        for raw in [
+            format!("{root}/../escape"),
+            format!("{root}/../escape/"),
+            format!("{root}/./../escape"),
+            format!("{root}/sub/../../escape"),
+            format!("{root}/nonexistent/../../escape"),
+        ] {
+            assert!(
+                p.check(&raw, Access::Write).is_err(),
+                "{raw} must not resolve to an in-root path"
+            );
+        }
+        // And the normaliser itself: `.` goes, `..` stays.
+        assert_eq!(
+            normalize_destination(Path::new("/a/./b//c/.")),
+            PathBuf::from("/a/b/c")
+        );
+        assert_eq!(
+            normalize_destination(Path::new("/a/../b/")),
+            PathBuf::from("/a/../b")
+        );
     }
 
     #[test]
