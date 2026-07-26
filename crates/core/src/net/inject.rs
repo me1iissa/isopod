@@ -10,10 +10,19 @@
 //! pinned origin, a verbatim `Host:` header delivers the `Authorization` to a
 //! different server, and a 30x followed blindly carries it somewhere else again.
 //!
-//! So this is **not** a reverse proxy. The guest's bytes never reach the wire.
+//! So this is **not** a reverse proxy: the guest does not *compose* the request.
 //! It states an intent — a method, a path, and at most two headers — and the
 //! broker **constructs a new request from parts** if and only if that intent
-//! matches a rule the operator wrote by hand:
+//! matches a rule the operator wrote by hand.
+//!
+//! Being precise about what does cross, because "guest bytes never reach the
+//! wire" would be an overstatement: a path that [`normalize_target`] accepted
+//! *and* an `allow` rule matched, that path's query string verbatim, the values
+//! of at most two allowlisted headers, and a body bounded by
+//! [`MAX_INJECT_BODY`]. What never crosses is anything that decides *where* the
+//! request goes or *who* it is from — the method token is this crate's own
+//! `&'static str`, the scheme and authority come from the operator's file, and
+//! the `Authorization` header is built here:
 //!
 //! ```text
 //!   guest                        broker                        upstream
@@ -522,7 +531,14 @@ fn split_alias(target: &str) -> Result<(String, String), InjectRefusal> {
     {
         return Err(InjectRefusal::NoAlias);
     }
-    Ok((alias.to_string(), rest))
+    // Lower-cased to match, because a resolved credential's alias is normalised
+    // through `SafeName` and so is already lower-case. Comparing the guest's
+    // segment verbatim meant an operator who wrote `"GitHub"` in their store
+    // got a credential reachable only as `/github/…`, while the obvious
+    // `/GitHub/…` returned "no such credential is injected into this run" —
+    // fail-closed, but indistinguishable from a real misconfiguration and
+    // needlessly baffling.
+    Ok((alias.to_ascii_lowercase(), rest))
 }
 
 // ===========================================================================
@@ -633,6 +649,17 @@ mod tests {
         // The Host the guest sent is not even retained — the constructed
         // request supplies the pinned one.
         assert!(i.headers.is_empty());
+    }
+
+    #[test]
+    fn the_alias_segment_is_case_insensitive() {
+        // A resolved alias is normalised through `SafeName` (lower-cased), so
+        // comparing the guest's segment verbatim made an operator's `"GitHub"`
+        // reachable only as `/github/…`.
+        for spelling in ["github", "GitHub", "GITHUB"] {
+            let i = parse_intent(&head(&format!("GET /{spelling}/user HTTP/1.1\n\n"))).unwrap();
+            assert_eq!(i.alias, "github", "{spelling}");
+        }
     }
 
     #[test]

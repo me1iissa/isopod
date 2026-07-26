@@ -32,7 +32,15 @@ scheme-relative target like `//evil.com/x` relocates the request off its pinned
 origin. A verbatim `Host:` header delivers the `Authorization` to a different
 server. A blindly-followed 30x carries it somewhere else again.
 
-So the endpoint is **not a reverse proxy**. Guest bytes never reach the wire.
+So the endpoint is **not a reverse proxy**: the guest does not *compose* the
+request. It says what it wants; the broker builds the request itself.
+
+Precisely, because "guest bytes never reach the wire" would overstate it: what
+crosses is a path the normaliser accepted *and* an `allow` rule matched, that
+path's query verbatim, the values of at most two allowlisted headers, and a
+bounded body. What never crosses is anything deciding **where** the request goes
+or **who** it is from — the method is a fixed token, the scheme and host come
+from your file, and the `Authorization` header is built host-side.
 
 ---
 
@@ -230,10 +238,31 @@ my program can use this credential". It is "this credential can only do these
 specific things". Scope it as if hostile code will use it, because if the run
 goes wrong, hostile code will.
 
+One thing the diagram used to leave out, and no longer does: **the run is the
+trust domain, and so is the machine.** The endpoint listens on a *host* address,
+which means the packet-filter rule that gates guest access — pinned to the tap —
+cannot see a packet a local process sends to it. So the listener checks its peer
+and serves only its own slot's guest:
+
+```mermaid
+flowchart LR
+    G["the run's guest<br/>10.107.8.2"] -->|"served"| E["credential endpoint<br/>10.107.8.1:3129"]
+    H["any other process<br/>on the host"] -.->|"closed before<br/>a byte is read"| E
+    S["a sibling run's guest"] -.->|"10.107.0.0/16 is never<br/>a dialable destination"| E
+```
+
+Before that check, `curl http://10.107.8.1:3129/github/user` from any local shell
+spent the operator's token while a run was live, and the call was recorded in the
+flight recorder as though the sandbox had made it.
+
 Two further limits, stated plainly:
 
 - **A credential is not a capability boundary between processes in one run.**
   If that matters, use two runs.
+- **Root on the host is the operator.** The peer check raises the bar for an
+  unprivileged local account — forging the guest's source address needs a raw
+  socket or a non-local bind, both privileged — and offers nothing against root or
+  against anything that can read the supervisor's memory.
 - **The pinned host is not added to the run's egress allowlist.** A run whose
   only egress input is `--inject github` gets an *empty* allowlist:
   `api.github.com` is `NXDOMAIN`, and the credential endpoint is the one way
@@ -273,7 +302,7 @@ flowchart LR
     P3 --> R
     W -.->|"direct connect:<br/>pinned_credential_host"| P2
     
-    nft["nftables: this tap forwards<br/>nothing, ever — set once as root"]
+    nft["nftables + per-tap forwarding=0:<br/>this tap forwards nothing, ever"]
     nft -.-> gw
 ```
 
@@ -281,14 +310,42 @@ The packet filter is what makes the rest true: a filtered slot forwards nothing,
 so there is no path to the upstream that does not pass through the endpoint, and
 no path to the endpoint that the guest can redirect.
 
+Two mechanisms enforce that, not one, and the difference matters at run time:
+
+```mermaid
+flowchart TB
+    A["nftables: iifname isopod-tap8 drop"] --> C{"still in place?"}
+    B["kernel: net.ipv4.conf.isopod-tap8.forwarding = 0"] --> C
+    C -->|"the ruleset needs CAP_NET_ADMIN to read —<br/>the runtime cannot check it"| D["trusted, and stated as a<br/>non-claim in SECURITY.md"]
+    C -->|"the sysctl is world-readable"| E["checked before every filtered run;<br/>refuses with `sudo isopod setup`"]
+```
+
+Taps outlive a ruleset flush, so before the second mechanism existed a
+`nft flush ruleset` — which a firewalld reload performs — left a "filtered" run
+booting onto a slot that forwarded freely, while its broker held a live token.
+The kernel flag is redundant enforcement *and* the part an unprivileged process
+can verify.
+
+Worth being exact about which of those two jobs applies to which failure:
+
+| What went wrong | Flag still `0`? | Outcome |
+|---|---|---|
+| Something re-enabled forwarding host-wide (`net.ipv4.ip_forward` stamps every interface, so a container runtime starting does it) | no | **Detected.** The run refuses before anything boots. |
+| The ruleset was flushed | yes — a flush does not touch the sysctl | **Contained, not detected.** The kernel still forwards nothing, so the run starts and reaches nothing; the input-chain drop is absent until you re-provision. |
+| Both | no | Detected, as the first row. |
+
+**A host provisioned before 0.11.0 does not have the flag**, so its first
+filtered run refuses with the re-provisioning command. That is the same
+fail-closed trap as the endpoint port, for the same reason: the runtime cannot
+provision anything itself.
+
 ---
 
 ## Failure is always closed
 
-Credential resolution happens **before any VM boots**, and it is all-or-nothing.
-(A network slot is claimed first, so that the broker has a gateway to bind; the
-slot is released again when the run aborts.) Any of these aborts the run rather
-than degrading it:
+Credential resolution happens **before any VM boots** — ahead of the warm-pool
+snapshot build, which boots a builder VM of its own — and it is all-or-nothing.
+Any of these aborts the run rather than degrading it:
 
 - the host was provisioned before the endpoint port existed (checked first, with
   the exact re-provisioning command);
@@ -298,7 +355,14 @@ than degrading it:
   not a regular file, or permissive;
 - the resolved token is empty, or contains bytes that cannot appear in an HTTP
   header (a stray newline would split the request the broker builds);
-- the alias does not exist, or is not opted in for the caller.
+- the alias does not exist, or is not opted in for the caller;
+- the kernel's forwarding guard is missing on any filtered tap — the host has been
+  re-configured (writing `net.ipv4.ip_forward` stamps every interface, so a
+  container runtime starting will do it) and needs `sudo isopod setup` again;
+- the pinned host resolves only to addresses the broker will not dial from the
+  host: loopback, link-local, or — unless the host was provisioned
+  `--allow-lan-egress` — a private range. The token is never sent to a service on
+  the machine because someone controls that name's DNS.
 
 A partial success would let a run proceed believing it holds a credential it
 does not — and, worse, could leave the pinned host reachable *without*

@@ -37,6 +37,9 @@ use isopod_core::image::RootfsFlavor;
 use isopod_core::stage::{self, StageMeta};
 use isopod_core::vm::{self, RunOptions, RunReport};
 
+mod hostio;
+use hostio::{Access, HostIo};
+
 /// Server instructions surfaced to the MCP client at initialize time. Kept under
 /// 2 KiB and front-loaded with trigger phrases (tool-search reads this to decide
 /// when to reach for isopod).
@@ -64,6 +67,76 @@ state must survive the call.";
 /// 64 KiB by core, so a single result stays well under this ceiling; the full,
 /// uncapped output is always on disk at the returned log paths.
 const MAX_RESULT_SIZE_CHARS: u64 = 100_000;
+
+/// Ceiling on a `stdin_file` payload.
+///
+/// The bytes cross the vsock as one framed message, and the frame limit is 8 MiB
+/// before base64 expansion — so anything much above this could not reach the guest
+/// anyway, and refusing up front names a limit instead of failing later with a
+/// framing error.
+const MAX_STDIN_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a `stdin_file`, with the guards a host-path argument needs.
+///
+/// `tokio::fs::read` on a caller-supplied path is not enough on either count:
+///
+/// - **Regular files only.** A FIFO blocks inside `open` until someone writes,
+///   parking a blocking-pool thread for the life of the process; a character
+///   device like `/dev/zero` never reaches EOF, so the read grows a `Vec` until
+///   the host is out of memory. The credential loader already refuses non-regular
+///   sources for exactly these two reasons; this path had none of it.
+/// - **A size ceiling, enforced on the read.** The stat is a hint — a file can
+///   grow between stat and read — so the limit is applied by reading through
+///   `take`, and the stat only exists to refuse early with a clear message.
+///
+/// `symlink_metadata`, not `metadata`: the path arriving here has already been
+/// resolved by [`HostIo::check`], so a symlink at this point is one that appeared
+/// after the check, and following it is the thing the check ruled out.
+async fn read_stdin_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    read_stdin_file_limited(path, MAX_STDIN_FILE_BYTES).await
+}
+
+/// [`read_stdin_file`] with the ceiling as a parameter, so the guards can be
+/// tested without writing megabytes to a temp directory.
+async fn read_stdin_file_limited(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file. A FIFO would block the read until something \
+             wrote to it, and a device is unbounded",
+            path.display()
+        ));
+    }
+    if meta.len() > limit {
+        return Err(format!(
+            "{} is {} bytes, over the {limit}-byte stdin_file limit (the payload \
+             crosses the vsock as one frame). Copy it into a stage instead, or split it",
+            path.display(),
+            meta.len(),
+        ));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    // One byte past the limit, so growth between the stat and the read is caught
+    // here rather than silently truncated.
+    tokio::io::AsyncReadExt::take(file, limit + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "{} grew past the {limit}-byte stdin_file limit while it was being read",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
 
 /// The `_meta` map attached to the `sandbox_run` tool definition, declaring the
 /// Anthropic max-result-size hint. Referenced by the `#[tool(meta = …)]`
@@ -260,6 +333,12 @@ struct SandboxRunResult {
     /// Committed stage vanity name (alongside `stage_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     stage_name: Option<String>,
+    /// Why `commit_as` did not produce a stage, when it was asked for and failed
+    /// (a label already in use, a base mismatch, no space). The command itself
+    /// still ran — its exit code and output above are the real ones — so this is
+    /// the field to read before assuming a stage exists to fork from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_error: Option<String>,
     /// Network slot index, present only when networking was on.
     #[serde(skip_serializing_if = "Option::is_none")]
     slot: Option<usize>,
@@ -461,6 +540,7 @@ impl From<RunReport> for SandboxRunResult {
             rootfs_flavor: r.rootfs_flavor,
             stage_id: r.stage_id,
             stage_name: r.stage_name,
+            commit_error: r.commit_error,
             slot: r.slot,
             guest_ip: r.guest_ip,
             stdout_log_path: r.stdout_log_path.to_string_lossy().into_owned(),
@@ -559,6 +639,10 @@ struct VmEntry {
     created_unix: u64,
     /// Total bytes currently held by the VM directory (logs, sockets, copies).
     dir_bytes: u64,
+    /// Whether the run that owns this directory is still going. `vm_gc` refuses
+    /// to touch these; surfacing it here is what lets a caller tell "leftovers I
+    /// can prune" from "a run in flight" before asking for a collection.
+    live: bool,
 }
 
 /// Result of [`Isopod::vm_list`].
@@ -592,6 +676,9 @@ struct Isopod {
     tool_router: ToolRouter<Self>,
     /// Total `sandbox_run` calls served — drives the every-Nth auto-GC.
     runs: Arc<AtomicU64>,
+    /// Policy for the two arguments that name a **host** path. Resolved once at
+    /// startup, so a mid-session environment change cannot widen it.
+    host_io: HostIo,
 }
 
 /// How many newest VM record dirs the automatic sweeps keep (matches the
@@ -624,9 +711,14 @@ fn spawn_auto_gc(trigger: &'static str) {
 impl Isopod {
     /// Construct the server with its tool router wired up.
     fn new() -> Self {
+        let host_io = HostIo::from_env();
+        // Logged at boot, not on first use: a confinement an operator cannot see
+        // is one they will not notice is wrong until a call fails.
+        tracing::info!("host file I/O: {}", host_io.describe());
         Self {
             tool_router: Self::tool_router(),
             runs: Arc::new(AtomicU64::new(0)),
+            host_io,
         }
     }
 
@@ -710,8 +802,17 @@ issue calls from separate agents.",
                         None,
                     ));
                 }
-                let bytes = tokio::fs::read(&path).await.map_err(|e| {
-                    ErrorData::invalid_params(format!("reading stdin_file {path:?}: {e}"), None)
+                // Confined, and the *resolved* path is what gets opened — so the
+                // path that was validated is the path that is read, with no
+                // window between the two. Unconstrained, this argument was an
+                // arbitrary host-file read whose contents come back to the
+                // caller in `stdout`; see the `hostio` module docs.
+                let checked = self
+                    .host_io
+                    .check(&path, Access::Read)
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                let bytes = read_stdin_file(&checked).await.map_err(|e| {
+                    ErrorData::invalid_params(format!("stdin_file {path:?}: {e}"), None)
                 })?;
                 Some(bytes)
             }
@@ -768,11 +869,22 @@ issue calls from separate agents.",
                 .copy_out
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| vm::CopyOutSpec {
-                    guest: c.guest,
-                    host: std::path::PathBuf::from(c.host),
+                .map(|c| {
+                    // Same confinement, opposite direction — and this one writes
+                    // guest-authored bytes, creating parent directories on the
+                    // way. Unconstrained it was a host-persistence primitive
+                    // (an `authorized_keys`, a shell rc, or isopod's own
+                    // credential store) driven by whatever the sandbox produced.
+                    let host = self
+                        .host_io
+                        .check(&c.host, Access::Write)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    Ok(vm::CopyOutSpec {
+                        guest: c.guest,
+                        host,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, ErrorData>>()?,
         };
 
         // Best-effort idle-timeout keepalive: if the client sent a progressToken,
@@ -913,7 +1025,8 @@ it. `reference` is a stage id, vanity name, or unique label prefix."
     #[tool(
         name = "vm_list",
         description = "List recent VM records (newest-first): id, vanity name, flavor, created, dir \
-bytes. These are the per-run directories holding serial and exec logs."
+bytes, and whether the run is still live. These are the per-run directories holding serial and \
+exec logs. `vm_gc` never collects a live one."
     )]
     async fn vm_list(&self) -> Result<Json<VmListResult>, ErrorData> {
         let vms = tokio::task::spawn_blocking(vm::vm_list)
@@ -931,6 +1044,7 @@ bytes. These are the per-run directories holding serial and exec logs."
                     flavor: r.flavor,
                     created_unix: r.created_unix,
                     dir_bytes: r.dir_bytes,
+                    live: r.live,
                 })
                 .collect(),
         }))
@@ -1003,6 +1117,58 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stdin_file_reads_only_bounded_regular_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // The ordinary case still works, byte for byte.
+        let ok = dir.path().join("payload");
+        std::fs::write(&ok, b"hello stdin").expect("write");
+        assert_eq!(
+            read_stdin_file_limited(&ok, 1024).await.expect("read"),
+            b"hello stdin".to_vec()
+        );
+
+        // A directory is not a regular file. Neither is a character device: reading
+        // /dev/zero to EOF never terminates, and the buffer grows until the host is
+        // out of memory — the argument was a one-line host OOM.
+        let err = read_stdin_file_limited(dir.path(), 1024)
+            .await
+            .expect_err("a directory must be refused");
+        assert!(err.contains("not a regular file"), "{err}");
+        let zero = std::path::Path::new("/dev/zero");
+        if zero.exists() {
+            let err = read_stdin_file_limited(zero, 1024)
+                .await
+                .expect_err("/dev/zero must be refused");
+            assert!(err.contains("not a regular file"), "{err}");
+            assert!(
+                err.contains("unbounded"),
+                "the why is in the message: {err}"
+            );
+        }
+
+        // Over the ceiling: refused by the stat, naming the limit.
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'x'; 64]).expect("write");
+        let err = read_stdin_file_limited(&big, 8)
+            .await
+            .expect_err("an oversized file must be refused");
+        assert!(err.contains("over the 8-byte stdin_file limit"), "{err}");
+
+        // Exactly at the ceiling is allowed — the check is `>`, not `>=`, and an
+        // off-by-one here would reject a payload the vsock frame can carry.
+        let exact = dir.path().join("exact");
+        std::fs::write(&exact, vec![b'y'; 8]).expect("write");
+        assert_eq!(
+            read_stdin_file_limited(&exact, 8)
+                .await
+                .expect("read")
+                .len(),
+            8
+        );
+    }
 
     /// The router exposes exactly the six agreed tools, by name.
     #[test]

@@ -190,6 +190,17 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     std::fs::write(SYSCTL_CONF, sysctl_conf_body())
         .with_context(|| format!("writing {SYSCTL_CONF}"))?;
 
+    // 3b. Per-tap forwarding, which MUST follow the global write: setting
+    //     net.ipv4.ip_forward stamps every interface's flag, so doing this first
+    //     would undo it. A filtered tap gets 0 — the kernel then refuses to
+    //     forward anything that arrives on it, independently of the ruleset above,
+    //     and unlike the ruleset the flag is readable without privilege, so the
+    //     unprivileged runtime can confirm it before every filtered run.
+    for i in 0..slot_count {
+        let tap = tap_name(i)?;
+        set_tap_forwarding(&tap, i < filtered_from)?;
+    }
+
     // 4. Manifest + ownership so the unprivileged runtime can claim slots.
     //    Resolve the net dir from the INVOKING user's home, not $HOME: under
     //    sudo, $HOME is often /root, which would strand the manifest where the
@@ -605,6 +616,23 @@ fn list_isopod_taps() -> Result<Vec<String>> {
 fn set_ip_forward(on: bool) -> Result<()> {
     std::fs::write(IP_FORWARD_PROC, if on { "1\n" } else { "0\n" })
         .with_context(|| format!("writing {IP_FORWARD_PROC}"))
+}
+
+/// Set the per-tap IPv4 forwarding knob.
+///
+/// Writing `net.ipv4.ip_forward` sets *every* interface's flag, so this must run
+/// after [`set_ip_forward`] or it is immediately undone.
+///
+/// For a filtered slot this is a second, independent enforcement of "forwards
+/// nothing": with the flag clear the kernel's routing layer refuses to forward a
+/// packet that arrived on the tap, whether or not the nftables ruleset is loaded.
+/// It is also the only part of the filtered guarantee an *unprivileged* process
+/// can verify at run time — reading the live ruleset needs `CAP_NET_ADMIN`, this
+/// file is world-readable — which is what [`crate::net::require_filtered_kernel_guard`]
+/// checks before a filtered run boots.
+fn set_tap_forwarding(tap: &str, on: bool) -> Result<()> {
+    let path = crate::net::tap_forwarding_proc(tap);
+    std::fs::write(&path, if on { "1\n" } else { "0\n" }).with_context(|| format!("writing {path}"))
 }
 
 /// Read the live `net.ipv4.ip_forward` value (0 if unreadable).

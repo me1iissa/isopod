@@ -3,7 +3,15 @@
 //!
 //! The root is `$ISOPOD_HOME` when set (tests and CI point it at a scratch dir),
 //! otherwise `~/.isopod`. Directory accessors create their target on demand with
-//! mode `0755` so callers never have to pre-create anything.
+//! mode `0700` so callers never have to pre-create anything.
+//!
+//! `0700`, not `0755`, because of what lives under it: every run's `console.log`,
+//! `exec-stdout.log`, `exec-stderr.log` and `egress.jsonl`, each created with a
+//! plain `File::create` and therefore `0644` under the usual umask. A traversable
+//! parent made all of it readable by every local account on the host. Nothing
+//! isopod runs needs the tree to be world-traversable — firecracker runs as the
+//! same user — so the directory mode is where this is fixed once, rather than at
+//! every file creation.
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
@@ -32,13 +40,31 @@ fn home_from(override_var: Option<OsString>, os_home: Option<PathBuf>) -> Result
     Ok(home.join(".isopod"))
 }
 
-/// Create `dir` (and parents) if absent and ensure it is mode `0755`.
+/// The mode every isopod state directory is created with, and tightened to if it
+/// is found looser. See the module docs for why it is not `0755`.
+const DIR_MODE: u32 = 0o700;
+
+/// Create `dir` (and parents) if absent, and tighten it to [`DIR_MODE`] if it is
+/// currently more permissive than that.
+///
+/// Tightening only, never loosening. This used to `set_permissions(0o755)`
+/// unconditionally on every call — not at create time, on *every* call — so an
+/// operator who ran `chmod 700 ~/.isopod/vms` had it silently undone by the next
+/// run. Going the other way is safe: a directory this process can already reach
+/// stays reachable, and anything beyond `0700` on a per-user state tree was not
+/// serving a purpose isopod knows about.
 fn ensure_dir(dir: PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
-    let perms = std::fs::Permissions::from_mode(0o755);
-    std::fs::set_permissions(&dir, perms)
-        .with_context(|| format!("setting 0755 on {}", dir.display()))?;
+    let current = std::fs::metadata(&dir)
+        .with_context(|| format!("reading the mode of {}", dir.display()))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if current & !DIR_MODE != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE))
+            .with_context(|| format!("tightening {} to 0700", dir.display()))?;
+    }
     Ok(dir)
 }
 
@@ -75,6 +101,34 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_dir_tightens_a_loose_tree_and_leaves_a_tight_one_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mode_of = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+
+        // Created fresh: 0700, so the run logs and egress records inside it are not
+        // readable by every local account.
+        let fresh = ensure_dir(tmp.path().join("fresh")).expect("create");
+        assert_eq!(mode_of(&fresh), DIR_MODE);
+
+        // Found world-traversable: tightened.
+        let loose = tmp.path().join("loose");
+        std::fs::create_dir_all(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let loose = ensure_dir(loose).expect("tighten");
+        assert_eq!(mode_of(&loose), DIR_MODE);
+
+        // Found tighter than we ask for: left exactly as the operator set it. The
+        // bug this replaces was a chmod on every call, which silently undid a
+        // deliberate `chmod 700` — so re-loosening here would be the same mistake
+        // in the other direction.
+        let tight = tmp.path().join("tight");
+        std::fs::create_dir_all(&tight).expect("mkdir");
+        std::fs::set_permissions(&tight, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let tight = ensure_dir(tight).expect("leave alone");
+        assert_eq!(mode_of(&tight), 0o500);
+    }
 
     #[test]
     fn override_wins_over_home() {

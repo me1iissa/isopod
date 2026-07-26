@@ -22,3 +22,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 isopod-core = { workspace = true }
+
+[dev-dependencies]
+# The host-I/O confinement tests build real directory trees and symlinks; a
+# spelling-only check would be no confinement at all.
+tempfile = { workspace = true }

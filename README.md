@@ -27,7 +27,11 @@ sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted
 ```
 
 > Pre-1.0 and moving quickly; `main` is the supported line. Newest: host-declared
-> credentials a run can spend but never read (0.10.0 — [docs](docs/credentials.md)).
+> credentials a run can spend but never read (0.10.0 — [docs](docs/credentials.md)),
+> hardened in 0.11.0 after an adversarial review of the shipped code
+> ([changelog](CHANGELOG.md)). **0.11.0 needs one `sudo isopod setup` on an existing
+> host** — a filtered run now verifies the kernel's own forwarding guard and fails
+> closed without it.
 
 ---
 

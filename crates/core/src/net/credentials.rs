@@ -739,6 +739,25 @@ fn read_store(path: &Path) -> Result<CredentialStore, CredError> {
             found: store.version,
         });
     }
+    // Aliases are matched without regard to case (see `resolve_one`), so a store
+    // declaring two that differ only in case has no single answer for `--inject
+    // gh`. Picking one would mean a token going to whichever pinned host sorted
+    // first — precisely the ambiguity a credential system must not resolve
+    // silently — so the store is rejected as a whole.
+    let mut seen: BTreeMap<String, &String> = BTreeMap::new();
+    for alias in store.credentials.keys() {
+        let folded = alias.to_ascii_lowercase();
+        if let Some(first) = seen.insert(folded, alias) {
+            return Err(CredError::BadSpec {
+                alias: alias.clone(),
+                problem: format!(
+                    "the store also declares {first:?}, which differs only in case. \
+                     Aliases are matched case-insensitively, so these two cannot be \
+                     told apart — rename one"
+                ),
+            });
+        }
+    }
     Ok(store)
 }
 
@@ -756,7 +775,18 @@ fn resolve_one(
         .for_caller(caller)
     };
 
-    let Some(spec) = store.credentials.get(alias) else {
+    // Case-insensitively, so the alias behaves the same way everywhere it is
+    // written: in the store, on the command line, and in the URL path the guest
+    // builds. A resolved alias is normalised through `SafeName` (lower-cased), so
+    // an operator who declared `"GitHub"` and typed `--inject GitHub` would
+    // otherwise have found the credential reachable only as `/github/…`. Matching
+    // in one place and not the others is worse than either rule on its own.
+    // `read_store` has already rejected a store where this could be ambiguous.
+    let Some((_, spec)) = store
+        .credentials
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(alias))
+    else {
         note_operator(caller, alias, "no such alias in the credential store");
         return Err(unavailable());
     };
@@ -1121,6 +1151,52 @@ mod tests {
         let missing = Path::new("/nonexistent/isopod/credentials.json");
         let err = load_credentials(&["github".into()], Caller::Operator, missing).unwrap_err();
         assert!(matches!(err, CredError::NoStore(_)), "{err}");
+    }
+
+    #[test]
+    fn an_alias_matches_however_it_is_spelled() {
+        // A resolved alias is normalised through `SafeName`, which lower-cases —
+        // so matching the *store key* case-sensitively made an alias declared
+        // `"GitHub"` reachable only as `/github/…` in the guest's URL, while
+        // `--inject github` did not resolve at all. One rule, everywhere: the
+        // store key, the flag, and the URL path segment all fold to the same
+        // thing. Found by running it, not by reading it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = r#"{"version":1,"credentials":{
+            "GitHub": {"host":"api.github.com","scheme":"bearer",
+                       "source":"env:ISOPOD_CASE_TOK","allow":["readonly"],"mcp":true}}}"#;
+        let p = write_store(dir.path(), store, 0o600);
+        std::env::set_var("ISOPOD_CASE_TOK", "tok");
+        for spelling in ["GitHub", "github", "GITHUB", "gItHuB"] {
+            let got = load_credentials(&[spelling.into()], Caller::Operator, &p)
+                .unwrap_or_else(|e| panic!("--inject {spelling} must resolve: {e}"));
+            assert_eq!(got.len(), 1);
+            // And what the guest must type is the normalised form, whatever the
+            // operator wrote in the file.
+            assert_eq!(got[0].alias().as_str(), "github");
+        }
+    }
+
+    #[test]
+    fn a_store_with_two_aliases_differing_only_in_case_is_refused_whole() {
+        // Case-insensitive matching has to answer this: `--inject gh` would name
+        // two different pinned hosts. Choosing either silently would send a token
+        // to a host the operator did not mean, so the store is rejected outright —
+        // including for the aliases that are *not* ambiguous, because a store this
+        // confusing should be fixed before anything spends from it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = r#"{"version":1,"credentials":{
+            "gh": {"host":"api.github.com","scheme":"bearer",
+                   "source":"env:ISOPOD_CASE_TOK","allow":["readonly"],"mcp":true},
+            "GH": {"host":"evil.example.com","scheme":"bearer",
+                   "source":"env:ISOPOD_CASE_TOK","allow":["readonly"],"mcp":true}}}"#;
+        let p = write_store(dir.path(), store, 0o600);
+        std::env::set_var("ISOPOD_CASE_TOK", "tok");
+        let err = load_credentials(&["gh".into()], Caller::Operator, &p)
+            .expect_err("an ambiguous store must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("differs only in case"), "{msg}");
+        assert!(msg.contains("rename one"), "{msg}");
     }
 
     #[test]

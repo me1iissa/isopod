@@ -699,7 +699,7 @@ impl AgentClient {
         };
         if result.is_ok() {
             use std::os::unix::fs::PermissionsExt;
-            let mode = result.as_ref().map(|c| c.mode).unwrap_or(0o644);
+            let mode = host_mode_for(result.as_ref().map(|c| c.mode).unwrap_or(0o644));
             let _ = tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).await;
         } else {
             let _ = tokio::fs::remove_file(dest).await;
@@ -780,6 +780,23 @@ impl AgentClient {
             other => Err(unexpected(label, &other)),
         }
     }
+}
+
+/// The mode a copied-out file lands with on the host.
+///
+/// The guest reports its source file's mode, and carrying it is the point: a
+/// script or binary built in the sandbox should arrive executable. But the guest
+/// is root in its own VM and picks that number freely, and it used to be applied
+/// verbatim — so `chmod 6777` before the copy produced a host file setuid **and**
+/// setgid to the operator and writable by every local account, and `chmod 000`
+/// produced an artifact the operator could not read.
+///
+/// Keep the executable bits; drop everything that grants authority away. setuid,
+/// setgid and sticky never travel, group and other write are cleared, and owner
+/// read/write is always granted so a copy is never useless.
+#[must_use]
+fn host_mode_for(guest_mode: u32) -> u32 {
+    ((guest_mode & 0o777) & !0o022) | 0o600
 }
 
 /// Describe an unexpected response body for error messages.
@@ -903,6 +920,25 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
+
+    #[test]
+    fn a_copied_out_file_never_lands_setuid_or_world_writable() {
+        // The mode comes from the guest, which is root in its own VM: it is an
+        // input, not a fact. These are the four cases that matter.
+        assert_eq!(host_mode_for(0o6777), 0o755, "setuid+setgid stripped");
+        assert_eq!(host_mode_for(0o4755), 0o755, "setuid stripped");
+        assert_eq!(host_mode_for(0o1777), 0o755, "sticky and o+w stripped");
+        assert_eq!(host_mode_for(0o000), 0o600, "an unreadable copy is useless");
+        // And the ordinary cases still round-trip, because carrying the exec bit
+        // is the entire reason the mode travels.
+        assert_eq!(host_mode_for(0o644), 0o644);
+        assert_eq!(host_mode_for(0o755), 0o755);
+        assert_eq!(host_mode_for(0o600), 0o600);
+        // Nothing above the low 9 bits ever survives, whatever the guest sends.
+        for guest in [0o7777, 0o4000, 0o2000, 0o1000] {
+            assert_eq!(host_mode_for(guest) & 0o7000, 0, "{guest:o}");
+        }
+    }
 
     /// Accept one connection, perform the Firecracker host-side vsock handshake,
     /// and hand back the raw stream positioned at the first RPC frame.

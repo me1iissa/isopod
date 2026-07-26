@@ -939,6 +939,18 @@ pub struct RunReport {
     /// [`stage_id`](Self::stage_id)).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_name: Option<String>,
+    /// Why `--commit-as` did not produce a stage, when it was asked for and
+    /// failed (a label already in use, a base mismatch, no space). Present only
+    /// on that path, and never alongside [`stage_id`](Self::stage_id).
+    ///
+    /// A failed commit used to abort the whole run: the command had already
+    /// succeeded, its scratch had already been cleaned up, and the caller got an
+    /// error instead of their output — so a mistyped label destroyed the work it
+    /// was meant to preserve. The commit is the last thing a run does; failing it
+    /// is worth reporting loudly, and worth nothing at all to throw the run away
+    /// over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_error: Option<String>,
     /// The claimed network slot index (present only when networking is on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<usize>,
@@ -1163,11 +1175,27 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     if opts.network {
         require_network_setup()?;
     }
+    // A filtered run's whole promise is that its slot forwards nothing, and the
+    // kernel-level half of that is the one part the unprivileged runtime can read
+    // back. Checked here as well as on the claimed slot so the refusal lands before
+    // a warm-pool snapshot build boots a builder VM.
+    if opts.egress.is_some() && opts.network {
+        net::require_filtered_pool_guard()?;
+    }
     // And fail fast if this host was provisioned before the credential endpoint
     // existed: its nftables ruleset has no hole for that port, so the run would
     // otherwise boot, bind a listener the guest cannot address, and hang.
-    if opts.egress.as_ref().is_some_and(|p| !p.inject.is_empty()) {
+    if let Some(policy) = opts.egress.as_ref().filter(|p| !p.inject.is_empty()) {
         net::require_credential_endpoint()?;
+        // Resolve the credentials here purely to fail fast, then drop them.
+        //
+        // The load is repeated when the broker starts, which is where the values
+        // are actually used. Doing it twice is the price of the guarantee the
+        // documentation makes: *nothing boots* before a credential problem is
+        // reported. Without this the first warm-eligible run of a shape builds
+        // its snapshot first — which boots a whole builder VM — so a mistyped
+        // alias cost seconds and a VM before saying so.
+        drop(load_run_credentials(policy)?);
     }
     // Validate the requested resource shape against real host capacity *before*
     // booting anything: an over-cap request must error with no VM launched.
@@ -1203,7 +1231,7 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(run_exec(
+    let out = rt.block_on(run_exec(
         fc,
         kernel,
         plan,
@@ -1211,7 +1239,35 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
         scratch_mib,
         opts,
         t_total,
-    ))
+    ));
+    // Bound the teardown instead of letting `rt` drop implicitly.
+    //
+    // Dropping a runtime waits, with no timeout, for every blocking-pool thread
+    // still inside a task — and `getaddrinfo` (which every allowed destination
+    // and every DNS answer goes through) has no cancellation: aborting the async
+    // task detaches the resolver thread rather than stopping it. So a name whose
+    // nameserver accepts the query and never answers held this function long past
+    // the run's own timeout, with the report already built and the slot already
+    // released. Over MCP that is a `sandbox_run` request and one of the server's
+    // blocking threads pinned for the whole resolver budget.
+    //
+    // Leaking those threads is the right trade here: they are pure resolver waits
+    // that exit on their own, and the broker they belonged to is gone.
+    rt.shutdown_timeout(Duration::from_millis(250));
+    out
+}
+
+/// Clears a run's `owner.pid` when the run ends, however it ends — including on
+/// an early `?` return, a panic, or a boot that never got as far as a VM.
+///
+/// See [`registry::clear_owner`] for why the file's absence is the signal rather
+/// than the recorded pid's death.
+struct OwnerMark(PathBuf);
+
+impl Drop for OwnerMark {
+    fn drop(&mut self) {
+        registry::clear_owner(&self.0);
+    }
 }
 
 /// How a run's guest disks are laid out. `Flavor` is the legacy single-ext4
@@ -1293,9 +1349,14 @@ async fn run_exec(
     let vm_dir = paths::vms_dir()?.join(&vm_id);
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
-    // Record the owning CLI pid so the reaper can tell a live run's VMM from an
-    // orphaned one regardless of process reparenting.
-    let _ = std::fs::write(vm_dir.join("owner.pid"), std::process::id().to_string());
+    // Record the owning pid so the reaper can tell a live run's VMM from an
+    // orphaned one regardless of process reparenting. The guard removes it when
+    // this function returns by any path: the file's *presence* is what marks a
+    // run as in flight, and it has to stop meaning that the moment the run ends.
+    // Leaving it behind would be harmless for the CLI, whose pid dies with the
+    // run, and wrong for MCP, whose pid is the server's and outlives everything.
+    let _owner = OwnerMark(vm_dir.clone());
+    let _ = std::fs::write(vm_dir.join("owner.pid"), registry::owner_token());
 
     let flavor_label = match &plan {
         BootPlan::Flavor { flavor_slug, .. } => flavor_slug.clone(),
@@ -1342,7 +1403,13 @@ async fn run_exec(
     // possible failure mode.
     let net_slot = if opts.network {
         Some(if opts.egress.is_some() {
-            net::claim_filtered()?
+            let slot = net::claim_filtered()?;
+            // Everything else about a filtered slot is provisioned by root and
+            // then trusted. This is the one part of it the unprivileged runtime
+            // can read back, so it is checked on the claimed slot every time,
+            // rather than inferred from the manifest that recorded the intent.
+            net::require_filtered_kernel_guard(slot.index())?;
+            slot
         } else {
             claim_network()?
         })
@@ -1370,8 +1437,17 @@ async fn run_exec(
             let gateway = slot.host_ip().parse().with_context(|| {
                 format!("slot {} has an unparseable gateway address", slot.index())
             })?;
+            // The broker dials from the host, so the packet filter's
+            // public-only-egress rule — which governs *forwarded* traffic — does
+            // not constrain it. It applies the same policy itself, reading the
+            // one authority for whether this host permits private destinations.
+            let allow_private = net::read_manifest()
+                .map(|m| m.allow_lan_egress)
+                .unwrap_or(false);
             let broker = broker::Broker::start(
-                broker::BrokerSpec::new(gateway, rules.clone()).with_credentials(credentials),
+                broker::BrokerSpec::new(gateway, rules.clone())
+                    .with_credentials(credentials)
+                    .with_private_destinations(allow_private),
             )
             .await
             .context("starting the egress broker; a filtered run cannot proceed without it")?;
@@ -1442,9 +1518,20 @@ async fn run_exec(
         crate::jail::teardown(spec);
     }
 
-    // Surface a commit failure ahead of the exec result: the user explicitly
-    // asked to persist the stage.
-    let committed = commit_outcome?;
+    // A commit failure is reported, not thrown. It happens after the command has
+    // run and after the scratch has been cleaned up, so propagating it discarded
+    // the exit code, the output and the log paths of a run that had already done
+    // its work — turning a mistyped `--commit-as` label into total data loss.
+    // The error goes to stderr immediately (an operator watching a build wants to
+    // know now) and into the report (so a program can see it).
+    let (committed, commit_error) = match commit_outcome {
+        Ok(c) => (c, None),
+        Err(e) => {
+            let why = format!("{e:#}");
+            eprintln!("run: --commit-as did not commit: {why}");
+            (None, Some(why))
+        }
+    };
     let exec = boot.exec?;
     Ok(RunReport {
         ok: true,
@@ -1474,6 +1561,7 @@ async fn run_exec(
         stderr_log_path: stderr_log,
         stage_id: committed.as_ref().map(|m| m.stage_id.clone()),
         stage_name: committed.as_ref().map(|m| m.name.clone()),
+        commit_error,
         slot: slot_index,
         guest_ip,
         copied: exec.copied,
@@ -2688,6 +2776,7 @@ mod tests {
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
             stage_id: None,
             stage_name: None,
+            commit_error: None,
             slot: None,
             guest_ip: None,
             copied: Vec::new(),
@@ -2796,6 +2885,7 @@ mod tests {
             stderr_log_path: PathBuf::from("/v/exec-stderr.log"),
             stage_id: Some("st-0123456789abcdef".into()),
             stage_name: Some("radiant-ghost".into()),
+            commit_error: None,
             slot: Some(3),
             guest_ip: Some("10.107.3.2".into()),
             copied: Vec::new(),

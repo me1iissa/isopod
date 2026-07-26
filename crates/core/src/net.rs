@@ -172,6 +172,20 @@ pub fn guest_ip(i: usize) -> String {
     format!("10.107.{i}.2")
 }
 
+/// The guest that shares a slot's `/30` with host address `gw`.
+///
+/// The two addresses of a slot differ only in their last octet (`.1` host, `.2`
+/// guest), and the broker needs the guest's to answer "is this connection from
+/// the sandbox this broker belongs to, or from some other process on the host?".
+/// Deriving it here rather than in the broker keeps the addressing scheme in the
+/// one module that owns it.
+#[must_use]
+pub fn guest_for_gateway(gw: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let mut octets = gw.octets();
+    octets[3] = 2;
+    std::net::Ipv4Addr::from(octets)
+}
+
 /// The host-side CIDR for slot `i` (`10.107.<i>.1/30`) — the address `setup`
 /// puts on the tap.
 #[must_use]
@@ -317,6 +331,10 @@ impl Manifest {
 pub struct Slot {
     index: usize,
     lock_path: PathBuf,
+    /// The exact bytes this claim wrote into its lockfile, so release can tell
+    /// "still mine" from "someone else's now" — including against a sibling run
+    /// in the same process, which a pid cannot. See [`Drop for Slot`](Slot#impl-Drop).
+    token: String,
     filtered: bool,
 }
 
@@ -367,9 +385,23 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        // Best-effort release: a failure to unlink only leaves a stale lock that
+        // Only if the lock is still *ours*, compared by the exact token this claim
+        // wrote. Unlinking unconditionally meant that if the lock had been
+        // replaced — a reclaimed-too-eagerly sweep being the way that happens —
+        // release would delete the lock of whichever run held the slot now,
+        // letting a third claim it while that run's VM and broker were still
+        // addressed on it.
+        //
+        // The token and not the pid, because under the MCP server every
+        // concurrent run shares one process: a pid comparison says "mine" for a
+        // sibling run's lock, which is exactly the case that needed protecting.
+        //
+        // Best-effort otherwise: a failure to unlink only leaves a stale lock that
         // the next `sweep_stale` reclaims (our pid will be dead).
-        let _ = fs::remove_file(&self.lock_path);
+        let ours = fs::read_to_string(&self.lock_path).is_ok_and(|s| s.trim() == self.token);
+        if ours {
+            let _ = fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -516,6 +548,100 @@ pub fn require_credential_endpoint() -> Result<()> {
     )
 }
 
+/// The procfs path of a tap's IPv4 forwarding flag.
+///
+/// World-readable, which is the whole point: it is the one piece of a filtered
+/// slot's enforcement an unprivileged process can check. Reading the live
+/// nftables ruleset requires `CAP_NET_ADMIN`.
+#[must_use]
+pub fn tap_forwarding_proc(tap: &str) -> String {
+    format!("/proc/sys/net/ipv4/conf/{tap}/forwarding")
+}
+
+/// Verify the kernel still refuses to forward what arrives on slot `i`'s tap.
+///
+/// `setup` clears this flag for every filtered tap ([`setup`]'s step 3b), giving
+/// the routing layer a refusal that does not depend on the nftables ruleset being
+/// loaded — and, because the file is world-readable while the live ruleset needs
+/// `CAP_NET_ADMIN` to read, one an unprivileged runtime can check.
+///
+/// # What this does and does not tell you
+///
+/// **It detects** the flag being turned back on. That is not hypothetical:
+/// writing `net.ipv4.ip_forward` stamps every interface at once, so a container
+/// runtime starting or a sysctl reload does it.
+///
+/// **It does not detect a flushed ruleset.** Nothing in nftables writes this file,
+/// so `nft flush ruleset` leaves it at `0` and this check passes. What the flag
+/// does there is *contain* the flush rather than report it: the kernel still
+/// refuses to forward off the tap, so the run reaches nothing. But the ruleset's
+/// other half is gone, and the flag has nothing to say about it — in
+/// `ip_route_input_slow` a packet for a host-local address takes the `RTN_LOCAL`
+/// branch **before** the forwarding test, so guest→host delivery is governed by
+/// the nftables input chain and by nothing else. SECURITY.md states this as a
+/// non-claim; do not let this doc drift into promising more.
+///
+/// # Errors
+/// If the flag is set, or cannot be read at all. Both are refusals: this runs on
+/// the path of a run whose entire promise is that it forwards nothing, so
+/// "cannot tell" and "no" are the same answer.
+pub fn require_filtered_kernel_guard(i: usize) -> Result<()> {
+    let tap = tap_name(i)?;
+    let path = tap_forwarding_proc(&tap);
+    require_forwarding_off(&tap, std::fs::read_to_string(&path).ok().as_deref())
+}
+
+/// [`require_filtered_kernel_guard`] across the whole filtered pool.
+///
+/// Called before anything boots, so a host whose guard has been clobbered says so
+/// immediately rather than after a warm-pool snapshot build has cold-booted a
+/// builder VM. The per-slot check still runs on the slot actually claimed — this
+/// one is about *when* the refusal arrives, not whether it does.
+///
+/// The realistic way the guard goes missing is host-wide (writing
+/// `net.ipv4.ip_forward` stamps every interface at once), so any filtered tap
+/// forwarding is treated as the whole pool being unprovisioned.
+///
+/// # Errors
+/// If the manifest is unreadable, or any filtered tap's guard is not in place.
+pub fn require_filtered_pool_guard() -> Result<()> {
+    let manifest = read_manifest().context(
+        "network manifest ~/.isopod/net/slots.json is missing or unreadable; \
+         run `sudo isopod setup` once",
+    )?;
+    for i in manifest.filtered_from()..manifest.slot_count.min(MAX_SLOT_COUNT) {
+        require_filtered_kernel_guard(i)?;
+    }
+    Ok(())
+}
+
+/// [`require_filtered_kernel_guard`] with the procfs read injected, so the
+/// decision is testable without a provisioned host.
+fn require_forwarding_off(tap: &str, raw: Option<&str>) -> Result<()> {
+    // Anything other than a clear "0" is a refusal, including a value this
+    // version does not recognise.
+    if raw.map(str::trim) == Some("0") {
+        return Ok(());
+    }
+    let observed = match raw {
+        Some(v) => format!("is {:?}", v.trim()),
+        None => "could not be read".to_string(),
+    };
+    bail!(
+        "the kernel's forwarding guard for filtered slot {i} is not in place: \
+         {path} {observed}, and `sudo isopod setup` leaves it at \"0\" so that the \
+         kernel refuses to forward anything arriving on {tap} even if the nftables \
+         ruleset is gone. Something has re-enabled forwarding host-wide: writing \
+         net.ipv4.ip_forward stamps every interface at once, so a container \
+         runtime starting or a sysctl reload does it. \
+         A filtered run will not boot into that: re-provision with\n\n    \
+         sudo isopod setup\n\n(taps and in-flight runs are unaffected), or run with \
+         unfiltered public egress by dropping --allow-host / --allow-cidr / --inject.",
+        i = tap.trim_start_matches("isopod-tap"),
+        path = tap_forwarding_proc(tap),
+    )
+}
+
 /// Shared preamble for both claim paths: resolve the state root and read the
 /// manifest, with the "setup has not run" guidance attached.
 fn manifest_for_claim() -> Result<(PathBuf, Manifest)> {
@@ -531,12 +657,18 @@ fn manifest_for_claim() -> Result<(PathBuf, Manifest)> {
 // Root-parameterized implementations (unit-testable without $ISOPOD_HOME).
 // ===========================================================================
 
-/// `~/.isopod/net`, created on demand (mode `0755`; a failure to set the mode is
-/// tolerated so a caller lacking chmod rights on an existing dir still works).
+/// `~/.isopod/net`, created on demand (mode `0700`, tightened but never loosened —
+/// see [`paths`]; a failure to set the mode is tolerated so a caller lacking chmod
+/// rights on an existing dir still works).
 pub(crate) fn net_dir() -> Result<PathBuf> {
     let dir = paths::isopod_home()?.join("net");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+    let loose = fs::metadata(&dir)
+        .map(|m| m.permissions().mode() & 0o7777 & !0o700 != 0)
+        .unwrap_or(false);
+    if loose {
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
     Ok(dir)
 }
 
@@ -601,20 +733,32 @@ fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<S
 fn try_claim_slot(root: &Path, i: usize, filtered: bool) -> Result<Option<Slot>> {
     let lock = lock_path_in(root, i);
     match create_lock(&lock) {
-        Ok(()) => Ok(Some(Slot {
+        Ok(token) => Ok(Some(Slot {
             index: i,
             lock_path: lock,
+            token,
             filtered,
         })),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Stale (dead owner)? Reclaim and retry exactly once; if someone else
             // wins the retry, treat the slot as busy.
+            //
+            // KNOWN LIMIT: deciding staleness and unlinking are two operations,
+            // so two claimants that read the same dead pid can both proceed — the
+            // second unlinking a lock the first has already replaced. Both then
+            // believe they hold the slot, and the loser's VM fails opaquely when
+            // firecracker cannot open the tap. It needs a real lock (`flock`,
+            // whose release the kernel handles on process death, and which
+            // distinguishes two open file descriptions in one process) rather
+            // than a staleness heuristic; that is a change to the claiming
+            // protocol, not a patch to this branch. Documented in SECURITY.md.
             if lock_is_stale(&lock) {
                 let _ = fs::remove_file(&lock);
                 match create_lock(&lock) {
-                    Ok(()) => Ok(Some(Slot {
+                    Ok(token) => Ok(Some(Slot {
                         index: i,
                         lock_path: lock,
+                        token,
                         filtered,
                     })),
                     Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
@@ -628,25 +772,72 @@ fn try_claim_slot(root: &Path, i: usize, filtered: bool) -> Result<Option<Slot>>
     }
 }
 
-/// Create the lockfile atomically (`O_EXCL`) and write our pid into it.
-fn create_lock(lock: &Path) -> std::io::Result<()> {
+/// Distinguishes two claims made by the *same process*.
+///
+/// The pid alone cannot: under the MCP server every concurrent run shares one
+/// process, so two claims write byte-identical locks. A release that only checked
+/// the pid would then happily unlink a lock belonging to a sibling run that was
+/// still using the slot.
+static CLAIM_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The token one claim writes into its lockfile: `<pid> <nonce>`.
+fn claim_token() -> String {
+    let n = CLAIM_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{} {n}", std::process::id())
+}
+
+/// Create the lockfile atomically (`O_EXCL`) and write our claim token into it.
+fn create_lock(lock: &Path) -> std::io::Result<String> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock)?;
-    write!(f, "{}", std::process::id())
+    let token = claim_token();
+    write!(f, "{token}")?;
+    Ok(token)
 }
 
-/// A lock is stale if its recorded pid is unparseable or names a dead process.
+/// How long a lock whose contents do not parse is left alone.
+///
+/// [`create_lock`] is two operations — `create_new`, then write the pid — so for
+/// an instant a live claim is a zero-byte file, which parses as nothing. Without
+/// this grace period a concurrent claimer's [`sweep_stale_in`] read that instant
+/// as "garbled ⇒ reclaim", deleted a claim that was in the middle of being made,
+/// and took the same slot: two runs on one tap, one address pair, and one
+/// gateway, presenting as an opaque "Open tap device failed" from the second
+/// firecracker. Generous, because the cost of waiting is a slot that stays busy
+/// for another few seconds and the cost of not waiting is two runs sharing it.
+const LOCK_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A lock is stale if its recorded pid names a dead process, or its contents do
+/// not parse *and* it is too old to be a claim still being written.
 fn lock_is_stale(lock: &Path) -> bool {
-    match fs::read_to_string(lock) {
-        Ok(s) => match s.trim().parse::<u32>() {
+    stale_from(fs::read_to_string(lock).ok().as_deref(), || {
+        written_recently(lock)
+    })
+}
+
+/// The staleness decision itself, with the mtime lookup injected so both arms are
+/// testable without backdating a real file.
+fn stale_from(contents: Option<&str>, recently_written: impl FnOnce() -> bool) -> bool {
+    match contents {
+        Some(s) => match s.trim().parse::<u32>() {
             Ok(pid) => !pid_is_alive(pid),
-            Err(_) => true, // garbled lock: reclaim it
+            Err(_) => !recently_written(),
         },
         // Vanished between the readdir and the read: not our concern here.
-        Err(_) => false,
+        None => false,
     }
+}
+
+/// Whether `path` was modified within [`LOCK_WRITE_GRACE`]. Unknowable ⇒ `false`,
+/// so an unreadable timestamp does not make a genuinely corrupt lock permanent.
+fn written_recently(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < LOCK_WRITE_GRACE)
 }
 
 /// Whether `/proc/<pid>` exists (best-effort liveness; pid reuse is accepted for
@@ -707,6 +898,144 @@ mod tests {
         assert_eq!(host_cidr(3), "10.107.3.1/30");
         assert_eq!(guest_cidr(3), "10.107.3.2/30");
         assert_eq!(host_ip(42), "10.107.42.1");
+    }
+
+    #[test]
+    fn a_lock_still_being_written_is_not_swept_out_from_under_its_claimer() {
+        // The state a live claim passes through between `create_new` and the pid
+        // write. A sweeper that reclaimed it would delete a claim in progress and
+        // then succeed in claiming the same slot itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = lock_path_in(dir.path(), 3);
+        fs::write(&lock, "").expect("write empty lock");
+        assert!(
+            !lock_is_stale(&lock),
+            "a zero-byte lock written just now is a claim in progress"
+        );
+        assert_eq!(sweep_stale_in(dir.path()).expect("sweep"), 0);
+        assert!(lock.exists(), "the sweep must not have removed it");
+    }
+
+    #[test]
+    fn staleness_distinguishes_a_claim_in_progress_from_a_corrupt_lock() {
+        // Unparseable contents are ambiguous: either a claim between its
+        // `create_new` and its pid write, or a lock left corrupt by something
+        // else. The mtime is what separates them, and getting it backwards either
+        // way is a real failure — reclaiming live slots, or leaking them forever.
+        assert!(!stale_from(Some(""), || true), "empty + just written");
+        assert!(stale_from(Some(""), || false), "empty + old");
+        assert!(!stale_from(Some("junk"), || true), "garbled + just written");
+        assert!(stale_from(Some("junk"), || false), "garbled + old");
+        // A live pid is never stale whatever the mtime says.
+        let live = std::process::id().to_string();
+        assert!(!stale_from(Some(&live), || false));
+        // A vanished lock is somebody else's business, not a reclaim.
+        assert!(!stale_from(None, || false));
+    }
+
+    #[test]
+    fn a_release_does_not_free_a_sibling_run_s_slot_in_the_same_process() {
+        // Under the MCP server every concurrent run shares one process, so a
+        // pid-based ownership check reads a sibling's lock as "mine". The claim
+        // token distinguishes them: same pid, different nonce.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = try_claim_slot(dir.path(), 2, false)
+            .expect("claim")
+            .expect("slot 2 free");
+        let lock = lock_path_in(dir.path(), 2);
+
+        // A sibling claim in this same process takes the slot over (the shape a
+        // too-eager reclaim produces).
+        fs::remove_file(&lock).expect("simulate a reclaim");
+        let second = try_claim_slot(dir.path(), 2, false)
+            .expect("claim")
+            .expect("slot 2 free again");
+        assert_ne!(first.token, second.token, "same pid, different claims");
+
+        // The first run finishing must not free the slot the second is using.
+        drop(first);
+        assert!(lock.exists(), "the sibling's lock must survive");
+        assert_eq!(
+            fs::read_to_string(&lock).unwrap().trim(),
+            second.token,
+            "and must still be the sibling's"
+        );
+
+        // The second's own release still works.
+        drop(second);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn releasing_a_slot_never_removes_a_lock_that_is_no_longer_ours() {
+        // Release used to unlink unconditionally, so a slot whose lock had been
+        // replaced by another run's claim had that claim deleted when the first
+        // run finished — while the second run's VM and broker were still live on
+        // the slot's addresses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slot = try_claim_slot(dir.path(), 5, false)
+            .expect("claim")
+            .expect("slot 5 is free");
+        let lock = lock_path_in(dir.path(), 5);
+        fs::write(&lock, "999999").expect("another claimer's pid");
+        drop(slot);
+        assert!(
+            lock.exists(),
+            "the other claimer's lock must have survived our release"
+        );
+    }
+
+    #[test]
+    fn the_kernel_guard_refuses_anything_but_a_clear_zero() {
+        // Fail-closed in every direction: only a literal "0" is enforcement in
+        // place. A missing file (no such tap, or a procfs layout this version does
+        // not know) reads as "cannot tell", which on this path is the same answer
+        // as "no".
+        assert!(require_forwarding_off("isopod-tap8", Some("0")).is_ok());
+        assert!(require_forwarding_off("isopod-tap8", Some("0\n")).is_ok());
+        for bad in [
+            None,
+            Some("1"),
+            Some("1\n"),
+            Some(""),
+            Some("2"),
+            Some("0 1"),
+        ] {
+            assert!(
+                require_forwarding_off("isopod-tap8", bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kernel_guard_refusal_names_the_slot_the_file_and_the_fix() {
+        // This message is the only thing an operator sees when a container runtime
+        // has stamped ip_forward across every interface, so it has to carry the
+        // whole answer rather than a symptom.
+        let why = require_forwarding_off("isopod-tap12", Some("1"))
+            .expect_err("must refuse")
+            .to_string();
+        assert!(why.contains("filtered slot 12"), "{why}");
+        assert!(
+            why.contains("/proc/sys/net/ipv4/conf/isopod-tap12/forwarding"),
+            "{why}"
+        );
+        assert!(why.contains("sudo isopod setup"), "{why}");
+        assert!(why.contains("net.ipv4.ip_forward"), "{why}");
+    }
+
+    #[test]
+    fn guest_for_gateway_agrees_with_the_per_slot_addresses() {
+        // The broker's peer check is only as good as this derivation: if it ever
+        // disagreed with `guest_ip`, the check would refuse the sandbox's own
+        // connections (a hard failure) or, worse, accept an address that is not
+        // the guest's.
+        for i in [0usize, 1, 7, 42, 200, MAX_SLOT_COUNT - 1] {
+            let gw: std::net::Ipv4Addr = host_ip(i).parse().expect("host ip parses");
+            let guest: std::net::Ipv4Addr = guest_ip(i).parse().expect("guest ip parses");
+            assert_eq!(guest_for_gateway(gw), guest, "slot {i}");
+        }
     }
 
     #[test]

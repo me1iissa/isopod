@@ -6,6 +6,234 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.11.0] — 2026-07-26
+
+A hardening release. An adversarial review of shipped 0.10.0 — 34 agents, no
+design framing supplied, findings verified by exploiting them rather than by
+reading — turned up eleven real defects. Two of them invalidated 0.10.0's stated
+threat model outright, so they are fixed here rather than deferred. **Existing
+hosts must re-provision before their next filtered run** (see the kernel guard
+below); public-slot runs are unaffected.
+
+A second adversarial pass — this one over the fixes themselves, before they were
+pushed — found nine more defects, several of them *in* the new code. Those are
+folded in below rather than listed separately, but three are worth calling out
+because the first version of this release claimed they were closed and they were
+not:
+
+- **`copy_out` escaped the confinement through a dangling symlink.** `Path::exists`
+  follows a link and returns false when its target is absent, so a link to a
+  not-yet-existing file outside the root fell past the "resolve it outright"
+  branch, was treated as an ordinary new file, and passed — after which
+  `File::create` followed it and wrote the guest's bytes outside, while the result
+  reported the in-root path. The test suite missed it because every symlink case
+  it covered had an *existing* target, which is the branch that worked.
+- **The confinement never excluded isopod's own state directory.** The root
+  defaults to the server's working directory, and `$HOME` is an ordinary working
+  directory for an MCP registration — which put `~/.isopod` *inside* the
+  confinement and handed back the exact credential-store read this release is
+  about. The state directory is now refused for every root, and with the
+  confinement switched off.
+- **`vm_gc` stopped collecting anything under MCP.** `owner.pid` records the
+  supervisor's pid, which for the CLI is the run's own process and for MCP is the
+  *long-lived server* — so every record the server ever wrote reported `live`
+  forever. Observed on a real host: 12 of 33 records live with one VM running.
+
+### Fixed — the MCP surface could read and write arbitrary host files
+
+`sandbox_run`'s two arguments that name a **host** path, `stdin_file` (read) and
+`copy_out[].host` (write), were used verbatim. That was demonstrated end to end:
+`stdin_file: "~/.isopod/credentials.json"` returned the credential store in
+`stdout`, and `copy_out` wrote guest-authored bytes anywhere, creating parent
+directories. Either one undoes the premise the credential design rests on — that
+the caller is a model whose context the sandboxed code may have written, and so
+may name an alias but never a secret.
+
+Both paths are now resolved and confined to a **host-I/O root**, defaulting to
+the server's working directory, with symlinks resolved *before* the check so a
+link planted inside cannot reach out (including one whose target does not exist
+yet — see the note above). `ISOPOD_MCP_HOST_IO_ROOT` moves the root
+(`/` restores the old behaviour, explicitly); `ISOPOD_MCP_HOST_IO`,
+`ISOPOD_MCP_STDIN_FILE` and `ISOPOD_MCP_COPY_OUT` set to `off` refuse the
+arguments outright. The startup log line says which is in force. The CLI is
+deliberately unaffected — there the caller is the operator.
+
+The confinement is a path check, so it is also given the two things a path check
+cannot infer: a **dangling symlink** is refused rather than written through (where
+the write would land cannot be resolved, so it cannot be checked), and a
+**multiply-linked file** is refused outright (a hard link is a second name for an
+inode and resolves to itself, so no prefix test can see it). isopod's own state
+directory is refused whatever the root is, including with the confinement off.
+An empty `ISOPOD_MCP_HOST_IO_ROOT` no longer reads as a root — `Path::starts_with("")`
+is true for every path, so it admitted everything while the log said "confined to " —
+and a switch set to anything not recognisably affirmative now reads as *off* rather
+than staying open.
+
+`stdin_file` also gained the guards the credential loader already had: regular
+files only (a FIFO blocks the read forever, `/dev/zero` grows the buffer until
+the host is out of memory) and a 4 MiB ceiling enforced on the read, not just on
+the stat.
+
+`copy_out` no longer applies the guest's reported mode verbatim. The exec bit
+still travels — that is why the mode travels at all — but setuid, setgid, sticky
+and group/other write are cleared, and owner read/write is always granted. A
+sandbox could otherwise land a setuid-to-the-operator binary in the project
+directory with `chmod 6777`.
+
+### Fixed — the broker dialled from the host with no destination floor
+
+The broker resolves and connects on the guest's behalf **as a host process**, so
+the packet filter's public-only-egress rule — which governs *forwarded* traffic —
+never applied to it. An allowlist entry that resolved inward was a confused
+deputy with host-level reach: `allow_cidrs: ["169.254.169.254/32"]` reached cloud
+instance metadata, `allow_hosts: ["localhost"]` reached the host's own services,
+and `10.107.0.0/16` reached sibling runs' brokers — including their credential
+endpoints.
+
+Every destination is now checked **after resolution**: loopback, link-local,
+multicast, broadcast, IPv4-mapped spellings of those, and isopod's own slot
+supernet are refused outright; private and CGNAT ranges follow the host's
+`--allow-lan-egress`, which until now was recorded in the manifest and never
+consulted. The same floor applies to the DNS answers the broker synthesises and
+to the credential endpoint's upstream leg (via a custom `reqwest` resolver — that
+leg does its own resolution, so a pinned host whose DNS answered `127.0.0.1`
+would otherwise have received an `Authorization` header). Refusals are recorded
+as `non_public_address`, and the explanation names `--allow-lan-egress`.
+
+### Fixed — every broker listener served every process on the host
+
+All four listeners bind the slot gateway, which is a *host* address: packets a
+host process sends there are delivered locally and never cross the
+`iifname "isopod-tap<i>"` input rule that gates guest access. So while a run with
+`--inject` was live, any local account could `curl http://10.107.8.1:3129/github/user`
+and spend the operator's token, with the calls landing in the flight recorder as
+though the sandbox had made them. Each listener now serves only its own slot's
+guest address, TCP and UDP alike, and closes anything else before reading a byte.
+The first refusal explains itself on the supervisor's stderr.
+
+### Added — a filtered slot's enforcement is verified at run time
+
+Nothing checked that the nftables ruleset was still loaded. `slots.json` existing
+and the taps existing were the whole test, and taps created with `ip tuntap add`
+outlive `nft flush ruleset` — which a firewalld reload performs — so a "filtered"
+run would boot on a wide-open slot while its broker held a live token.
+
+`sudo isopod setup` now also clears `net.ipv4.conf.isopod-tap<i>.forwarding` for
+every filtered tap. That makes the kernel refuse to forward what arrives there
+independently of the ruleset, and — the point — it is **world-readable**, so the
+unprivileged runtime can confirm it. Every filtered run checks the whole filtered
+pool before anything boots, and the claimed slot again after, and fails closed
+with the re-provisioning command. **This is why an existing host must re-run
+`sudo isopod setup`:** its taps predate the flag.
+
+`SECURITY.md` now states plainly what this does *not* cover — the guest→host half
+of the guarantee still rests on the nftables input chain, and an unprivileged
+process cannot read the live ruleset to confirm it.
+
+### Fixed — resource and lifecycle defects
+
+- **The broker's connection bound was not a bound.** The concurrency permit was
+  acquired *inside* the spawned task, so every connection was accepted
+  immediately and became a task plus a host file descriptor merely *waiting* for
+  capacity. A guest opening sockets in a loop exhausted the supervisor's file
+  descriptors — which, over MCP, are the server's. The permit is now taken before
+  `accept`, so at capacity connections stay in the kernel backlog.
+- **An accept error busy-looped.** Under `EMFILE` the error recurs instantly and
+  a bare `yield_now` saturated the runtime thread the whole run shares. Now a
+  50 ms backoff, on the UDP path too.
+- **`vm_gc` collected live runs.** Age was the only protection, and it is a guess:
+  the MCP tool passes 60 s against a permitted timeout of an hour. Collecting a
+  live run's directory unlinked the vsock socket its remaining RPCs needed and the
+  scratch `commit_as` was to freeze — and the missing `owner.pid` then read to the
+  reaper as proof of orphanhood, so the next pass SIGKILLed the VMM. gc now skips
+  any record with a live owner pid or a running VMM, and `vm_list` reports `live`.
+
+  `owner.pid` now records the pid **and that pid's start time**. A pid alone is
+  not an identity: these records outlive their runs by design, so on a busy host a
+  finished run's pid is reused and a bare `/proc/<pid>` test reports that run as
+  live forever. Records written by an earlier isopod carry only a pid and keep the
+  old, weaker check — reading them as dead would collect live runs, which is the
+  failure this path exists to prevent.
+- **`vm_gc` deleted by a path from `meta.json`.** The record's `vm_id` came from
+  the file rather than the directory, so `"vm_id": "../../.."` in any writable
+  `meta.json` made `remove_dir_all` traverse out of the vms root — reachable
+  through a `copy_out` destination. The directory name is now authoritative.
+- **Slot claiming: two of the three races are closed, and the third is now
+  documented rather than claimed fixed.** The lockfile existed zero-byte between
+  its `create_new` and its pid write, and a concurrent claimer's stale sweep read
+  that as "garbled ⇒ reclaim" — unparseable contents are now stale only once the
+  file is older than the write grace. Releasing a slot no longer unlinks a lock
+  that is not ours, compared by a **per-claim token** rather than by pid: under the
+  MCP server every concurrent run shares one process, so a pid comparison called a
+  sibling run's lock "mine" and freed a slot that still had a VM and a broker on it.
+
+  **Not fixed:** deciding a lock is stale and unlinking it are still two
+  operations, so two claimants that read the same dead pid can both proceed, the
+  second unlinking what the first just wrote. Both then believe they hold the slot
+  and the loser's firecracker fails opaquely on the tap. It needs `flock` — whose
+  release the kernel handles on process death, and which distinguishes two open
+  file descriptions in one process — rather than a staleness heuristic, which is a
+  change to the claiming protocol rather than a patch. Trigger: one stale lock
+  present (a `kill -9`'d run) plus two claims at the same instant.
+- **A run outlived its own timeout.** `getaddrinfo` has no cancellation, and
+  dropping the run's tokio runtime waits for every blocking thread with no bound —
+  so a name whose nameserver never answered held the `sandbox_run` request (and a
+  server thread) for the full resolver budget after the report was built. Both
+  resolution paths are now bounded at 5 s and the teardown at 250 ms.
+- **The state tree was re-chmodded to `0755` on every call.** Not at create time —
+  every call, so `chmod 700 ~/.isopod/vms` was silently undone by the next run,
+  and every run's `console.log`, `exec-*.log` and `egress.jsonl` were readable by
+  any local account. Directories are now created `0700` and tightened if found
+  looser, never loosened.
+
+### Fixed — smaller correctness
+
+- **A failed `--commit-as` no longer destroys the run.** The commit is the last
+  thing a run does — after the command has succeeded and after the scratch has been
+  cleaned up — and its error was propagated, so a mistyped label discarded the exit
+  code, the output and the log paths of work that had already been done. It is now
+  reported on stderr and in a `commit_error` field on the report (and on the MCP
+  result), with the run's own result intact. This release *introduced* the way to
+  hit it, by making a reused label an error.
+- **The credential leg's destination floor had a hole for IP literals.** The floor
+  is installed as `reqwest`'s DNS resolver, and hyper dials an address literal
+  directly without consulting a resolver — so a credential whose store entry pinned
+  `169.254.169.254` would have sent the operator's token to the metadata service.
+  A run whose credential is pinned to an address the broker will not dial is now
+  refused before the broker starts, naming the alias and the address.
+- **`vm_list` reports `live`, and `sandbox_run` reports `commit_error`.** Both were
+  added to the core report and then not carried through the MCP surface's own
+  hand-written projections — so the field existed everywhere except where the tool
+  that needs it could see it.
+- **Credential aliases are now case-insensitive everywhere.** They were lower-cased
+  when resolved but compared case-sensitively against the guest's URL path segment,
+  so an alias declared `GitHub` was reachable only as `/github/…`. Folding the
+  guest's segment fixed that half and left the other: the *store lookup* was still
+  exact, so `--inject GitHub` — the operator's own spelling — did not resolve at
+  all. One rule now covers the store key, the flag and the path segment. A store
+  declaring two aliases that differ only in case is refused whole, because
+  `--inject gh` would otherwise name two different pinned hosts and picking either
+  silently is exactly the ambiguity a credential system must not resolve for you.
+- `stage: ""` resolved: the empty string is a prefix of every label, so it forked
+  whatever single stage was in the store. Now refused.
+- `commit_as` could take a label that already referred to another stage, and
+  `resolve_in` prefers an exact label match over a prefix — so committing
+  `commit_as: "my"` silently redirected every later `stage: "my"` away from the
+  stage labelled `myenv`. Reusing a label is now refused.
+- Committing byte-identical content under a *different* label reported success
+  while recording nothing (the store is content-addressed), so the requested
+  label never existed and every later reference to it failed to resolve. Same
+  label, same content is still idempotent; a different label is now an error that
+  names the existing one.
+- **A claim that was too strong, in three places.** `inject.rs`, `SECURITY.md` and
+  `docs/credentials.md` all said guest bytes never reach the wire. The path, the
+  query string, two header values and the body do cross — what never crosses is
+  anything that decides where the request goes or who it is from. Corrected to say
+  that instead, including in the 0.10.0 entry above.
+- Credential resolution now happens in the early-validation block, ahead of the
+  warm-pool snapshot build, so "nothing boots before a credential problem is
+  reported" is literally true rather than nearly true.
+
 ## [0.10.0] — 2026-07-25
 
 - **Credential injection — a run can spend a credential without ever holding
@@ -16,8 +244,8 @@ Versioning for the policy.
   and the host attaches the token, but only for a method and path the operator
   wrote down. See [docs/credentials.md](docs/credentials.md).
 
-  The endpoint is **not a reverse proxy**: guest bytes never reach the wire. It
-  reads a stated intent and constructs a new request from its own parts — its
+  The endpoint is **not a reverse proxy**: the guest does not compose the
+  request. It reads a stated intent and constructs a new request from its own parts — its
   own `Host`, its own `Authorization`, a normalised path, and at most two
   allowlisted headers. **Redirects are disabled** on the upstream leg, because
   following one would carry the credential to a host the operator never named,

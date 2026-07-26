@@ -182,11 +182,11 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `env` | `{}` | Extra environment variables as a flat `KEY: "VALUE"` object. |
 | `commit_as` | — | Label to persist the result as a new stage. Only commits when the command exits 0 — a failed setup command never silently produces a broken stage. |
 | `stdin` | — | Small inline text piped to the command's stdin, then closed. |
-| `stdin_file` | — | HOST-side file whose bytes are piped to stdin — use for anything beyond a few KiB so large payloads never transit the model context. Mutually exclusive with `stdin`. |
+| `stdin_file` | — | HOST-side file whose bytes are piped to stdin — use for anything beyond a few KiB so large payloads never transit the model context. Mutually exclusive with `stdin`. Confined to the server's host-I/O root, regular files only, 4 MiB ceiling — see [Host paths](#host-paths-stdin_file-and-copy_out) below. |
 | `vcpus` | `1` | Guest vCPUs: 1 or an even number, at most the host CPU count. Over-cap errors before boot. |
 | `mem_mib` | `512` | Guest memory in MiB, bounded 128..=host free RAM (with headroom). Over-cap errors before boot. |
 | `scratch_mib` | ~`1024` | Writable overlay scratch in MiB (128..=65536, sparse). Raise for build workloads; passing it forces the cold (disk-upper) path. |
-| `copy_out` | — | List of `{guest, host}` mappings: stream guest files to host paths after a successful exec — the binary-safe artifact channel. A copy failure fails the call; written files are listed in the result's `copied`. |
+| `copy_out` | — | List of `{guest, host}` mappings: stream guest files to host paths after a successful exec — the binary-safe artifact channel. A copy failure fails the call; written files are listed in the result's `copied`. `host` is confined to the host-I/O root and the guest's file mode is masked — see [Host paths](#host-paths-stdin_file-and-copy_out) below. |
 
 Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
@@ -253,6 +253,49 @@ only when networking was on.
 The inline `stdout`/`stderr` are 64 KiB **heads**, with exact byte totals
 alongside them and the complete streams on disk at the `*_log_path`s — those
 on-disk logs have their own, much larger caps (see SECURITY.md).
+
+### Host paths: `stdin_file` and `copy_out`
+
+Every other `sandbox_run` argument describes work to do *inside* the VM. These two
+do not — they name files on the machine running the server, and that machine is
+not the sandbox. Since 0.11.0 both are confined:
+
+```mermaid
+flowchart TB
+    C["a sandbox_run argument<br/>naming a host path"] --> R{"resolved — symlinks<br/>followed first"}
+    R -->|"inside the host-I/O root"| OK["allowed"]
+    R -->|"outside it"| NO["refused, naming the root<br/>and the variable that moves it"]
+    OK --> M{"which direction?"}
+    M -->|"stdin_file"| RD["regular files only,<br/>4 MiB ceiling"]
+    M -->|"copy_out[].host"| WR["mode masked: never setuid,<br/>setgid, sticky, group/other write"]
+```
+
+The root defaults to **the server's working directory** — the project a coding
+agent is working in, which is what artifact extraction and large stdin payloads
+are for. Symlinks are resolved *before* the check, so a link the sandbox planted
+inside the root cannot reach out of it.
+
+| Variable | Effect |
+|---|---|
+| `ISOPOD_MCP_HOST_IO_ROOT` | Confine to this directory instead of the cwd. `/` disables the confinement entirely, explicitly and visibly — the startup log says `UNCONFINED`. |
+| `ISOPOD_MCP_HOST_IO=off` | Refuse both arguments outright. |
+| `ISOPOD_MCP_STDIN_FILE=off` | Refuse `stdin_file` only. |
+| `ISOPOD_MCP_COPY_OUT=off` | Refuse `copy_out` only. |
+
+Set them in the `env` block of your MCP registration (see [Option 2](#option-2-as-a-claude-code-plugin)).
+The server logs which policy is in force on startup, on stderr.
+
+Why this is a policy and not just a caveat: unconfined, `stdin_file` was an
+arbitrary host-file read whose contents come back in `stdout`, and `copy_out` was
+an arbitrary host-file write with guest-authored bytes. Together they were enough
+to read `~/.isopod/credentials.json`, read the `file:` sources it names, or rewrite
+it. The `isopod` CLI is deliberately unaffected — there the caller is the operator,
+who owns those files already.
+
+**A root is not a sandbox.** Confining `copy_out` keeps it away from the credential
+store; it does not make the files inside the root safe, and by default that root is
+your source tree. Point `ISOPOD_MCP_HOST_IO_ROOT` somewhere disposable, or set
+`ISOPOD_MCP_COPY_OUT=off`, if the sandbox writing there is not what you want.
 
 ### `egress` — the flight recorder
 

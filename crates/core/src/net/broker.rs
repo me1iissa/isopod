@@ -107,6 +107,21 @@ const INJECT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the endpoint will spend draining a refused request's body so the
 /// refusal itself survives the close. See [`drain_refused_body`].
 const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long to wait after a failed `accept` before trying again.
+///
+/// Non-zero on purpose: under `EMFILE` the error recurs instantly, and retrying
+/// without a pause busy-loops the runtime thread the whole run shares.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// How long the broker will wait for a name to resolve.
+///
+/// `getaddrinfo` has no cancellation: it runs on a blocking thread that keeps
+/// going after the future holding it is dropped, and the run's runtime waits for
+/// that thread when it shuts down. Left unbounded, a name whose authoritative
+/// nameserver accepts the query and never answers stalls for the whole glibc
+/// resolver budget (several attempts against several nameservers), which is
+/// longer than most runs' entire timeout. Bounded here so the *broker* stops
+/// waiting; [`crate::vm`] bounds the runtime teardown so the run does too.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ===========================================================================
 // Recording.
@@ -275,6 +290,21 @@ impl Default for BrokerPorts {
 pub struct BrokerSpec {
     /// The slot's gateway address; every listener binds here and nowhere else.
     pub gateway: Ipv4Addr,
+    /// The one peer address the listeners will serve: this slot's guest.
+    ///
+    /// The gateway is a *host* address, so a packet a host process sends to it is
+    /// delivered locally and never crosses the `iifname "isopod-tap<i>"` input
+    /// rule that gates guest access — that rule cannot match locally-generated
+    /// traffic. Without this check, every listener was open to every process on
+    /// the host: any local account could use a live run's proxies, and spend the
+    /// operator's injected token against its pinned host, with the calls landing
+    /// in the flight recorder as though the sandbox had made them.
+    ///
+    /// Source addresses are not forgeable here without privilege: the guest
+    /// address is not a local address, so binding it requires `IP_FREEBIND` or
+    /// `ip_nonlocal_bind`, and spoofing one requires a raw socket. Both are root,
+    /// and root on the host is already the operator.
+    pub guest: Ipv4Addr,
     /// The run's allowlist. Empty means "deny everything", which is a supported
     /// and useful configuration: the recorder still logs every attempt.
     pub rules: Vec<HostRule>,
@@ -284,6 +314,20 @@ pub struct BrokerSpec {
     pub credentials: Vec<ResolvedCredential>,
     /// Listener ports; leave as [`BrokerPorts::default`] outside tests.
     pub ports: BrokerPorts,
+    /// Mirror of the manifest's `allow_lan_egress`. `false` — the default and
+    /// the provisioning default — refuses host-side connections to private
+    /// ranges, matching what the packet filter does to forwarded traffic.
+    pub allow_private: bool,
+    /// **Test scaffolding. A real run must never set this.**
+    ///
+    /// The end-to-end broker tests drive the genuine allow/deny path over real
+    /// sockets, and the only address they can bind an upstream on is loopback.
+    /// Rather than soften the policy so those tests pass — loopback is the one
+    /// destination `--allow-lan-egress` deliberately does *not* open, because
+    /// host services bind there precisely on the assumption that only local
+    /// processes reach them — the exception is named, isolated, and asserted to
+    /// be off on the constructor every real run uses.
+    pub allow_loopback: bool,
 }
 
 impl BrokerSpec {
@@ -292,10 +336,21 @@ impl BrokerSpec {
     pub fn new(gateway: Ipv4Addr, rules: Vec<HostRule>) -> Self {
         Self {
             gateway,
+            guest: super::guest_for_gateway(gateway),
             rules,
             credentials: Vec::new(),
             ports: BrokerPorts::default(),
+            allow_private: false,
+            allow_loopback: false,
         }
+    }
+
+    /// Permit host-side connections to private ranges, for a host provisioned
+    /// with `--allow-lan-egress`.
+    #[must_use]
+    pub fn with_private_destinations(mut self, allow: bool) -> Self {
+        self.allow_private = allow;
+        self
     }
 
     /// Attach the run's resolved credentials.
@@ -314,8 +369,20 @@ struct Policy {
     /// This slot's gateway, so the proxy listener can recognise a request aimed
     /// at the broker's own credential endpoint.
     gateway: Ipv4Addr,
+    /// The only peer the listeners serve; see [`BrokerSpec::guest`].
+    guest: Ipv4Addr,
+    /// Set the first time a non-guest peer is refused, so a misdirected tool gets
+    /// one explanatory line on the supervisor's stderr and a local prober cannot
+    /// turn the check into a log-flooding primitive.
+    peer_refusal_logged: std::sync::atomic::AtomicBool,
     /// The port that endpoint listens on.
     inject_port: u16,
+    /// Whether this host was provisioned with `--allow-lan-egress`, which widens
+    /// the broker's own destination guard to private ranges. Loopback and
+    /// link-local are refused regardless.
+    allow_private: bool,
+    /// Test-only loopback exception; see [`BrokerSpec::allow_loopback`].
+    allow_loopback: bool,
     recorder: Recorder,
     conns: Arc<Semaphore>,
     /// The client for the credential endpoint's upstream leg. Built once so
@@ -361,6 +428,7 @@ impl Broker {
     /// rather than a policy decision, so a bind failure fails the run.
     pub async fn start(spec: BrokerSpec) -> Result<Self> {
         let has_credentials = !spec.credentials.is_empty();
+        refuse_floored_pinned_hosts(&spec)?;
         let gw = spec.gateway;
 
         let socks = bind_tcp(gw, spec.ports.socks).await?;
@@ -400,10 +468,14 @@ impl Broker {
             rules: spec.rules,
             credentials: spec.credentials,
             gateway: gw,
+            guest: spec.guest,
+            peer_refusal_logged: std::sync::atomic::AtomicBool::new(false),
             inject_port: inject_addr.port(),
+            allow_private: spec.allow_private,
+            allow_loopback: spec.allow_loopback,
             recorder: Recorder::new(),
             conns: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS)),
-            http: build_upstream_client()?,
+            http: build_upstream_client(spec.allow_private, spec.allow_loopback)?,
         });
 
         let tasks = vec![
@@ -513,32 +585,154 @@ async fn bind_udp(gw: Ipv4Addr, port: u16) -> Result<UdpSocket> {
 /// TLS is not made optional anywhere: the URL is built as `https://` from parts
 /// in [`inject::authorize`], so there is no code path that puts a token on a
 /// plaintext socket.
-fn build_upstream_client() -> Result<reqwest::Client> {
+///
+/// A third setting is load-bearing but invisible in the builder chain: the
+/// resolver. `reqwest` resolves the pinned host itself, so the destination guard
+/// `dial` applies to proxied traffic would not otherwise cover the one leg that
+/// carries a token. See [`FlooredResolver`].
+fn build_upstream_client(allow_private: bool, allow_loopback: bool) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        .dns_resolver(FlooredResolver {
+            allow_private,
+            allow_loopback,
+        })
         .timeout(INJECT_UPSTREAM_TIMEOUT)
         .user_agent(concat!("isopod/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building the credential endpoint's upstream HTTPS client")
 }
 
-/// Accept loop shared by all three TCP listeners.
+/// Refuse to start if any credential is pinned to an address the broker would not
+/// dial.
+///
+/// [`FlooredResolver`] is installed as `reqwest`'s DNS resolver, which covers a
+/// pinned *name* — but a pinned **IP literal never reaches a resolver at all**:
+/// hyper's connector parses the authority as an address first and dials it
+/// directly, so `"host": "169.254.169.254"` in the credential store bypassed the
+/// floor entirely and sent the operator's token to the metadata service. A store
+/// entry is the operator's own writing, so this is a mistake to catch rather than
+/// an attack to block — but it is a mistake that ends with a token on a network
+/// isopod says it will not dial, so it fails the run rather than warning.
+///
+/// # Errors
+/// Naming the alias and the address, because the operator can fix both.
+fn refuse_floored_pinned_hosts(spec: &BrokerSpec) -> Result<()> {
+    for cred in &spec.credentials {
+        let host = cred.host().as_str();
+        let Ok(ip) = host.parse::<IpAddr>() else {
+            continue; // a name: resolved through FlooredResolver at dial time
+        };
+        let ok = (spec.allow_loopback && ip.is_loopback())
+            || super::egress::is_dialable(&ip, spec.allow_private);
+        if !ok {
+            anyhow::bail!(
+                "credential {:?} is pinned to the address {host}, which this broker will \
+                 not dial: {}. An address literal in the credential store is dialled \
+                 directly rather than resolved, so it bypasses the guard a host name \
+                 goes through — the run is refused instead. Pin a public address, a \
+                 name, or re-provision with `sudo isopod setup --allow-lan-egress` if \
+                 the destination really is on your LAN.",
+                cred.alias().as_str(),
+                super::egress::DenyReason::NonPublicAddress.explain(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The destination guard, applied to the credential endpoint's upstream leg.
+///
+/// The pinned host is the operator's choice, but where it *resolves* is not: a
+/// name can be made to answer `127.0.0.1` by whoever controls its DNS, and the
+/// broker would then have sent the operator's token to a service on the host and
+/// relayed the reply into the sandbox. `dial` floors the proxied path; nothing
+/// floored this one, because `reqwest` does its own resolution.
+///
+/// Unlike [`resolve_v4`] this keeps both address families: the upstream leg is a
+/// host-side connection, so an API reachable only over IPv6 is legitimately
+/// reachable here.
+struct FlooredResolver {
+    allow_private: bool,
+    /// Test-only; see [`BrokerSpec::allow_loopback`].
+    allow_loopback: bool,
+}
+
+impl reqwest::dns::Resolve for FlooredResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let (allow_private, allow_loopback) = (self.allow_private, self.allow_loopback);
+        Box::pin(async move {
+            let all = match tokio::time::timeout(
+                RESOLVE_TIMEOUT,
+                tokio::net::lookup_host((name.as_str(), 0u16)),
+            )
+            .await
+            {
+                Ok(Ok(iter)) => iter.collect::<Vec<SocketAddr>>(),
+                Ok(Err(e)) => return Err(e.to_string().into()),
+                Err(_) => return Err("the pinned host did not resolve in time".into()),
+            };
+            let kept: Vec<SocketAddr> = all
+                .into_iter()
+                .filter(|a| {
+                    (allow_loopback && a.ip().is_loopback())
+                        || super::egress::is_dialable(&a.ip(), allow_private)
+                })
+                .collect();
+            if kept.is_empty() {
+                // Deliberately says nothing about what it resolved to: the reply
+                // reaches the guest, and the guest is the party that must not
+                // learn about the host's networks.
+                return Err("the pinned host has no address this broker will dial".into());
+            }
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Accept loop shared by all four TCP listeners.
+///
+/// The permit is taken **before** `accept`, which is what makes
+/// [`MAX_CONCURRENT_CONNS`] a real bound. Acquiring it inside the spawned task
+/// bounded only the *work*: every connection was still accepted immediately,
+/// so a guest opening sockets in a loop produced an unbounded number of tasks,
+/// host file descriptors and kernel receive buffers, all of them merely
+/// *waiting* for a permit. At capacity, connections now stay in the kernel's
+/// listen backlog — which is exactly where backpressure belongs, and costs the
+/// host nothing per pending connection.
 async fn serve_tcp(listener: TcpListener, policy: Arc<Policy>, proto: Proto) {
     loop {
-        let Ok((stream, _peer)) = listener.accept().await else {
-            // A transient accept error must not kill the listener; yield and retry.
-            tokio::task::yield_now().await;
-            continue;
+        // `acquire_owned` only fails if the semaphore is closed, which never
+        // happens while the broker lives; if it somehow does, stop accepting
+        // rather than spin.
+        let Ok(permit) = Arc::clone(&policy.conns).acquire_owned().await else {
+            return;
         };
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                // A transient accept error must not kill the listener. Sleeping
+                // rather than yielding matters under `EMFILE`: the error repeats
+                // immediately, and a bare yield turns that into a busy loop that
+                // saturates the runtime thread this broker shares with the run's
+                // whole supervisor. The permit drops here, so capacity is not
+                // leaked by a failed accept.
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        // Closed before a single byte is read, and before the connection reaches
+        // a protocol handler at all: a peer that is not this run's sandbox has no
+        // business in the SOCKS handshake, let alone at the credential endpoint.
+        if !policy.peer_permitted(peer.ip()) {
+            drop(stream);
+            continue;
+        }
         let policy = Arc::clone(&policy);
         tokio::spawn(async move {
-            // The semaphore bounds concurrency; a permit is held for the whole
-            // connection. `acquire_owned` only fails if the semaphore is closed,
-            // which never happens while the broker lives.
-            let Ok(_permit) = Arc::clone(&policy.conns).acquire_owned().await else {
-                return;
-            };
+            // Held for the whole connection, then released on task exit.
+            let _permit = permit;
             let work = async {
                 match proto {
                     Proto::Socks5 => handle_socks(stream, &policy).await,
@@ -627,6 +821,34 @@ impl Policy {
                 .any(|c| c.host().as_str() == name.as_str())
     }
 
+    /// Whether `peer` is the guest this broker belongs to.
+    ///
+    /// Every listener gates on this. See [`BrokerSpec::guest`] for why binding the
+    /// gateway is not by itself a boundary — the address is a host address, and
+    /// the packet-filter rule that gates guest access is pinned to the tap, so it
+    /// never sees a locally-generated packet.
+    fn peer_permitted(&self, peer: IpAddr) -> bool {
+        let ok = match peer {
+            IpAddr::V4(v4) => v4 == self.guest,
+            // A v4-mapped v6 peer is the v4 peer it names; anything else cannot
+            // be this slot's guest, which has no IPv6 address at all.
+            IpAddr::V6(v6) => v6.to_ipv4_mapped() == Some(self.guest),
+        };
+        if !ok
+            && !self
+                .peer_refusal_logged
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "isopod: egress broker refused a connection from {peer}: its listeners serve \
+                 only this run's sandbox ({}). A credential is spendable by the run it was \
+                 injected into and by nothing else, including tools on the host.",
+                self.guest
+            );
+        }
+        ok
+    }
+
     fn record(&self, event: EgressEvent) -> Option<usize> {
         self.recorder.record(event)
     }
@@ -637,6 +859,19 @@ impl Policy {
 }
 
 use super::egress::Decision;
+
+/// Resolve `host` to IPv4 socket addresses, bounded by [`RESOLVE_TIMEOUT`].
+///
+/// IPv4 only: filtered slots have no IPv6 path at all, so an AAAA result would
+/// produce a connection the guest can never use and a misleading "allowed"
+/// record. A failure and a timeout are the same answer here — no addresses —
+/// because both leave the caller with nothing to dial.
+async fn resolve_v4(host: &str, port: u16) -> Vec<SocketAddr> {
+    match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(iter)) => iter.filter(SocketAddr::is_ipv4).collect(),
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    }
+}
 
 /// Resolve `target` host-side and connect, recording the outcome.
 ///
@@ -665,24 +900,46 @@ async fn dial(
         }
     };
 
-    let addrs: Vec<SocketAddr> = match target {
+    let resolved: Vec<SocketAddr> = match target {
         Target::Addr(ip, port) => vec![SocketAddr::new(*ip, *port)],
-        Target::Name(host, port) => {
-            match tokio::net::lookup_host((host.as_str(), *port)).await {
-                Ok(iter) => {
-                    // IPv4 only: filtered slots have no IPv6 path at all, so an
-                    // AAAA result would produce a connection the guest can never
-                    // use and a misleading "allowed" record.
-                    let v4: Vec<SocketAddr> = iter.filter(|a| a.is_ipv4()).collect();
-                    for a in &v4 {
-                        policy.recorder.remember_resolved(a.ip(), host);
-                    }
-                    v4
-                }
-                Err(_) => Vec::new(),
-            }
-        }
+        Target::Name(host, port) => resolve_v4(host.as_str(), *port).await,
     };
+
+    // The destination guard, applied AFTER resolution and to literal targets
+    // alike. The broker dials from the host, so nothing it connects to is
+    // forwarded through the tap — the packet filter's public-only-egress rule
+    // never sees it. A name is allowed to *pass policy* and still resolve to
+    // 169.254.169.254 or 127.0.0.1, and the allowlist is not always written by
+    // the operator: an MCP caller supplies `allow_hosts` directly.
+    let (addrs, blocked): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        resolved.into_iter().partition(|a| {
+            (policy.allow_loopback && a.ip().is_loopback())
+                || super::egress::is_dialable(&a.ip(), policy.allow_private)
+        });
+    // Only addresses that survived the floor are remembered. The cache is what
+    // lets a later literal target be recognised as "an address this broker handed
+    // out for an allowed name" — so recording a floored address would turn the
+    // guard into a way of *whitelisting* the very address it just refused.
+    if let Target::Name(host, _) = target {
+        for a in &addrs {
+            policy.recorder.remember_resolved(a.ip(), host);
+        }
+    }
+    if addrs.is_empty() && !blocked.is_empty() {
+        policy.record(EgressEvent {
+            proto,
+            host: name,
+            port,
+            allowed: false,
+            reason: Some(DenyReason::NonPublicAddress),
+            bytes_up: 0,
+            bytes_down: 0,
+            ts_ms: policy.now_ms(),
+            note: Some("non-public-address"),
+        });
+        return Err(DialFailure::Denied(DenyReason::NonPublicAddress));
+    }
+
     if addrs.is_empty() {
         policy.record(EgressEvent {
             proto,
@@ -1568,9 +1825,19 @@ async fn serve_dns_udp(socket: UdpSocket, policy: Arc<Policy>) {
     let mut buf = vec![0u8; MAX_DNS_MSG];
     loop {
         let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
-            tokio::task::yield_now().await;
+            // Backoff rather than yield, for the reason `serve_tcp` gives: a
+            // recurring error and a bare yield make a busy loop on the thread the
+            // whole run shares.
+            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             continue;
         };
+        // The listener is bound to a host address, so a local process can send it
+        // datagrams without ever crossing the tap-pinned filter rule. Answering
+        // only this run's sandbox keeps the responder from being a general-purpose
+        // resolver for whatever else is on the host.
+        if !policy.peer_permitted(peer.ip()) {
+            continue;
+        }
         let reply = answer_dns(&buf[..n], &policy).await;
         if let Some(reply) = reply {
             let _ = socket.send_to(&reply, peer).await;
@@ -1669,15 +1936,25 @@ async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
         return Some(build_dns_response(&query, RCODE_NOERROR, &[]));
     }
 
-    let ips: Vec<Ipv4Addr> = match tokio::net::lookup_host((query.name.as_str(), 0)).await {
-        Ok(iter) => iter
-            .filter_map(|a| match a.ip() {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    // The same floor `dial` applies, applied to what the guest is *told*. An
+    // answer naming 127.0.0.1 or 169.254.169.254 is one the broker would refuse
+    // to dial anyway, so synthesising it only invites the guest to try the
+    // address directly — which is a packet the filter drops, but a filter is a
+    // second line, not the first. A name that resolves entirely into the floored
+    // set is answered NOERROR-with-no-records, exactly like a name with no A.
+    let ips: Vec<Ipv4Addr> = resolve_v4(query.name.as_str(), 0)
+        .await
+        .into_iter()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(v4)
+                if (policy.allow_loopback && v4.is_loopback())
+                    || super::egress::is_dialable(&IpAddr::V4(v4), policy.allow_private) =>
+            {
+                Some(v4)
+            }
+            _ => None,
+        })
+        .collect();
     if ips.is_empty() {
         return Some(build_dns_response(&query, RCODE_NOERROR, &[]));
     }
@@ -1834,10 +2111,19 @@ mod tests {
                 .collect(),
             credentials,
             gateway: Ipv4Addr::LOCALHOST,
+            // The tests connect over loopback, so loopback *is* the peer the
+            // listeners must serve. A real run's guest address is derived from
+            // its gateway by `BrokerSpec::new`.
+            guest: Ipv4Addr::LOCALHOST,
+            peer_refusal_logged: std::sync::atomic::AtomicBool::new(false),
             inject_port: BROKER_INJECT_PORT,
+            // Tests dial 127.0.0.1 echo servers on purpose, so the destination
+            // guard is opened here. The guard itself is tested directly.
+            allow_private: true,
+            allow_loopback: true,
             recorder: Recorder::new(),
             conns: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS)),
-            http: build_upstream_client().expect("upstream client"),
+            http: build_upstream_client(true, true).expect("upstream client"),
         }
     }
 
@@ -2010,6 +2296,171 @@ mod tests {
     }
 
     // --- policy ------------------------------------------------------------
+
+    #[test]
+    fn the_real_constructor_never_opens_the_loopback_exception() {
+        // The test suite sets `allow_loopback` so it can bind an upstream at all.
+        // This asserts the escape hatch stays exactly that: the constructor every
+        // real run goes through must leave both destination flags closed, so the
+        // default cannot drift open unnoticed.
+        let spec = BrokerSpec::new(Ipv4Addr::LOCALHOST, Vec::new());
+        assert!(!spec.allow_loopback, "a real run must never dial loopback");
+        assert!(
+            !spec.allow_private,
+            "private destinations are opt-in via provisioning"
+        );
+        // And the manifest flag widens private ranges without touching loopback.
+        let widened = spec.with_private_destinations(true);
+        assert!(widened.allow_private);
+        assert!(
+            !widened.allow_loopback,
+            "--allow-lan-egress is about the LAN, not the host's own services"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_to_metadata_is_refused_even_when_allowlisted() {
+        // The confused-deputy case. The name passes the allowlist — the operator
+        // (or an MCP caller) put it there — but the broker dials from the HOST,
+        // where the packet filter's public-only-egress rule does not apply. Cloud
+        // metadata is the highest-value target reachable that way.
+        let upstream = spawn_echo().await;
+        let broker = Broker::start(BrokerSpec {
+            gateway: Ipv4Addr::LOCALHOST,
+            // The tests connect over loopback, so loopback *is* the peer the
+            // listeners must serve. A real run's guest address is derived from
+            // its gateway by `BrokerSpec::new`.
+            guest: Ipv4Addr::LOCALHOST,
+            rules: vec![HostRule::parse_cidr("0.0.0.0/0").expect("cidr")],
+            credentials: Vec::new(),
+            allow_private: true,
+            // Deliberately NOT set: this is the production posture.
+            allow_loopback: false,
+            ports: BrokerPorts {
+                socks: 0,
+                http: 0,
+                inject: 0,
+                dns: 0,
+            },
+        })
+        .await
+        .expect("broker must start");
+
+        // A wide-open CIDR allowlist still does not get loopback.
+        let (code, _s) = socks_connect(&broker, upstream).await;
+        assert_eq!(
+            code,
+            socks_reply::NOT_ALLOWED,
+            "loopback must be refused despite 0.0.0.0/0"
+        );
+        let (events, _) = broker.events();
+        assert_eq!(events[0].reason, Some(DenyReason::NonPublicAddress));
+        assert_eq!(events[0].note, Some("non-public-address"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_pinned_to_a_floored_address_refuses_to_start() {
+        // The resolver guard covers a pinned NAME. A pinned IP literal never
+        // reaches a resolver — hyper parses the authority as an address and dials
+        // it — so the floor had a hole exactly where it would hurt most: a
+        // credential whose store entry reads "169.254.169.254" would have sent the
+        // token to the metadata service.
+        for bad in ["169.254.169.254", "127.0.0.1", "10.107.9.1"] {
+            let spec = BrokerSpec {
+                gateway: Ipv4Addr::LOCALHOST,
+                guest: Ipv4Addr::LOCALHOST,
+                rules: Vec::new(),
+                credentials: vec![test_credential("probe", bad)],
+                allow_private: true, // even so
+                allow_loopback: false,
+                ports: BrokerPorts {
+                    socks: 0,
+                    http: 0,
+                    inject: 0,
+                    dns: 0,
+                },
+            };
+            let err = Broker::start(spec)
+                .await
+                .expect_err("a floored pinned host must refuse the run")
+                .to_string();
+            assert!(err.contains("probe"), "names the alias: {err}");
+            assert!(err.contains(bad), "names the address: {err}");
+        }
+
+        // A public literal is a legitimate pin and must still start.
+        let spec = BrokerSpec {
+            gateway: Ipv4Addr::LOCALHOST,
+            guest: Ipv4Addr::LOCALHOST,
+            rules: Vec::new(),
+            credentials: vec![test_credential("ok", "93.184.216.34")],
+            allow_private: false,
+            allow_loopback: false,
+            ports: BrokerPorts {
+                socks: 0,
+                http: 0,
+                inject: 0,
+                dns: 0,
+            },
+        };
+        assert!(
+            Broker::start(spec).await.is_ok(),
+            "a public literal is fine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_is_not_the_run_s_guest_is_served_by_no_listener() {
+        // The listeners bind the slot's gateway, which is a *host* address: the
+        // input-chain rule that gates guest access is pinned to the tap and by
+        // construction cannot match a locally-generated packet. So "bound to the
+        // gateway" is not a boundary, and without this check every local account
+        // could drive a live run's proxies — and spend its injected credential.
+        //
+        // Here the spec names a guest the test cannot possibly connect from, so
+        // every loopback connection is the "some other process on the host" case.
+        let broker = Broker::start(BrokerSpec {
+            gateway: Ipv4Addr::LOCALHOST,
+            guest: Ipv4Addr::new(10, 107, 8, 2),
+            rules: vec![HostRule::parse_cidr("0.0.0.0/0").expect("cidr")],
+            credentials: vec![test_credential("echo", "api.example.test")],
+            allow_private: true,
+            allow_loopback: true,
+            ports: BrokerPorts {
+                socks: 0,
+                http: 0,
+                inject: 0,
+                dns: 0,
+            },
+        })
+        .await
+        .expect("broker must start");
+
+        for (what, addr) in [
+            ("socks", broker.endpoints().socks.clone()),
+            ("http", broker.endpoints().http.clone()),
+            ("inject", broker.inject_addr().to_string()),
+        ] {
+            let mut s = TcpStream::connect(&addr)
+                .await
+                .expect("the listener accepts, then decides");
+            // A greeting long enough that any handler would answer it.
+            let _ = s
+                .write_all(b"\x05\x01\x00GET /echo/user HTTP/1.1\r\n\r\n")
+                .await;
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: the connection must be closed, not left open"))
+                .unwrap_or(0);
+            assert_eq!(n, 0, "{what}: a non-guest peer must get no bytes at all");
+        }
+
+        // And nothing was recorded: a host-side prober must not be able to write
+        // entries into the run's flight recorder either.
+        let (events, _) = broker.events();
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+    }
 
     #[test]
     fn policy_denies_a_literal_the_broker_never_resolved() {
@@ -2209,8 +2660,14 @@ mod tests {
     ) -> Broker {
         Broker::start(BrokerSpec {
             gateway: Ipv4Addr::LOCALHOST,
+            // The tests connect over loopback, so loopback *is* the peer the
+            // listeners must serve. A real run's guest address is derived from
+            // its gateway by `BrokerSpec::new`.
+            guest: Ipv4Addr::LOCALHOST,
             rules,
             credentials,
+            allow_private: true,
+            allow_loopback: true,
             // Ephemeral: the fixed ports would collide between concurrent tests
             // and with anything already listening on the developer's machine.
             ports: BrokerPorts {

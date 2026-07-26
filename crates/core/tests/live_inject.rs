@@ -67,8 +67,16 @@ async fn broker_with(allow: &str) -> Broker {
     Broker::start(
         BrokerSpec {
             gateway: Ipv4Addr::LOCALHOST,
+            // The tests connect over loopback, so loopback *is* the peer the
+            // listeners must serve. A real run's guest address is derived from
+            // its gateway by `BrokerSpec::new`.
+            guest: Ipv4Addr::LOCALHOST,
             rules: Vec::new(),
             credentials,
+            // The production posture: this test's upstream is a real public
+            // host, so it needs neither exception.
+            allow_private: false,
+            allow_loopback: false,
             ports: BrokerPorts {
                 socks: 0,
                 http: 0,

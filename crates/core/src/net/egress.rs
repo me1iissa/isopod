@@ -406,6 +406,90 @@ pub enum DenyReason {
     /// The credential endpoint refused the request. The accompanying `note`
     /// carries which of its checks failed.
     CredentialRefused,
+    /// The destination resolved to an address the broker will not dial from the
+    /// host: loopback, link-local (including cloud metadata), or — unless the
+    /// host was provisioned with `--allow-lan-egress` — a private range.
+    NonPublicAddress,
+}
+
+/// Whether the broker may open a host-side connection to `ip`.
+///
+/// # Why the broker needs its own check
+///
+/// The packet filter's public-only-egress rule governs packets **forwarded**
+/// from a tap. Nothing the broker dials is forwarded — the broker is a host
+/// process, so its connections originate on the host and never traverse that
+/// chain at all. Without this, allowlisting a name that resolves into a private
+/// range turned the broker into a confused deputy with host-level reach:
+///
+/// - `169.254.169.254` — cloud instance metadata, and with it instance
+///   credentials. The single highest-value SSRF target on any cloud host.
+/// - `127.0.0.1` — every unauthenticated service the operator runs locally,
+///   which the guest has no route to and no business reaching.
+/// - `10.0.0.0/8`, `192.168.0.0/16` — the operator's LAN, i.e. lateral movement.
+///
+/// This is not a hypothetical requiring a careless operator, because the
+/// allowlist is not always written by one: an MCP caller supplies `allow_hosts`
+/// and `allow_cidrs` directly, and plenty of public names resolve to loopback by
+/// design.
+///
+/// Loopback and link-local are refused **unconditionally**. `--allow-lan-egress`
+/// is a statement about the operator's LAN, not an invitation to the host's own
+/// services or its metadata endpoint, so it widens only the private and CGNAT
+/// ranges — exactly the set the nftables rule drops.
+///
+/// isopod's own slot supernet ([`crate::net::SLOT_SUPERNET`]) is refused
+/// unconditionally too, `--allow-lan-egress` or not. Those addresses are where
+/// every *other* concurrent run's broker listens, so dialling them would let one
+/// run reach a sibling's SOCKS proxy, its DNS responder, and — the reason this is
+/// not merely untidy — its credential endpoint, spending a token that was
+/// injected into a different run.
+#[must_use]
+pub fn is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            // `10.107.0.0/16`, asserted against `SLOT_SUPERNET` in the tests so
+            // the two cannot drift apart.
+            if v4.octets()[0] == 10 && v4.octets()[1] == 107 {
+                return false;
+            }
+            if v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+            {
+                return false;
+            }
+            // 100.64.0.0/10, RFC 6598 — carrier NAT, and not `is_private`.
+            let cgnat = v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]);
+            if v4.is_private() || cgnat {
+                return allow_private;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
+                return false;
+            }
+            // fe80::/10 link-local and fec0::/10 site-local.
+            let seg = v6.segments()[0];
+            if seg & 0xffc0 == 0xfe80 || seg & 0xffc0 == 0xfec0 {
+                return false;
+            }
+            // fc00::/7 unique-local — the v6 equivalent of a private range.
+            if seg & 0xfe00 == 0xfc00 {
+                return allow_private;
+            }
+            // An IPv4-mapped v6 address must be judged as the v4 address it is,
+            // or it becomes a way to spell 127.0.0.1 that passes every v6 check.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_dialable(&IpAddr::V4(mapped), allow_private);
+            }
+            true
+        }
+    }
 }
 
 impl DenyReason {
@@ -432,6 +516,15 @@ impl DenyReason {
             Self::CredentialRefused => {
                 "the credential endpoint refused this request; the event's \"note\" says \
                  which check failed"
+            }
+            Self::NonPublicAddress => {
+                "the destination resolved to a loopback, link-local or private address, \
+                 which the broker will not dial from the host. Allowing one would give \
+                 the sandbox reach the packet filter denies it — the host's own \
+                 services, its LAN, the cloud metadata endpoint, or another run's \
+                 broker. Re-provision with `sudo isopod setup --allow-lan-egress` to \
+                 permit private ranges; loopback, link-local and isopod's own slot \
+                 addresses are never dialled"
             }
         }
     }
@@ -806,6 +899,133 @@ mod tests {
         for port in [80, 443, 8080, 65535] {
             assert!(decide(&r, &name("pypi.org", port)).is_allowed());
         }
+    }
+
+    // --- the host-side destination guard ----------------------------------
+
+    #[test]
+    fn loopback_and_metadata_are_never_dialable() {
+        // These are refused even with --allow-lan-egress. That flag is about the
+        // operator's LAN; it is not an invitation to the host's own services or
+        // to the cloud metadata endpoint, which is the highest-value SSRF target
+        // on any cloud host.
+        for allow_private in [false, true] {
+            for bad in [
+                "127.0.0.1",
+                "127.1.2.3",
+                "0.0.0.0",
+                "169.254.169.254", // cloud instance metadata + credentials
+                "169.254.0.1",
+                "255.255.255.255",
+                "224.0.0.1",
+                "::1",
+                "::",
+                "fe80::1",
+                "ff02::1",
+                // An IPv4-mapped v6 address is just a way of spelling the v4 one,
+                // and must be judged as such rather than passing every v6 check.
+                "::ffff:127.0.0.1",
+                "::ffff:169.254.169.254",
+            ] {
+                let ip: IpAddr = bad.parse().expect("test address");
+                assert!(
+                    !is_dialable(&ip, allow_private),
+                    "{bad} must never be dialable (allow_private={allow_private})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_ranges_follow_the_provisioning_flag() {
+        // Exactly the set the nftables rule drops for forwarded traffic, so the
+        // broker's host-side connections match the packet filter rather than
+        // quietly exceeding it.
+        for private in [
+            "10.0.0.1",
+            "10.106.255.255", // one below the slot supernet
+            "10.108.0.0",     // one above it
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1", // CGNAT, RFC 6598 — not covered by is_private()
+            "100.127.255.255",
+            "fc00::1", // v6 unique-local
+            "fd12::1",
+        ] {
+            let ip: IpAddr = private.parse().expect("test address");
+            assert!(!is_dialable(&ip, false), "{private} denied by default");
+            assert!(
+                is_dialable(&ip, true),
+                "{private} permitted with --allow-lan-egress"
+            );
+        }
+        // Just outside CGNAT, so a sloppy range check would show up here.
+        for public in ["100.63.255.255", "100.128.0.0", "172.32.0.1", "11.0.0.1"] {
+            let ip: IpAddr = public.parse().expect("test address");
+            assert!(is_dialable(&ip, false), "{public} is public");
+        }
+    }
+
+    #[test]
+    fn isopod_slot_addresses_are_refused_even_with_lan_egress() {
+        // Every other concurrent run's broker listens on 10.107.<j>.1 — its SOCKS
+        // proxy, its DNS responder, and its credential endpoint. `--allow-lan-egress`
+        // widens the operator's LAN; it must not open a path from one run into a
+        // sibling run's token.
+        for allow_private in [false, true] {
+            for slot in [
+                "10.107.0.1",     // slot 0 gateway
+                "10.107.0.2",     // slot 0 guest
+                "10.107.8.1",     // an arbitrary sibling's gateway
+                "10.107.249.2",   // the last slot's guest
+                "10.107.255.255", // the top of the supernet
+                "::ffff:10.107.8.1",
+            ] {
+                let ip: IpAddr = slot.parse().expect("test address");
+                assert!(
+                    !is_dialable(&ip, allow_private),
+                    "{slot} must never be dialable (allow_private={allow_private})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_slot_refusal_covers_exactly_the_declared_supernet() {
+        // `is_dialable` open-codes 10.107/16 for cheapness; this pins it to the
+        // constant the rest of the crate provisions from, so a change to one
+        // without the other fails here rather than silently opening a path.
+        let supernet = Cidr::parse(crate::net::SLOT_SUPERNET).expect("SLOT_SUPERNET parses");
+        for octet_b in [106u8, 107, 108] {
+            for tail in [(0u8, 1u8), (8, 1), (255, 255)] {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, octet_b, tail.0, tail.1));
+                let inside = supernet.contains(&ip);
+                assert_eq!(
+                    inside,
+                    !is_dialable(&ip, true),
+                    "{ip} inside={inside} but the guard disagrees"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_public_addresses_stay_dialable() {
+        // The guard must not have become a general denial: this is the path every
+        // legitimate allowlisted destination takes.
+        for good in ["1.1.1.1", "151.101.0.223", "93.184.216.34", "2606:4700::1"] {
+            let ip: IpAddr = good.parse().expect("test address");
+            assert!(is_dialable(&ip, false), "{good} must be dialable");
+        }
+    }
+
+    #[test]
+    fn the_non_public_refusal_says_what_to_do_about_it() {
+        let why = DenyReason::NonPublicAddress.explain();
+        assert!(why.contains("loopback"), "{why}");
+        assert!(why.contains("metadata"), "{why}");
+        assert!(why.contains("--allow-lan-egress"), "{why}");
     }
 
     #[test]

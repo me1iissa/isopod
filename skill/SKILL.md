@@ -144,6 +144,11 @@ Practical notes:
 - `stdin` is for small text. For anything beyond a few KiB (tarballs, datasets,
   archives) pass `stdin_file="/abs/host/path"` instead — the server reads the
   file directly, so large payloads never transit the model context.
+- `stdin_file` and `copy_out[].host` are the only arguments naming a **host**
+  path, and both are confined to the server's host-I/O root (its working
+  directory by default), regular files only, 4 MiB for stdin. A refusal names
+  the root — that is a policy, not a bug, so pick a path inside the project
+  rather than retrying elsewhere.
 - Parallel `sandbox_run` calls batched in **one** assistant message execute
   serially, one VM after another. For genuinely concurrent sandboxes, issue the
   calls from separate agents/processes — the server and its network-slot pool

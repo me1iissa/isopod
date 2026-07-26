@@ -191,15 +191,48 @@ fn commit_in(
         bail!("stage label must not be empty");
     }
     let stage_id = stage_id_for(scratch_path)?;
+    let by_id = get_by_id_in(root, &stage_id)?;
+    let by_label = list_in(root)?.into_iter().find(|s| s.label == label);
 
-    // Content-addressed store: identical bytes ⇒ identical id ⇒ idempotent.
-    if let Some(existing) = get_by_id_in(root, &stage_id)? {
-        eprintln!(
-            "stage commit: {stage_id} already present (content-addressed); \
-             returning existing stage {:?}",
-            existing.name
-        );
-        return Ok(existing);
+    match (by_id, by_label) {
+        // Content-addressed store: identical bytes *under the same label* ⇒
+        // identical id ⇒ genuinely idempotent. Re-running the same build is the
+        // ordinary way to reach this, and it must keep succeeding.
+        (Some(existing), Some(same)) if existing.stage_id == same.stage_id => {
+            eprintln!(
+                "stage commit: {stage_id} already present (content-addressed); \
+                 returning existing stage {:?}",
+                existing.name
+            );
+            return Ok(existing);
+        }
+        // A label is a *reference* other runs resolve by, and `resolve_in` returns
+        // an exact label match before it considers prefixes — so committing a stage
+        // labelled exactly what another workflow uses as a prefix would silently
+        // redirect that workflow onto this layer chain. The caller picks the label,
+        // so refusing is the only way that stays impossible.
+        (_, Some(clash)) => bail!(
+            "stage label {label:?} already refers to stage {} (name {:?}). Labels are how \
+             other runs name a stage, so reusing one would move an existing reference onto \
+             different content. Pick another label, or fork what is already there with \
+             `--stage {label}`.",
+            clash.stage_id,
+            clash.name,
+        ),
+        // Same bytes, different label. The store is keyed by content, so the
+        // requested label cannot be recorded at all: reporting success here handed
+        // back the *other* stage's id and name, and every later `stage: "<label>"`
+        // then failed to resolve — which reads as a lost commit rather than a label
+        // that was never written.
+        (Some(existing), None) => bail!(
+            "this scratch is byte-identical to stage {} (label {:?}), so committing it as \
+             {label:?} would record nothing: the store is content-addressed, and one set of \
+             bytes has one id. Use `--stage {}` to build on it, or make the layer differ.",
+            existing.stage_id,
+            existing.label,
+            existing.label,
+        ),
+        (None, None) => {}
     }
 
     // Resolve the parent and build the root-first chain (self last). A stacked
@@ -295,6 +328,16 @@ fn list_in(root: &Path) -> Result<Vec<StageMeta>> {
 }
 
 fn resolve_in(root: &Path, reference: &str) -> Result<StageMeta> {
+    // The empty string is a prefix of every label, so step 4 below resolved it to
+    // whatever the single stage in a one-stage store happened to be — forking a
+    // layer chain nobody named. An omitted stage has its own spelling (`None`,
+    // which means the toolchain base); an empty one is a mistake.
+    if reference.trim().is_empty() {
+        bail!(
+            "stage reference must not be empty (omit it entirely to start from the \
+             toolchain base)"
+        );
+    }
     let stages = list_in(root)?;
 
     // 1. Exact stage_id (ids are unique).
@@ -491,14 +534,90 @@ mod tests {
         let reread = get_by_id_in(&root, &meta.stage_id).unwrap().unwrap();
         assert_eq!(reread, meta);
 
-        // Idempotent: re-committing identical content returns the same stage.
-        let again = commit_in(&root, &scratch, "some/other-label", None, "base-sqfs").unwrap();
+        // Idempotent: re-committing identical content under the SAME label returns
+        // the same stage. This is the case that happens in practice — the same
+        // build run twice — and it must stay a no-op rather than an error.
+        let again = commit_in(&root, &scratch, "demo/first", None, "base-sqfs").unwrap();
         assert_eq!(again, meta, "re-commit of identical content is idempotent");
         assert_eq!(
             list_in(&root).unwrap().len(),
             1,
             "no duplicate stage created"
         );
+
+        // Identical content under a DIFFERENT label is refused, and says why. It
+        // used to report success while recording nothing: the store is keyed by
+        // content, so the requested label was silently dropped and every later
+        // `stage: "some/other-label"` failed to resolve — which reads as a commit
+        // that was lost rather than a label that was never written.
+        let why = commit_in(&root, &scratch, "some/other-label", None, "base-sqfs")
+            .expect_err("must refuse")
+            .to_string();
+        assert!(why.contains("byte-identical"), "{why}");
+        assert!(why.contains("demo/first"), "{why}");
+        assert_eq!(list_in(&root).unwrap().len(), 1, "still no duplicate");
+    }
+
+    #[test]
+    fn a_label_cannot_be_moved_onto_different_content() {
+        // `resolve_in` prefers an exact label match over a prefix match, so a stage
+        // labelled exactly what another workflow uses as a *prefix* would capture
+        // that workflow's reference — and `commit_as` is chosen by the caller.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = fixture(home.path(), "a.img", b"first content");
+        let original = commit_in(&root, &first, "myenv", None, "base-sqfs").unwrap();
+        // "my" resolves to it today, by unique label prefix.
+        assert_eq!(resolve_in(&root, "my").unwrap().stage_id, original.stage_id);
+
+        let second = fixture(home.path(), "b.img", b"different content entirely");
+        let why = commit_in(&root, &second, "my", None, "base-sqfs")
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e.to_string());
+        // Committing *is* allowed here — "my" is not an existing label, only a
+        // prefix of one — but the reference it captures must now be unambiguous
+        // rather than silently redirected.
+        if why.is_empty() {
+            let after = resolve_in(&root, "my").unwrap();
+            assert_ne!(
+                after.stage_id, original.stage_id,
+                "an exact label match is the documented winner"
+            );
+        }
+
+        // The case that must never be permitted: reusing the exact label.
+        let third = fixture(home.path(), "c.img", b"third content");
+        let why = commit_in(&root, &third, "myenv", None, "base-sqfs")
+            .expect_err("an exact label collision must be refused")
+            .to_string();
+        assert!(why.contains("already refers to"), "{why}");
+        assert_eq!(
+            resolve_in(&root, "myenv").unwrap().stage_id,
+            original.stage_id,
+            "the existing reference still points where it did"
+        );
+    }
+
+    #[test]
+    fn an_empty_stage_reference_does_not_resolve_to_whatever_is_there() {
+        // "" is a prefix of every label, so the unique-prefix step resolved it to
+        // the sole stage in a one-stage store and forked a layer chain nobody named.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = fixture(home.path(), "s.img", b"only stage");
+        commit_in(&root, &scratch, "sole", None, "base-sqfs").unwrap();
+
+        for empty in ["", "   "] {
+            let why = resolve_in(&root, empty)
+                .expect_err("an empty reference must not resolve")
+                .to_string();
+            assert!(why.contains("must not be empty"), "{why}");
+        }
+        // The real reference still works, so this is not a general regression.
+        assert_eq!(resolve_in(&root, "sole").unwrap().label, "sole");
     }
 
     #[test]
