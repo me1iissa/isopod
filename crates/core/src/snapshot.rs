@@ -425,11 +425,10 @@ fn slot_nic(slot: &net::Slot) -> NetworkInterface {
 /// Do the actual build: boot the warm-shape VM, snapshot it, tear it down, and
 /// atomically publish the artifacts + `meta.json`.
 async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> {
-    // Reclaim any slot orphaned by a crashed run, then claim one for the builder.
+    // Reap any firecracker orphaned by a crashed run — its tap would wedge the
+    // slot — then claim one for the builder. The slot lock itself needs no
+    // reclaiming: a crashed owner's `flock` is already gone.
     crate::vm::reap_orphans();
-    if let Err(e) = net::sweep_stale() {
-        eprintln!("warmpool build: warning: stale-slot sweep failed (continuing): {e:#}");
-    }
     let slot = net::claim().context("claiming a network slot for the snapshot builder")?;
 
     let vm_id = generate_vm_id()?;

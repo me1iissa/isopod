@@ -277,8 +277,13 @@ pub fn teardown(spec: &JailSpec) {
     }
 }
 
-/// Remove empty leftover `isopod.slice/*` leaf cgroups (crash recovery), mirroring
-/// [`crate::net::sweep_stale`]. Best-effort; a live VM's leaf stays (`EBUSY`).
+/// Remove empty leftover `isopod.slice/*` leaf cgroups (crash recovery).
+/// Best-effort; a live VM's leaf stays (`EBUSY`).
+///
+/// This one really does need an age heuristic, unlike the network slot, which
+/// dropped its own for an `flock`: a cgroup leaf is not a file a process can be
+/// made to hold open for its lifetime, so `EBUSY` is the only liveness signal
+/// available and it only covers a leaf that has already been joined.
 pub fn sweep_stale_cgroups() {
     // Only reap leaves older than this. A leaf is created (empty) in `setup` and
     // joined by the jail supervisor only once Firecracker has forked, so a

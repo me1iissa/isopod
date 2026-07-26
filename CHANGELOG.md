@@ -158,23 +158,38 @@ process cannot read the live ruleset to confirm it.
   the file rather than the directory, so `"vm_id": "../../.."` in any writable
   `meta.json` made `remove_dir_all` traverse out of the vms root — reachable
   through a `copy_out` destination. The directory name is now authoritative.
-- **Slot claiming: two of the three races are closed, and the third is now
-  documented rather than claimed fixed.** The lockfile existed zero-byte between
-  its `create_new` and its pid write, and a concurrent claimer's stale sweep read
-  that as "garbled ⇒ reclaim" — unparseable contents are now stale only once the
-  file is older than the write grace. Releasing a slot no longer unlinks a lock
-  that is not ours, compared by a **per-claim token** rather than by pid: under the
-  MCP server every concurrent run shares one process, so a pid comparison called a
-  sibling run's lock "mine" and freed a slot that still had a VM and a broker on it.
+- **A network slot is now claimed with `flock`, and the staleness heuristic is
+  gone.** A run holds an exclusive `flock` on `~/.isopod/net/slot-<i>.lock` for
+  its whole lifetime. That deletes the entire class of bug this release spent
+  three attempts on: there is no staleness to decide, no pid liveness to guess,
+  no write grace, no startup sweep, and no unlink — the kernel releases the lock
+  when the owning process dies, `kill -9` included, so a crashed run's slot is
+  free the instant it dies and correct the instant after. `flock` also belongs to
+  the **open file description** rather than the process, so two concurrent runs
+  under one MCP server are told apart for free; `fcntl` record locking would have
+  handed the second one a lock the first still needed. The lockfiles now carry no
+  contents at all, and are no longer unlinked. `net::sweep_stale` is removed.
 
-  **Not fixed:** deciding a lock is stale and unlinking it are still two
-  operations, so two claimants that read the same dead pid can both proceed, the
-  second unlinking what the first just wrote. Both then believe they hold the slot
-  and the loser's firecracker fails opaquely on the tap. It needs `flock` — whose
-  release the kernel handles on process death, and which distinguishes two open
-  file descriptions in one process — rather than a staleness heuristic, which is a
-  change to the claiming protocol rather than a patch. Trigger: one stale lock
-  present (a `kill -9`'d run) plus two claims at the same instant.
+  **This release introduced a regression that this change closes.** Earlier in
+  0.11.0 the claim started writing a `<pid> <nonce>` token into the lockfile so a
+  release could tell a sibling run's lock from its own — but the staleness parser
+  was left reading the file as a bare pid. Every real lockfile therefore failed to
+  parse, took the "unparseable" branch, and was declared stale **five seconds
+  after it was written, with its owner alive and its VM on the tap**. Since every
+  claim swept first, the next run unlinked a live lock and took the occupied slot;
+  the loser's firecracker died on `Open tap device failed … Device or resource
+  busy` cold, or `Failed to restore devices … Net:` on a warm resume. Two runs
+  more than five seconds apart collided reliably. It failed closed — firecracker
+  will not open a tap twice — so it was a reliability defect and not a crossing of
+  the isolation boundary, but it was a live one. The tests missed it because they
+  claim and release in milliseconds, inside the grace period, and because the one
+  test that built a lockfile by hand wrote the bare pid the code had stopped
+  writing. Fixture lockfiles are now built only through the claiming path, and the
+  regression test ages a real lock past the old grace before re-claiming.
+
+  Also fixed with it, and previously listed here as not fixed: deciding staleness
+  and unlinking were two operations, so two claimants reading the same dead pid
+  could both proceed, the second unlinking what the first had just written.
 - **A run outlived its own timeout.** `getaddrinfo` has no cancellation, and
   dropping the run's tokio runtime waits for every blocking thread with no bound —
   so a name whose nameserver never answered held the `sandbox_run` request (and a

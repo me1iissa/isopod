@@ -132,10 +132,13 @@ installed package (import works) while the parent stage stays byte-identical.
 ## 5. 👤 Leak / crash recovery
 
 ```bash
-# Kill a run mid-flight (Ctrl-C or kill -9) and confirm the slot lock is reclaimed
-# on the next run's startup sweep — no slot is permanently lost:
-ls ~/.isopod/net/                     # may show a stale slot-<i>.lock after a crash
-./target/debug/isopod run -- /bin/sh -c 'echo recovered'   # sweeps stale locks, reuses the slot
+# Kill a run mid-flight (Ctrl-C or kill -9) and confirm its slot is immediately
+# reusable — no slot is permanently lost:
+ls ~/.isopod/net/                     # the slot-<i>.lock files persist; they are empty
+                                      # and always present, so this says nothing about
+                                      # occupancy. The kernel does:
+flock -n ~/.isopod/net/slot-0.lock true && echo "slot 0 is free"
+./target/debug/isopod run -- /bin/sh -c 'echo recovered'   # reuses the dead run's slot
 pgrep -a firecracker || echo "no leaked VMM"
 ```
 

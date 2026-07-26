@@ -1994,17 +1994,14 @@ fn parse_egress_rules(policy: &EgressPolicy) -> Result<Vec<net::egress::HostRule
 
 /// Claim a network slot for a networked run, requiring the one-time host setup.
 ///
-/// Sweeps stale locks first (crash recovery), then claims the lowest free slot.
+/// Claims the lowest free slot. Nothing needs reclaiming first: a slot is held
+/// by an `flock`, which the kernel releases when the owning process dies.
 ///
 /// # Errors
 /// If `sudo isopod setup` has not run (names the command), or every slot is in
 /// use.
 fn claim_network() -> Result<net::Slot> {
     require_network_setup()?;
-    // Best-effort: reclaim slots orphaned by crashed runs before claiming.
-    if let Err(e) = net::sweep_stale() {
-        eprintln!("run: warning: stale-slot sweep failed (continuing): {e:#}");
-    }
     net::claim()
 }
 

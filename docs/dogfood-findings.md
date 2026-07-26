@@ -191,8 +191,14 @@ model + M5.5 flex resources carry a real heavy workload. Five gaps fell out.
 **Concurrency stress (positive, no gap).** 6 networked `run --stage base` launched in parallel
 all **warm-resumed from the one shared 512 MiB snapshot**, each claimed a **distinct slot** (0–5)
 with its own `/30`, all exited 0 with NET-OK, and left **zero leaks** (no firecracker procs, no
-held slot locks). The `O_EXCL` slot-claim is race-free under real contention and concurrent
-resume from a single read-only memfile is safe — the core multi-agent model holds under load.
+held slot locks). The `O_EXCL` slot-claim held under this contention and concurrent resume from
+a single read-only memfile is safe — the core multi-agent model holds under load.
+
+> **Corrected 2026-07-26.** This was read at the time as "the slot claim is race-free", which it
+> was not. Six *simultaneous* launches is the one shape the `O_EXCL`-plus-staleness claim got
+> right; runs staggered by more than a few seconds is the shape it got wrong, and neither this
+> stress nor the unit tests ever ran that. The claim is now an `flock` held for the run's
+> lifetime, which does not depend on timing at all. See the 0.11.0 changelog entry.
 
 ## 2026-07-22 — MCP v2 gauntlet (post-restart, all-MCP) + self-build **via MCP**
 

@@ -233,8 +233,9 @@ layers; xattr survival.
   no-root-runtime property. The netns design's identical-guest-IP benefit (snapshot restores
   into any slot) is recovered at M6 by the guest agent re-applying net config over vsock after
   resume, exactly like the existing clock resync.
-- Slot pool is claimed/released via `~/.isopod/net/` lockfiles (stale-pid sweep on startup for
-  slots orphaned by crashes).
+- Slot pool is claimed by an exclusive `flock` on `~/.isopod/net/slot-<i>.lock`, held for the
+  run's lifetime; released by closing the descriptor. Crashes need no recovery pass — the kernel
+  drops the lock when the owning process dies.
 - DNS: public resolvers baked into guest `/etc/resolv.conf`.
 - `--no-network`: no NIC attached at all. Control RPC is vsock, so exec works identically.
 - Guest→host: never routed; host services are not reachable from guests (no route, nftables drop).
@@ -410,7 +411,8 @@ external NBD demoted to fallback, vhost-user ruled out as it breaks snapshots); 
 From Claude Code via MCP: `sandbox_run("uname -a")` cold; `sandbox_start` → `pip install` →
 `stage_commit("demo/py-deps-1")` → in a second session `sandbox_start(stage=…)` → import works;
 original stage bit-identical (blake3); `--no-network` sandbox can exec but not `curl`; kill -9
-the MCP server mid-session → no leaked FC processes/slots after the startup sweep; latency
+the MCP server mid-session → no leaked FC processes (reaped on the next run) and no leaked
+slots (the kernel drops their locks with the process); latency
 report: cold `sandbox_run` wall time, hot-resume wall time, fork disk-setup time (<100 ms target).
 
 ## Key references (public)

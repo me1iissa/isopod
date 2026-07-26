@@ -23,18 +23,19 @@
 //! distinct slots are on distinct subnets and cannot address one another even
 //! before nftables isolation.
 //!
-//! At runtime a VM **claims** a free slot via an `O_EXCL` lockfile under
-//! `~/.isopod/net/slot-<i>.lock` (containing the claiming pid) and **releases**
-//! it by unlinking on [`Slot`] drop. A startup [`sweep_stale`] reclaims locks
-//! whose owning pid is dead (crash recovery). The manifest
+//! At runtime a VM **claims** a free slot by taking a non-blocking exclusive
+//! `flock` on `~/.isopod/net/slot-<i>.lock`, and holds it for the run's whole
+//! lifetime; [`Slot`] drop closes the descriptor, which is what releases it.
+//! Crash recovery needs no sweep and no bookkeeping: the kernel drops the lock
+//! when the holding process dies, however it died. The manifest
 //! `~/.isopod/net/slots.json` records what `setup` provisioned.
 //!
 //! The `*_in(root)` helpers take an explicit state root so the slot logic is
 //! unit-testable against a temp directory without a real `~/.isopod`.
 
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -324,17 +325,16 @@ impl Manifest {
     }
 }
 
-/// A claimed network slot. Holds an `O_EXCL` lockfile for its lifetime;
-/// [`Drop`] releases the slot by unlinking it, so a slot is never leaked even if
-/// the run panics.
+/// A claimed network slot. Holds an exclusive `flock` on its lockfile for its
+/// whole lifetime, so a slot is never leaked even if the run panics — or is
+/// `kill -9`'d, since the kernel drops the lock when the descriptor closes.
 #[derive(Debug)]
 pub struct Slot {
     index: usize,
-    lock_path: PathBuf,
-    /// The exact bytes this claim wrote into its lockfile, so release can tell
-    /// "still mine" from "someone else's now" — including against a sibling run
-    /// in the same process, which a pid cannot. See [`Drop for Slot`](Slot#impl-Drop).
-    token: String,
+    /// The flocked lockfile. **This handle is the claim**: dropping it is the
+    /// release, and nothing else may close or duplicate it. It is otherwise
+    /// unused, which is the point — see [`claim_lock`].
+    _lock: fs::File,
     filtered: bool,
 }
 
@@ -383,27 +383,13 @@ impl Slot {
     }
 }
 
-impl Drop for Slot {
-    fn drop(&mut self) {
-        // Only if the lock is still *ours*, compared by the exact token this claim
-        // wrote. Unlinking unconditionally meant that if the lock had been
-        // replaced — a reclaimed-too-eagerly sweep being the way that happens —
-        // release would delete the lock of whichever run held the slot now,
-        // letting a third claim it while that run's VM and broker were still
-        // addressed on it.
-        //
-        // The token and not the pid, because under the MCP server every
-        // concurrent run shares one process: a pid comparison says "mine" for a
-        // sibling run's lock, which is exactly the case that needed protecting.
-        //
-        // Best-effort otherwise: a failure to unlink only leaves a stale lock that
-        // the next `sweep_stale` reclaims (our pid will be dead).
-        let ours = fs::read_to_string(&self.lock_path).is_ok_and(|s| s.trim() == self.token);
-        if ours {
-            let _ = fs::remove_file(&self.lock_path);
-        }
-    }
-}
+// `Slot` needs no `Drop`: dropping the `File` closes the descriptor, and closing
+// the descriptor is what releases the `flock`. Writing one that unlinked the
+// lockfile would reintroduce the race this design exists to remove — between the
+// unlink and the next claimant's `open` a third party can create the same path,
+// and then two holders have flocked two different inodes under one name. The
+// lockfiles are meant to stay: they are a fixed, slot-count-sized set of empty
+// files, and an empty file that persists is cheaper than a race.
 
 // ===========================================================================
 // Public API (resolves the state root through `crate::paths`).
@@ -456,19 +442,12 @@ fn all_taps_present(slot_count: usize, present: impl Fn(&str) -> bool) -> Result
     Ok(true)
 }
 
-/// Reclaim slot locks whose owning pid is dead (crash recovery), returning how
-/// many were reclaimed.
-///
-/// # Errors
-/// If the net directory exists but cannot be read.
-pub fn sweep_stale() -> Result<usize> {
-    sweep_stale_in(&net_dir()?)
-}
-
 /// Claim the lowest-numbered free **public** slot (NAT egress to the public
-/// internet), first reclaiming any stale locks.
+/// internet).
 ///
-/// The returned [`Slot`] releases itself on drop.
+/// The returned [`Slot`] releases itself on drop. There is no crash-recovery
+/// step to run first: a slot whose owner died is already free, because the
+/// kernel released its `flock`.
 ///
 /// # Errors
 /// If setup has not run, the manifest cannot be read, or every public slot is
@@ -696,16 +675,13 @@ fn write_manifest_in(root: &Path, manifest: &Manifest) -> Result<()> {
 
 /// Claim the lowest-numbered free slot in `[lo, hi)`, marking it `filtered`.
 ///
-/// Both pools share the lockfile namespace and the stale sweep; they differ
-/// only in which indices they scan, which is what makes the public/filtered
-/// split a pure setup-time decision with no runtime coordination.
+/// Both pools share the lockfile namespace; they differ only in which indices
+/// they scan, which is what makes the public/filtered split a pure setup-time
+/// decision with no runtime coordination.
 fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<Slot> {
     if hi == 0 || hi > MAX_SLOT_COUNT || lo > hi {
         bail!("invalid slot range {lo}..{hi} (expected 0..=hi, hi in 1..={MAX_SLOT_COUNT})");
     }
-    // Reclaim crashed owners first so a busy scan does not spuriously exhaust.
-    let _ = sweep_stale_in(root);
-
     for i in lo..hi {
         // Validate the slot's derived names/addresses up front; a misconfigured
         // slot_count must never yield an out-of-range tap name or octet.
@@ -727,145 +703,61 @@ fn claim_range_in(root: &Path, lo: usize, hi: usize, filtered: bool) -> Result<S
     )
 }
 
-/// Try to claim slot `i`: create its lockfile with `O_EXCL`. Returns `Ok(Some)`
-/// on success, `Ok(None)` if a live owner holds it, and reclaims-then-retries a
-/// single time if the existing lock is stale.
+/// Try to claim slot `i`. Returns `Ok(Some)` on success and `Ok(None)` if
+/// another claimant — in any process, including this one — holds it.
 fn try_claim_slot(root: &Path, i: usize, filtered: bool) -> Result<Option<Slot>> {
-    let lock = lock_path_in(root, i);
-    match create_lock(&lock) {
-        Ok(token) => Ok(Some(Slot {
-            index: i,
-            lock_path: lock,
-            token,
-            filtered,
-        })),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Stale (dead owner)? Reclaim and retry exactly once; if someone else
-            // wins the retry, treat the slot as busy.
-            //
-            // KNOWN LIMIT: deciding staleness and unlinking are two operations,
-            // so two claimants that read the same dead pid can both proceed — the
-            // second unlinking a lock the first has already replaced. Both then
-            // believe they hold the slot, and the loser's VM fails opaquely when
-            // firecracker cannot open the tap. It needs a real lock (`flock`,
-            // whose release the kernel handles on process death, and which
-            // distinguishes two open file descriptions in one process) rather
-            // than a staleness heuristic; that is a change to the claiming
-            // protocol, not a patch to this branch. Documented in SECURITY.md.
-            if lock_is_stale(&lock) {
-                let _ = fs::remove_file(&lock);
-                match create_lock(&lock) {
-                    Ok(token) => Ok(Some(Slot {
-                        index: i,
-                        lock_path: lock,
-                        token,
-                        filtered,
-                    })),
-                    Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-                    Err(e2) => Err(anyhow::Error::new(e2).context(format!("claiming slot {i}"))),
-                }
-            } else {
-                Ok(None)
-            }
-        }
-        Err(e) => Err(anyhow::Error::new(e).context(format!("claiming slot {i}"))),
-    }
+    let lock = claim_lock(&lock_path_in(root, i))
+        .map_err(|e| anyhow::Error::new(e).context(format!("claiming slot {i}")))?;
+    Ok(lock.map(|_lock| Slot {
+        index: i,
+        _lock,
+        filtered,
+    }))
 }
 
-/// Distinguishes two claims made by the *same process*.
+/// Take a non-blocking exclusive `flock` on `path`, creating it if absent.
+/// `Ok(None)` means somebody else holds it.
 ///
-/// The pid alone cannot: under the MCP server every concurrent run shares one
-/// process, so two claims write byte-identical locks. A release that only checked
-/// the pid would then happily unlink a lock belonging to a sibling run that was
-/// still using the slot.
-static CLAIM_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The token one claim writes into its lockfile: `<pid> <nonce>`.
-fn claim_token() -> String {
-    let n = CLAIM_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{} {n}", std::process::id())
-}
-
-/// Create the lockfile atomically (`O_EXCL`) and write our claim token into it.
-fn create_lock(lock: &Path) -> std::io::Result<String> {
-    let mut f = fs::OpenOptions::new()
+/// **The lockfile carries no contents, deliberately.** Every previous design
+/// wrote the owner's identity into it and decided occupancy by reading that
+/// back — a pid, then a `<pid> <nonce>` claim token — and each time the writer
+/// and the reader were free to disagree. In 0.11.0 they did: the writer had
+/// gained a nonce and the parser still expected a bare pid, so every live lock
+/// failed to parse, was declared stale five seconds after it was written, and
+/// was deleted out from under a running VM. There is nothing to parse now. The
+/// only fact about a slot is whether the kernel will grant the lock, and only
+/// the kernel answers it.
+///
+/// `flock` is the right primitive rather than `fcntl` record locking on two
+/// counts. It is owned by the **open file description**, so two claims in one
+/// process — the shape every concurrent run takes under the MCP server — are
+/// correctly told apart, where `fcntl`'s per-process ownership would hand the
+/// second claimant a lock the first still needs. And the kernel releases it when
+/// the last descriptor closes, which covers `kill -9`, a panic, and an OOM kill
+/// with no bookkeeping and no liveness guess.
+///
+/// The descriptor is close-on-exec (Rust's default), so firecracker does not
+/// inherit the claim and cannot outlive the run holding it.
+fn claim_lock(path: &Path) -> std::io::Result<Option<fs::File>> {
+    let file = fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
-        .open(lock)?;
-    let token = claim_token();
-    write!(f, "{token}")?;
-    Ok(token)
-}
-
-/// How long a lock whose contents do not parse is left alone.
-///
-/// [`create_lock`] is two operations — `create_new`, then write the pid — so for
-/// an instant a live claim is a zero-byte file, which parses as nothing. Without
-/// this grace period a concurrent claimer's [`sweep_stale_in`] read that instant
-/// as "garbled ⇒ reclaim", deleted a claim that was in the middle of being made,
-/// and took the same slot: two runs on one tap, one address pair, and one
-/// gateway, presenting as an opaque "Open tap device failed" from the second
-/// firecracker. Generous, because the cost of waiting is a slot that stays busy
-/// for another few seconds and the cost of not waiting is two runs sharing it.
-const LOCK_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// A lock is stale if its recorded pid names a dead process, or its contents do
-/// not parse *and* it is too old to be a claim still being written.
-fn lock_is_stale(lock: &Path) -> bool {
-    stale_from(fs::read_to_string(lock).ok().as_deref(), || {
-        written_recently(lock)
-    })
-}
-
-/// The staleness decision itself, with the mtime lookup injected so both arms are
-/// testable without backdating a real file.
-fn stale_from(contents: Option<&str>, recently_written: impl FnOnce() -> bool) -> bool {
-    match contents {
-        Some(s) => match s.trim().parse::<u32>() {
-            Ok(pid) => !pid_is_alive(pid),
-            Err(_) => !recently_written(),
-        },
-        // Vanished between the readdir and the read: not our concern here.
-        None => false,
+        .create(true)
+        .truncate(false)
+        // Only applies when this call creates the file; the enclosing directory
+        // is already 0700.
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: `flock` takes a raw fd and an operation, mutating no memory. `file`
+    // owns the descriptor and outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
     }
-}
-
-/// Whether `path` was modified within [`LOCK_WRITE_GRACE`]. Unknowable ⇒ `false`,
-/// so an unreadable timestamp does not make a genuinely corrupt lock permanent.
-fn written_recently(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < LOCK_WRITE_GRACE)
-}
-
-/// Whether `/proc/<pid>` exists (best-effort liveness; pid reuse is accepted for
-/// v1, matching the PLAN's stale-pid sweep).
-fn pid_is_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-fn sweep_stale_in(root: &Path) -> Result<usize> {
-    let entries = match fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", root.display()))),
-    };
-    let mut reclaimed = 0;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading an entry in {}", root.display()))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !(name.starts_with("slot-") && name.ends_with(".lock")) {
-            continue;
-        }
-        let path = entry.path();
-        if lock_is_stale(&path) && fs::remove_file(&path).is_ok() {
-            reclaimed += 1;
-        }
+    let e = std::io::Error::last_os_error();
+    // EWOULDBLOCK (== EAGAIN) is the whole point of LOCK_NB: held, not broken.
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
     }
-    Ok(reclaimed)
+    Err(e)
 }
 
 #[cfg(test)]
@@ -901,88 +793,52 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_still_being_written_is_not_swept_out_from_under_its_claimer() {
-        // The state a live claim passes through between `create_new` and the pid
-        // write. A sweeper that reclaimed it would delete a claim in progress and
-        // then succeed in claiming the same slot itself.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let lock = lock_path_in(dir.path(), 3);
-        fs::write(&lock, "").expect("write empty lock");
-        assert!(
-            !lock_is_stale(&lock),
-            "a zero-byte lock written just now is a claim in progress"
-        );
-        assert_eq!(sweep_stale_in(dir.path()).expect("sweep"), 0);
-        assert!(lock.exists(), "the sweep must not have removed it");
-    }
-
-    #[test]
-    fn staleness_distinguishes_a_claim_in_progress_from_a_corrupt_lock() {
-        // Unparseable contents are ambiguous: either a claim between its
-        // `create_new` and its pid write, or a lock left corrupt by something
-        // else. The mtime is what separates them, and getting it backwards either
-        // way is a real failure — reclaiming live slots, or leaking them forever.
-        assert!(!stale_from(Some(""), || true), "empty + just written");
-        assert!(stale_from(Some(""), || false), "empty + old");
-        assert!(!stale_from(Some("junk"), || true), "garbled + just written");
-        assert!(stale_from(Some("junk"), || false), "garbled + old");
-        // A live pid is never stale whatever the mtime says.
-        let live = std::process::id().to_string();
-        assert!(!stale_from(Some(&live), || false));
-        // A vanished lock is somebody else's business, not a reclaim.
-        assert!(!stale_from(None, || false));
-    }
-
-    #[test]
     fn a_release_does_not_free_a_sibling_run_s_slot_in_the_same_process() {
-        // Under the MCP server every concurrent run shares one process, so a
-        // pid-based ownership check reads a sibling's lock as "mine". The claim
-        // token distinguishes them: same pid, different nonce.
+        // Under the MCP server every concurrent run shares one process, so an
+        // ownership test based on anything the process knows about itself — a pid,
+        // most obviously — reads a sibling's lock as "mine". `flock` is held by
+        // the open file description rather than the process, so a second claim on
+        // a held slot is refused even from the very thread that holds it. (This is
+        // exactly where `fcntl` record locking would go wrong: its locks are
+        // per-process, so the second claim would be granted.)
         let dir = tempfile::tempdir().expect("tempdir");
         let first = try_claim_slot(dir.path(), 2, false)
             .expect("claim")
             .expect("slot 2 free");
-        let lock = lock_path_in(dir.path(), 2);
 
-        // A sibling claim in this same process takes the slot over (the shape a
-        // too-eager reclaim produces).
-        fs::remove_file(&lock).expect("simulate a reclaim");
-        let second = try_claim_slot(dir.path(), 2, false)
-            .expect("claim")
-            .expect("slot 2 free again");
-        assert_ne!(first.token, second.token, "same pid, different claims");
-
-        // The first run finishing must not free the slot the second is using.
-        drop(first);
-        assert!(lock.exists(), "the sibling's lock must survive");
-        assert_eq!(
-            fs::read_to_string(&lock).unwrap().trim(),
-            second.token,
-            "and must still be the sibling's"
+        assert!(
+            try_claim_slot(dir.path(), 2, false)
+                .expect("claim")
+                .is_none(),
+            "a sibling run in this same process must not be handed a held slot"
         );
 
-        // The second's own release still works.
-        drop(second);
-        assert!(!lock.exists());
+        // And the sibling's own release does not disturb the holder: nothing in
+        // the release path touches shared state at all.
+        drop(first);
+        assert!(
+            try_claim_slot(dir.path(), 2, false)
+                .expect("claim")
+                .is_some(),
+            "released, so claimable again"
+        );
     }
 
     #[test]
-    fn releasing_a_slot_never_removes_a_lock_that_is_no_longer_ours() {
-        // Release used to unlink unconditionally, so a slot whose lock had been
-        // replaced by another run's claim had that claim deleted when the first
-        // run finished — while the second run's VM and broker were still live on
-        // the slot's addresses.
+    fn releasing_a_slot_leaves_the_lockfile_in_place() {
+        // Release closes the descriptor and stops there. Unlinking would reopen
+        // the race the lock exists to close: between the unlink and the next
+        // claimant's open, a third party can create the same path, and two holders
+        // then hold two inodes under one name.
         let dir = tempfile::tempdir().expect("tempdir");
         let slot = try_claim_slot(dir.path(), 5, false)
             .expect("claim")
             .expect("slot 5 is free");
         let lock = lock_path_in(dir.path(), 5);
-        fs::write(&lock, "999999").expect("another claimer's pid");
+        assert!(lock.exists());
         drop(slot);
-        assert!(
-            lock.exists(),
-            "the other claimer's lock must have survived our release"
-        );
+        assert!(lock.exists(), "the lockfile is durable, the lock is not");
+        assert_eq!(fs::read(&lock).expect("read lock").len(), 0, "no contents");
     }
 
     #[test]
@@ -1188,7 +1044,6 @@ mod tests {
 
         // Releasing slot 0 (drop) frees it; the next claim reuses the lowest free.
         drop(a);
-        assert!(!lock_path_in(root, 0).exists(), "drop must unlink the lock");
         let c = claim_range_in(root, 0, 3, false).unwrap();
         assert_eq!(c.index(), 0, "lowest free slot reused after release");
 
@@ -1207,44 +1062,108 @@ mod tests {
     }
 
     #[test]
-    fn sweep_reclaims_dead_owner_then_claim_succeeds() {
+    fn a_lockfile_nobody_holds_does_not_cost_a_slot() {
+        // Crash recovery, which is now entirely the kernel's job. What a `kill -9`
+        // leaves behind is an unlocked lockfile — indistinguishable on disk from
+        // one a clean release left, which is the design: the file's existence has
+        // never been the claim, and now nothing about the file is. A single-slot
+        // pool would be permanently exhausted if it were.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-
-        // Forge a lock owned by a pid that cannot exist (above any pid_max).
-        let stale = lock_path_in(root, 0);
-        fs::write(&stale, "999999999").unwrap();
-        assert!(lock_is_stale(&stale), "a dead-pid lock must read as stale");
-
-        // A single-slot pool would be exhausted unless the stale lock is reclaimed.
-        let reclaimed = sweep_stale_in(root).unwrap();
-        assert_eq!(reclaimed, 1);
-        assert!(!stale.exists());
+        fs::write(lock_path_in(root, 0), "").unwrap();
 
         let s = claim_range_in(root, 0, 1, false).unwrap();
         assert_eq!(s.index(), 0);
     }
 
     #[test]
-    fn live_lock_is_not_reclaimed() {
+    fn a_lockfile_left_by_an_older_isopod_is_claimable_despite_its_contents() {
+        // 0.10.0 wrote a bare pid and 0.11.0 wrote `<pid> <nonce>`. Neither is read
+        // any more, and an upgrade must not strand a slot on bytes it once parsed —
+        // including bytes that name a pid this host really is running.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Our own pid is alive, so this lock must survive a sweep.
-        let live = lock_path_in(root, 0);
-        fs::write(&live, format!("{}", std::process::id())).unwrap();
-        assert!(!lock_is_stale(&live));
-        assert_eq!(sweep_stale_in(root).unwrap(), 0);
-        assert!(live.exists());
+        fs::write(lock_path_in(root, 0), format!("{} 0", std::process::id())).unwrap();
+        fs::write(lock_path_in(root, 1), "999999999").unwrap();
+
+        let s = claim_range_in(root, 0, 4, false).unwrap();
+        assert_eq!(s.index(), 0, "an unheld lock is free whatever it says");
+    }
+
+    /// Age `path` by `secs`, so a test can push a lockfile past any grace period
+    /// the claiming code might apply without sleeping for it.
+    fn backdate(path: &Path, secs: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+        let t = libc::timeval {
+            tv_sec: i64::try_from(now).expect("epoch seconds fit an i64") - secs,
+            tv_usec: 0,
+        };
+        let times = [t, t];
+        let c = CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL");
+        // SAFETY: `c` is a valid NUL-terminated path and `times` is the
+        // two-element array `utimes` expects; both outlive the call.
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "utimes {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
     }
 
     #[test]
-    fn claim_reclaims_stale_lock_inline() {
-        let dir = tempfile::tempdir().unwrap();
+    fn a_held_slot_is_still_held_after_any_amount_of_time_passes() {
+        // THE 0.11.0 regression. The claim wrote `<pid> <nonce>` into the lockfile
+        // while the staleness parser still read it as a bare pid, so every real
+        // lock took the "does not parse" branch and was declared stale the moment
+        // it aged past a five-second write grace — with its owner alive and its VM
+        // on the tap. The next claim then took an occupied slot and the loser's
+        // firecracker died on "Open tap device failed ... resource busy".
+        //
+        // Age is not evidence of anything. A slot is held for exactly as long as
+        // its owner holds the lock, whether that is nine seconds or nine hours.
+        let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        // Slot 0 held by a dead pid; claim must reclaim it rather than skip to 1.
-        fs::write(lock_path_in(root, 0), "999999999").unwrap();
-        let s = claim_range_in(root, 0, 4, false).unwrap();
-        assert_eq!(s.index(), 0, "stale slot 0 reclaimed inline");
+
+        let held = claim_range_in(root, 0, 4, false).expect("first claim");
+        assert_eq!(held.index(), 0);
+        backdate(&lock_path_in(root, 0), 3600);
+
+        assert!(
+            try_claim_slot(root, 0, false).expect("re-claim").is_none(),
+            "slot 0 has a live owner and must read as busy however old its lock is"
+        );
+        let next = claim_range_in(root, 0, 4, false).expect("second claim");
+        assert_ne!(
+            next.index(),
+            held.index(),
+            "the second claim landed on the slot the first is still using"
+        );
+        let _ = (&held, &next);
+    }
+
+    #[test]
+    fn staggered_claims_in_one_process_land_on_different_slots() {
+        // The live reproduction, in miniature: two runs started nine seconds apart
+        // under one MCP server. Both succeeded when they were milliseconds apart
+        // and collided when they were not, which is why every existing test passed
+        // through the regression.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let first = claim_range_in(root, 0, 4, false).expect("run 1");
+        backdate(&lock_path_in(root, first.index()), 9);
+        let second = claim_range_in(root, 0, 4, false).expect("run 2");
+
+        assert_ne!(first.index(), second.index(), "two runs, two slots");
+        assert_ne!(first.tap_name(), second.tap_name());
+        assert_ne!(first.guest_ip(), second.guest_ip());
     }
 
     #[test]

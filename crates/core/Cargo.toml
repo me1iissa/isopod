@@ -26,6 +26,10 @@ reqwest = { workspace = true, features = ["blocking", "query"] }
 # Crate-local (not in the workspace set): S3 ListObjectsV2 XML parsing + home dir.
 quick-xml = { version = "0.39", features = ["serialize"] }
 dirs = "6"
+# `flock` for the network-slot claim, and `kill` for the orphan reaper. Matches
+# the raw-libc style of the sibling crates (no `nix`); already in the lockfile
+# via isopod-fc, so this adds no crate and no compile time.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

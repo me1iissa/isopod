@@ -868,6 +868,7 @@ dependencies = [
  "hex",
  "isopod-fc",
  "isopod-proto",
+ "libc",
  "quick-xml",
  "reqwest",
  "serde",

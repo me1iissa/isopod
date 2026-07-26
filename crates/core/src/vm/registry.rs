@@ -251,13 +251,26 @@ fn owner_token_alive(token: &str) -> bool {
     }
 }
 
-/// SIGKILL a pid via the `kill` binary (core takes no `libc` dependency).
+/// SIGKILL a pid.
+///
+/// Directly, not by spawning `/bin/kill`: that was here only because core once
+/// took no `libc` dependency, and it made the reaper depend on a binary being on
+/// `PATH` and on resolving to the real one.
 fn kill_pid(pid: i32) -> std::io::Result<()> {
     eprintln!("vm: reaping orphaned firecracker pid {pid}");
-    std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .map(|_| ())
+    // SAFETY: `kill` is a plain syscall wrapper touching no memory. A positive
+    // pid signals exactly that process (never a group), and the caller has
+    // already established it is a firecracker this isopod started.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    // Already gone between the liveness check and here: the reaper got what it
+    // wanted, so this is success.
+    match e.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        _ => Err(e),
+    }
 }
 
 /// Read one VM directory into a record, tolerating missing/corrupt meta.
