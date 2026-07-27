@@ -309,8 +309,8 @@ MUTATIONS = [
     Mutation(
         name="commit-always-allows-skew",
         file="crates/core/src/vm/mod.rs",
-        old="    let meta = stage::commit(scratch, label, parent.as_deref(), base, *allow_base_skew)?;",
-        new="    let meta = stage::commit(scratch, label, parent.as_deref(), base, true)?;",
+        old="        base,\n        *allow_base_skew,\n    )?;",
+        new="        base,\n        true,\n    )?;",
         defect=(
             "Every commit behaves as though the operator had opted into base "
             "skew, so a mixed-build chain is recorded by an ordinary run. The "
