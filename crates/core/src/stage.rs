@@ -547,7 +547,7 @@ pub(crate) fn commit_in(
     Ok(meta)
 }
 
-fn list_in(root: &Path) -> Result<Vec<StageMeta>> {
+pub(crate) fn list_in(root: &Path) -> Result<Vec<StageMeta>> {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         // A never-populated store is an empty list, not an error.

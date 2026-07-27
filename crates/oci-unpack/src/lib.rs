@@ -954,10 +954,16 @@ fn remove_child(dir: &Dir, name: &OsStr, limits: &Limits, depth: usize) -> std::
         Err(e) if is(&e, libc::ENOENT) => Ok(()),
         // Linux answers EISDIR; POSIX permits EPERM.
         Err(e) if is(&e, libc::EISDIR) || is(&e, libc::EPERM) => {
+            // Before the open, not after. `finish` applies the image's own
+            // restrictive directory modes just before the promoting rename, so
+            // if that rename fails this teardown has to remove a tree it has
+            // already made unreadable (0o000 cannot be opened) or unwritable
+            // (0o500 can be listed but not emptied). Chmodding the child from
+            // its parent is the only order that works for both, and without it
+            // a refusal could leave behind exactly the tree invariant 9 says
+            // never survives.
+            let _ = dir.chmod_child(name, 0o700);
             let sub = dir.open_dir(name)?;
-            // A directory the image made unreadable to its owner still has to be
-            // removable, or a refusal could not clean up after itself.
-            let _ = sub.chmod(0o700);
             for child in sub.entries()? {
                 remove_child(&sub, &child, limits, depth + 1)?;
             }

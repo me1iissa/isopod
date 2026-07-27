@@ -229,28 +229,7 @@ pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutc
         .context("fsync image")?;
     let (_, tmp_path) = tmp_img.keep().context("finalizing temp image")?;
 
-    // Invalidate the old stamp BEFORE the image it describes is replaced. These
-    // two are one publish in two steps, and the order decides what a failure
-    // between them leaves behind: sidecar-first leaves a new image vouched for
-    // by the old sidecar, which reads as verified and is not — a stage forks
-    // onto a root it was never built over with no warning at all. Removing the
-    // stamp first makes the same failure land on "unstamped", which the run path
-    // reports as a comparison it could not make.
-    let sidecar = image_meta_path(&dest);
-    match std::fs::remove_file(&sidecar) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e)
-                .context(format!("clearing the stale stamp {}", sidecar.display())))
-        }
-    }
-    std::fs::rename(&tmp_path, &dest)
-        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), dest.display()))?;
-
-    // Stamp the build-metadata sidecar so the run path can refuse a
-    // proto-stale image *before* any VM work (finding #17).
-    write_image_meta(&dest, flavor)?;
+    publish_image(&tmp_path, &dest, |img| write_image_meta(img, flavor))?;
 
     outcome_for(&dest, flavor, false)
 }
@@ -356,6 +335,41 @@ fn host_agent_sha256() -> Option<&'static str> {
             paths::sha256_file(&agent).ok()
         })
         .as_deref()
+}
+
+/// Move a freshly built image into place and stamp it, in the one order that is
+/// safe to fail in.
+///
+/// The image and its sidecar are a single publish in two steps, and which step
+/// goes first decides what a failure between them leaves behind. Stamping after
+/// the rename — the obvious order — leaves a *new* image vouched for by the
+/// *old* sidecar whenever anything goes wrong in between: that reads as verified
+/// and is not, and the pre-boot check then passes a stage onto a root it was
+/// never built over, silently. Clearing the stamp first makes the same failure
+/// land on "unstamped", which the run path reports as a comparison it could not
+/// make.
+///
+/// `stamp` is a parameter so the failure can be injected in a test; production
+/// always passes [`write_image_meta`].
+fn publish_image(
+    tmp_path: &Path,
+    dest: &Path,
+    stamp: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let sidecar = image_meta_path(dest);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("clearing the stale stamp {}", sidecar.display())))
+        }
+    }
+    std::fs::rename(tmp_path, dest)
+        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), dest.display()))?;
+    // Stamp so the run path can refuse a proto-stale image *before* any VM work
+    // (finding #17).
+    stamp(dest)
 }
 
 /// Sidecar path for an image: `<image>.meta.json`.
@@ -1709,38 +1723,57 @@ mod tests {
     /// The image and its stamp are one publish in two steps, and the order is
     /// the whole guarantee: if the stamp survives a failed rebuild, it vouches
     /// for an image that is no longer there, and the pre-boot check passes on a
-    /// root the stage was never built over. Clearing it first makes the same
-    /// failure land on "unstamped", which is reported rather than believed.
+    /// root the stage was never built over.
+    ///
+    /// This drives the real publish and fails the stamping step, because the
+    /// property is about the *code's* ordering — a test that performs the steps
+    /// itself only asserts that the test knows the right order.
     #[test]
-    fn a_stamp_never_outlives_the_image_it_describes() {
+    fn a_failed_stamp_never_leaves_the_old_one_vouching_for_a_new_image() {
         let dir = tempfile::tempdir().unwrap();
-        let img = dir.path().join("base.sqfs");
-        std::fs::write(&img, b"first build").unwrap();
-        let sidecar = image_meta_path(&img);
-        std::fs::write(
-            &sidecar,
-            serde_json::to_vec_pretty(&ImageMeta {
-                flavor: "base-sqfs".into(),
-                proto_version: None,
-                agent_sha256: None,
-                sha256: paths::sha256_file(&img).unwrap(),
-                built_unix: 0,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let stamped_first = read_image_meta(&img).unwrap().unwrap().sha256;
+        let dest = dir.path().join("base.sqfs");
+        std::fs::write(&dest, b"first build").unwrap();
+        write_image_meta(&dest, RootfsFlavor::DevBusybox).unwrap();
+        let first_stamp = read_image_meta(&dest).unwrap().unwrap().sha256;
 
-        // Replace the image the way a rebuild does, having cleared the stamp
-        // first. Whatever happens next, no sidecar claims this file.
-        std::fs::remove_file(&sidecar).unwrap();
-        std::fs::write(&img, b"second build, and the stamping step never runs").unwrap();
+        let tmp = dir.path().join("incoming.sqfs");
+        std::fs::write(&tmp, b"second build, entirely different bytes").unwrap();
+        let err = publish_image(&tmp, &dest, |_| bail!("stamping failed"))
+            .expect_err("the injected failure must surface");
+        assert!(err.to_string().contains("stamping failed"));
 
-        assert!(
-            read_image_meta(&img).unwrap().is_none(),
-            "a replaced image must read as unstamped, never as the old stamp"
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"second build, entirely different bytes",
+            "the image was replaced, which is what makes the stale stamp dangerous"
         );
-        assert_ne!(stamped_first, paths::sha256_file(&img).unwrap());
+        assert!(
+            read_image_meta(&dest).unwrap().is_none(),
+            "the old stamp must not survive the image it described"
+        );
+        assert_ne!(first_stamp, paths::sha256_file(&dest).unwrap());
+    }
+
+    /// The success path still ends stamped, and stamped for the new bytes.
+    #[test]
+    fn a_successful_publish_stamps_the_image_it_just_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("rootfs-dev-busybox.ext4");
+        std::fs::write(&dest, b"old").unwrap();
+        write_image_meta(&dest, RootfsFlavor::DevBusybox).unwrap();
+
+        let tmp = dir.path().join("incoming.ext4");
+        std::fs::write(&tmp, b"new bytes").unwrap();
+        publish_image(&tmp, &dest, |img| {
+            write_image_meta(img, RootfsFlavor::DevBusybox)
+        })
+        .unwrap();
+
+        assert_eq!(
+            read_image_meta(&dest).unwrap().unwrap().sha256,
+            paths::sha256_file(&dest).unwrap(),
+            "the stamp describes the image that is actually there"
+        );
     }
 
     /// A torn sidecar parses as no sidecar, which silently turns "does not

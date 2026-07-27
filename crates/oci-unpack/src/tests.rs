@@ -956,3 +956,26 @@ fn the_running_total_sums_the_layers() {
     assert_eq!(total.whiteouts_applied, 1);
     assert_eq!(total.setuid_paths, vec![("a".to_string(), 0o4755)]);
 }
+
+#[test]
+fn the_teardown_can_remove_a_tree_the_image_locked() {
+    // `finish` applies the image's restrictive directory modes and *then*
+    // renames. If the rename fails — a destination that appeared concurrently,
+    // a full filesystem — the teardown has to remove a tree it has just made
+    // unreadable and unwritable, or invariant 9 holds for every refusal except
+    // the one that happens last. Exercised directly, because arranging a failed
+    // rename inside a test would prove less than checking the property does.
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("locked/inner")).expect("mkdir");
+    std::fs::write(tmp.path().join("locked/inner/f"), b"x").expect("write");
+    // 0o000 cannot be opened at all; 0o500 can be listed but not emptied.
+    for (rel, mode) in [("locked/inner", 0o000), ("locked", 0o500)] {
+        std::fs::set_permissions(tmp.path().join(rel), std::fs::Permissions::from_mode(mode))
+            .expect("chmod");
+    }
+    let root = crate::sys::Dir::open_root(tmp.path()).expect("open root");
+    remove_child(&root, std::ffi::OsStr::new("locked"), &Limits::default(), 0)
+        .expect("the teardown must be able to remove what finish locked");
+    assert!(!tmp.path().join("locked").exists());
+}

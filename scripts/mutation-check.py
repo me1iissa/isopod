@@ -265,7 +265,13 @@ MUTATIONS = [
         name="base-skew-opt-in-covers-flavors",
         file="crates/core/src/vm/mod.rs",
         old="        v @ stage::BaseCheck::WrongFlavor(_) => bail!(\"{}\", v.message().unwrap_or_default()),",
-        new="        v @ stage::BaseCheck::WrongFlavor(_) if !allow_skew => bail!(\"{}\", v.message().unwrap_or_default()),",
+        new=(
+            "        v @ stage::BaseCheck::WrongFlavor(_) if allow_skew => {\n"
+            "            eprintln!(\"{}\", v.message().unwrap_or_default());\n"
+            "            Ok(())\n"
+            "        }\n"
+            "        v @ stage::BaseCheck::WrongFlavor(_) => bail!(\"{}\", v.message().unwrap_or_default()),"
+        ),
         defect=(
             "The opt-out for a rebuilt base starts excusing a different base "
             "*flavor* too, so busybox layers boot on the Alpine root. The escape "
@@ -315,8 +321,8 @@ MUTATIONS = [
     Mutation(
         name="stale-stamp-outlives-its-image",
         file="crates/core/src/image/rootfs.rs",
-        old="    let sidecar = image_meta_path(&dest);",
-        new="    let sidecar = image_meta_path(&dest.with_extension(\"never\"));",
+        old="    let sidecar = image_meta_path(dest);\n    match std::fs::remove_file(&sidecar) {",
+        new="    let sidecar = image_meta_path(&dest.with_extension(\"never\"));\n    match std::fs::remove_file(&sidecar) {",
         defect=(
             "A rebuild stops clearing the old stamp before replacing the image, "
             "so a failure between the two leaves a sidecar vouching for an image "

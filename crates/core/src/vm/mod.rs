@@ -2202,6 +2202,18 @@ fn maybe_commit_stage(
     opts: &RunOptions,
     driven: &Result<ExecResult>,
 ) -> Result<Option<StageMeta>> {
+    maybe_commit_stage_in(&paths::stages_dir()?, disk, opts, driven)
+}
+
+/// [`maybe_commit_stage`] against an explicit stage store, so every branch —
+/// including whether the run's base-skew opt-in actually reaches the commit —
+/// is exercisable without `$ISOPOD_HOME`.
+fn maybe_commit_stage_in(
+    stages_root: &Path,
+    disk: &DiskConfig,
+    opts: &RunOptions,
+    driven: &Result<ExecResult>,
+) -> Result<Option<StageMeta>> {
     let DiskConfig::Stage {
         scratch,
         parent,
@@ -2246,7 +2258,14 @@ fn maybe_commit_stage(
     // fresh environment read: a run allowed to start across a rebuilt base must
     // be allowed to save what it produced, or rebasing a stage onto a new image
     // would be impossible.
-    let meta = stage::commit(scratch, label, parent.as_deref(), base, *allow_base_skew)?;
+    let meta = stage::commit_in(
+        stages_root,
+        scratch,
+        label,
+        parent.as_deref(),
+        base,
+        *allow_base_skew,
+    )?;
     eprintln!(
         "run: committed stage {} ({}) labelled {:?}",
         meta.stage_id, meta.name, meta.label
@@ -3233,6 +3252,80 @@ mod tests {
             } => assert!(*allow_base_skew),
             _ => panic!("expected the overlay topology"),
         }
+    }
+
+    /// The opt-in is decided once, at plan time, and must arrive at the commit
+    /// unchanged. Hardcoding it to `true` at the commit site made every run
+    /// behave as though the operator had opted in — and the whole suite stayed
+    /// green, because nothing drove this function.
+    #[test]
+    fn the_commit_honours_the_plan_s_opt_in_rather_than_its_own() {
+        let home = tempfile::tempdir().unwrap();
+        let stages = home.path().join("stages");
+        std::fs::create_dir_all(&stages).unwrap();
+
+        // A parent stamped against one image, and a run that booted a different
+        // build of it — the state the opt-in exists to govern.
+        let parent = stage_in(
+            &stages,
+            home.path(),
+            "parent",
+            None,
+            Some("1111aaaa2222bbbb"),
+        );
+        let scratch = home.path().join("scratch.ext4");
+        std::fs::write(&scratch, b"what this run produced").unwrap();
+
+        let disk = |allow: bool| DiskConfig::Stage {
+            base_sqfs: PathBuf::from("/i/base.sqfs"),
+            base: stage::BaseId::new("base-sqfs", Some("9999ffff8888eeee".into())),
+            layer_paths: vec![],
+            scratch: scratch.clone(),
+            parent: Some(parent.stage_id.clone()),
+            allow_base_skew: allow,
+        };
+        let opts = RunOptions {
+            egress: None,
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            timeout_s: 60,
+            flavor: RootfsFlavor::DevAgent,
+            keep: false,
+            network: false,
+            stage: Some("parent".into()),
+            commit_as: Some("child".into()),
+            base: RootfsFlavor::BaseSqfs,
+            stdin: None,
+            vcpus: DEFAULT_VCPUS,
+            mem_mib: DEFAULT_MEM_MIB,
+            scratch_mib: None,
+            copy_out: Vec::new(),
+        };
+        let ok = Ok(ExecResult {
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            exec_ms: 1,
+            stdout: StreamCapture::from_bytes(b"", 0),
+            stderr: StreamCapture::from_bytes(b"", 0),
+            copied: Vec::new(),
+        });
+
+        let err = maybe_commit_stage_in(&stages, &disk(false), &opts, &ok)
+            .expect_err("without the opt-in, the rebuilt base refuses the commit");
+        assert!(err.to_string().contains("refusing to stack"), "{err}");
+        assert_eq!(
+            stage::list_in(&stages).unwrap().len(),
+            1,
+            "nothing was recorded"
+        );
+
+        let saved = maybe_commit_stage_in(&stages, &disk(true), &opts, &ok)
+            .expect("with the opt-in, the work is saved")
+            .expect("a stage was committed");
+        assert_eq!(saved.base_sha256.as_deref(), Some("9999ffff8888eeee"));
+        assert_eq!(saved.parent.as_deref(), Some(parent.stage_id.as_str()));
     }
 
     /// One unstamped link used to launder every ancestor behind it: the fork

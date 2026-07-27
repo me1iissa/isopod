@@ -203,6 +203,22 @@ impl Dir {
         Ok(())
     }
 
+    /// Set a child **directory's** mode.
+    ///
+    /// `fchmodat` follows a symbolic link in the final component, so this is
+    /// only ever called where the caller has already established that the child
+    /// is a real directory — `unlinkat` answering `EISDIR`, which a link would
+    /// not produce because it would simply have been removed.
+    pub fn chmod_child(&self, name: &OsStr, mode: u32) -> io::Result<()> {
+        let c = cname(name)?;
+        // SAFETY: `self.0` is an open directory descriptor and `c` is valid.
+        let rc = unsafe { libc::fchmodat(self.0.as_raw_fd(), c.as_ptr(), mode as libc::mode_t, 0) };
+        if rc < 0 {
+            return last_err();
+        }
+        Ok(())
+    }
+
     /// Child names, excluding `.` and `..`.
     ///
     /// Reads through a duplicate of the descriptor because `fdopendir(3)` takes
