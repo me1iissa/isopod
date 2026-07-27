@@ -125,7 +125,7 @@ pub struct BrokerConfig {
 /// Parameters for `RequestOp::Exec`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecRequest {
-    /// Program + arguments (argv[0] is the program; PATH is searched).
+    /// Program + arguments (`argv[0]` is the program; PATH is searched).
     pub argv: Vec<String>,
     /// Extra environment variables appended to the agent's baseline env.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

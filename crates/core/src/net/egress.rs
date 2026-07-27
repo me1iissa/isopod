@@ -54,7 +54,7 @@ pub enum EgressError {
     /// An empty pattern, name or CIDR.
     #[error("empty host pattern")]
     Empty,
-    /// The name exceeds [`MAX_NAME_LEN`] or a label exceeds [`MAX_LABEL_LEN`].
+    /// The name exceeds `MAX_NAME_LEN` or a label exceeds `MAX_LABEL_LEN`.
     #[error("host name is too long ({0} bytes, max {MAX_NAME_LEN})")]
     TooLong(usize),
     /// A label was empty, over-long, or hyphen-anchored.
@@ -127,7 +127,7 @@ impl SafeName {
     /// emits only hex digits, dots and colons, none of which can carry a
     /// terminal escape or prompt text.
     ///
-    /// This does not go through [`normalize_name`], which would reject the
+    /// This does not go through `normalize_name`, which would reject the
     /// colons in an IPv6 literal and record a perfectly good address as
     /// `<invalid:N>`.
     #[must_use]
@@ -143,7 +143,7 @@ impl SafeName {
 
     /// Whether this holds a real host name rather than the placeholder.
     ///
-    /// The placeholder contains `<`, which [`normalize_name`] rejects, so it can
+    /// The placeholder contains `<`, which `normalize_name` rejects, so it can
     /// never be produced by a valid parse and never matches a rule.
     #[must_use]
     pub fn is_valid(&self) -> bool {

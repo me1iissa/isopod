@@ -30,7 +30,7 @@
 //! Instead the overlay `upper`/`work` live on a **tmpfs** mounted at `/overlay`,
 //! captured inside the memory snapshot, so all writes land in guest RAM (bounded
 //! by `mem_mib`). The overlay is base-only (`lowerdir=/`). Steps 3–4 are shared
-//! with the drive-backed path via [`assemble_overlay_and_pivot`].
+//! with the drive-backed path via `assemble_overlay_and_pivot`.
 //!
 //! Absent both keys the agent boots exactly as before (a writable ext4 root needs
 //! no overlay).

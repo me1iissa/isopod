@@ -522,7 +522,7 @@ impl Broker {
     }
 
     /// Every recorded decision, plus the total observed (which exceeds the
-    /// returned length when [`MAX_RECORDED_EVENTS`] was hit).
+    /// returned length when `MAX_RECORDED_EVENTS` was hit).
     #[must_use]
     pub fn events(&self) -> (Vec<EgressEvent>, u64) {
         self.policy.recorder.snapshot()

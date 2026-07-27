@@ -179,7 +179,7 @@ struct RunArgs {
     deny_egress: bool,
     /// Inject a credential declared in ~/.isopod/credentials.json, by alias
     /// (repeatable). The run can spend it without ever holding it: the guest
-    /// asks the endpoint at $ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>, and the
+    /// asks the endpoint at `$ISOPOD_CREDENTIAL_ENDPOINT/<alias>/<path>`, and the
     /// host attaches the token only if the request matches that credential's
     /// `allow` list. Also switches the run to filtered egress, so a credential
     /// never comes with unfiltered network. Requires `sudo isopod setup`

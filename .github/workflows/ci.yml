@@ -120,3 +120,18 @@ jobs:
       # ones included.
       - name: Compile the live (/dev/kvm) tests
         run: cargo test --workspace --locked --no-run
+
+      # Broken intra-doc links shipped twice before this gate existed, because
+      # `cargo doc` is the one toolchain command CI never ran. Documentation that
+      # links to a private item, or to a path that does not resolve, is a claim
+      # the reader cannot follow.
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+      # The tests above prove the code passes them. This proves they would
+      # notice if it stopped: a fixed set of deliberate breakages, each one a
+      # defect this project actually shipped, that must make the suite fail.
+      # Every review pass over 0.11.0 found a test that covered the branch that
+      # already worked; this is the gate for that class.
+      - name: Mutations
+        run: python3 scripts/mutation-check.py

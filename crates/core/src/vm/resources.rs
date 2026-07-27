@@ -49,7 +49,7 @@ pub const MAX_VCPUS: u32 = 32;
 
 /// A resolved, host-validated per-VM resource allocation.
 ///
-/// Constructed only via [`resolve`] / [`resolve_for_host`], so an instance is a
+/// Constructed only via `resolve` / `resolve_for_host`, so an instance is a
 /// proof that the values fit the host. See the module docs for the M6 warm-pool
 /// cache-key role that motivates the `Hash` derive and [`Self::cache_fragment`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -765,12 +765,12 @@ pub struct RunOptions {
     /// Bytes written to the command's stdin (then closed). `None` = no stdin.
     pub stdin: Option<Vec<u8>>,
     /// Requested guest vCPU count. Validated against the host CPU count (and
-    /// Firecracker's 1-or-even rule) by [`resources::resolve`]; an out-of-range
+    /// Firecracker's 1-or-even rule) by `resources::resolve`; an out-of-range
     /// value is a hard error, never silently clamped. Use [`DEFAULT_VCPUS`] for
     /// the default.
     pub vcpus: u32,
     /// Requested guest memory in MiB. Validated against the host's free RAM
-    /// (leaving headroom) by [`resources::resolve`]; an out-of-range value is a
+    /// (leaving headroom) by `resources::resolve`; an out-of-range value is a
     /// hard error, never silently clamped. Use [`DEFAULT_MEM_MIB`] for the
     /// default.
     pub mem_mib: u32,
@@ -799,7 +799,7 @@ pub struct RunOptions {
 ///
 /// Kept as strings so the surface layers (CLI, MCP) stay free of core types and
 /// a bad pattern is reported with the caller's own spelling. Parsed into
-/// [`net::egress::HostRule`] by [`parse_egress_rules`] before boot.
+/// [`net::egress::HostRule`] by `parse_egress_rules` before boot.
 ///
 /// # Why `inject` lives here and not beside it
 ///
@@ -888,10 +888,10 @@ pub struct RunReport {
     /// Captured stderr head (lossy UTF-8, capped at 64 KiB).
     pub stderr: String,
     /// `true` if stdout exceeded the inline cap (the log holds the stream up to
-    /// [`EXEC_LOG_CAP`](crate::agent::EXEC_LOG_CAP) bytes).
+    /// [`crate::agent::EXEC_LOG_CAP`] bytes).
     pub stdout_truncated: bool,
     /// `true` if stderr exceeded the inline cap (the log holds the stream up to
-    /// [`EXEC_LOG_CAP`](crate::agent::EXEC_LOG_CAP) bytes).
+    /// [`crate::agent::EXEC_LOG_CAP`] bytes).
     pub stderr_truncated: bool,
     /// Total stdout bytes produced (regardless of the inline cap).
     pub stdout_bytes: u64,

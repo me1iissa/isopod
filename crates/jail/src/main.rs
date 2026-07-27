@@ -1,7 +1,7 @@
 //! `isopod-jail` — a rootless microjail *launcher* used as a command prefix.
 //!
 //! `isopod-core` prepends this binary to the Firecracker argv (via the existing
-//! [`command_prefix`] seam) when `ISOPOD_JAIL=1`. It wraps the VMM in a second
+//! `command_prefix` seam) when `ISOPOD_JAIL=1`. It wraps the VMM in a second
 //! isolation layer with no privileged host component:
 //!
 //! 1. **Join a delegated cgroup** (`--cgroup`), as the real user, *before* any
@@ -20,7 +20,7 @@
 //! 4. **`exec` Firecracker** as PID 1 of the new pid namespace.
 //!
 //! A thin supervisor stays in the host pid namespace as the process the parent
-//! [`FcProcess`] tracks; it forwards termination to the jailed child, reaps it,
+//! `FcProcess` tracks; it forwards termination to the jailed child, reaps it,
 //! and proxies its exit status. No `CLONE_NEWNET`: Firecracker must stay in the
 //! root network namespace so the existing tap + nftables fabric works unchanged;
 //! the user namespace already removes host privilege from an escape.
@@ -28,8 +28,8 @@
 //! Relevant public specs: `user_namespaces(7)`, `pid_namespaces(7)`,
 //! `mount_namespaces(7)`, `pivot_root(2)`, `cgroups(7)`, `capabilities(7)`.
 //!
-//! [`command_prefix`]: (the `FcProcessConfig` builder in `isopod-fc`)
-//! [`FcProcess`]: (the supervised Firecracker handle in `isopod-fc`)
+//! `command_prefix`: (the `FcProcessConfig` builder in `isopod-fc`)
+//! `FcProcess`: (the supervised Firecracker handle in `isopod-fc`)
 
 mod sys;
 

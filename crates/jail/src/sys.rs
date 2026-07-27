@@ -285,7 +285,7 @@ pub fn install_child_forwarding(child: i32) {
 /// same exit code, or — if it was killed by a signal — re-raise that signal on
 /// ourselves so the supervisor's own status reflects it. Never returns.
 ///
-/// This makes the jail transparent to the parent [`FcProcess`]: a Firecracker
+/// This makes the jail transparent to the parent `FcProcess`: a Firecracker
 /// that dies before its API socket appears still surfaces as an early exit.
 pub fn wait_and_proxy(child: i32) -> ! {
     let mut status: libc::c_int = 0;
