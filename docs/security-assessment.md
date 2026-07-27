@@ -165,8 +165,8 @@ amplifiers found by static review:
 global governor. With 8 slots, up to 8 concurrent VMs × up to 4096 MiB (= 32 GiB)
 can be requested against a 5.9 GiB host.
 
-- **Impact**: concurrent sandboxes over-commit host RAM → OOM. (The session
-  handover already noted memory pressure likely killing a co-running agent.)
+- **Impact**: concurrent sandboxes over-commit host RAM → OOM. (Memory pressure
+  on this host has already been observed killing a co-running process.)
 - **Fix**: check `MemAvailable` at slot-claim time, and/or a global running-VM
   memory budget, and/or cgroup memory caps (via the jailer, F2).
 
