@@ -143,9 +143,11 @@ ls ~/.isopod/net/                     # empty slot-<i>.lock files, created lazil
 # free lock does NOT mean a usable slot: `kill -9` of the supervisor leaves its
 # Firecracker running and still holding the tap, so this can report "free" while
 # the slot is unusable. Do not treat it as a health check.
-#   (`-E 1` and the redirect keep it from creating the lockfile at your umask —
-#    plain `flock ... true` will create a 0644 one where isopod uses 0600.)
-flock -n -E 1 ~/.isopod/net/slot-0.lock true 2>/dev/null && echo "slot 0's lock is free"
+#   NOTE: flock(1) always opens with O_CREAT, so it CREATES the lockfile if it is
+#   absent — at your umask (0644), where isopod creates it 0600, and claim_lock
+#   does not re-chmod a file that already exists. Guard it, or subshell a umask:
+[ -e ~/.isopod/net/slot-0.lock ] \
+  && flock -n ~/.isopod/net/slot-0.lock true && echo "slot 0's lock is free"
 
 # The SLOT comes back when the next run reaps the orphaned VMM. That is the
 # check that actually matters:

@@ -29,7 +29,7 @@
 //! The *lock* needs no sweep and no bookkeeping: the kernel drops it when the
 //! holding process dies, however it died. The *slot* is a different question —
 //! a supervisor killed with `SIGKILL` leaves its Firecracker running and still
-//! holding the tap, so callers run [`crate::vm::registry::reap_orphans`] before
+//! holding the tap, so callers run [`crate::vm::reap_orphans`] before
 //! claiming. The manifest `~/.isopod/net/slots.json` records what `setup`
 //! provisioned.
 //!
@@ -454,7 +454,7 @@ fn all_taps_present(slot_count: usize, present: impl Fn(&str) -> bool) -> Result
 /// That is not the same as the slot being usable. A supervisor killed with
 /// `SIGKILL` leaves its Firecracker alive and still holding the tap, and the
 /// lock says nothing about that. Callers are expected to run
-/// [`crate::vm::registry::reap_orphans`] first, which is what actually frees the
+/// [`crate::vm::reap_orphans`] first, which is what actually frees the
 /// tap; both of isopod's do.
 ///
 /// # Errors

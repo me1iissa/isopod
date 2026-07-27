@@ -1994,8 +1994,11 @@ fn parse_egress_rules(policy: &EgressPolicy) -> Result<Vec<net::egress::HostRule
 
 /// Claim a network slot for a networked run, requiring the one-time host setup.
 ///
-/// Claims the lowest free slot. Nothing needs reclaiming first: a slot is held
-/// by an `flock`, which the kernel releases when the owning process dies.
+/// Claims the lowest free slot. The `flock` on that slot is released by the
+/// kernel when the owning process dies, so there is no lock to reclaim — but the
+/// *slot* can still be occupied by a Firecracker orphaned from a supervisor that
+/// was killed, which is why [`run_exec`] calls [`registry::reap_orphans`] before
+/// getting here. Do not remove that call on the strength of the lock alone.
 ///
 /// # Errors
 /// If `sudo isopod setup` has not run (names the command), or every slot is in

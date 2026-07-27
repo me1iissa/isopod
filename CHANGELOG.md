@@ -133,13 +133,13 @@ overstated the code, all fixed here:
   success replaces it in one step with no half-written window. A device or a
   reader-backed FIFO is still written straight through — renaming onto `/dev/null`
   would replace the node with a regular file.
-- **Prose that claimed more than the code did**, in ten places, all introduced by
-  this release's own fixes. `docs/m4-verify.md` told an operator to conclude "slot
-  0 is free" from `flock -n`, the exact inference this release documents as false;
-  it also called the lockfiles "always present" when they are created lazily, and
-  its command created one at `0644` where isopod uses `0600`. `net.rs`'s module doc
-  and `claim()`'s contract both said crash recovery needs no step, while both
-  callers run `reap_orphans()` first for the reason the contract denied.
+- **Prose that claimed more than the code did**, in eleven places, all introduced
+  by this release's own fixes. `docs/m4-verify.md` told an operator to conclude
+  "slot 0 is free" from `flock -n`, the exact inference this release documents as
+  false; it also called the lockfiles "always present" when they are created
+  lazily. `net.rs`'s module doc, `claim()`'s contract and `claim_network()`'s —
+  the wrapper one frame above it — all said crash recovery needs no step, while
+  both callers run `reap_orphans()` first for the reason the contract denied.
   `SECURITY.md` and the CHANGELOG said `..` is "refused" when it is resolved and
   re-tested. The CLI's `--copy-out` help promised bytes "land on the path you named
   or nowhere", which the parent chain and the truncation defect both contradicted.
@@ -148,6 +148,21 @@ overstated the code, all fixed here:
   "untouched" (one whose last label is all digits is refused at startup). None of
   these was a hole; all of them were the defect class this release spent three
   commits fixing, so they are fixed rather than deferred.
+
+A **fifth** pass, over the staging fix itself, found the pattern had not stopped.
+The new "a failed copy leaves nothing behind" invariant had one hole: a malformed
+base64 chunk returned straight out of the stream loop past the cleanup, and since
+every attempt takes a fresh sequence number, a guest repeating it leaked one
+staging file per attempt rather than reusing one name — unbounded host disk, in a
+function whose neighbouring comment exists because "a malicious agent could stream
+forever and fill the host disk". The staging path now owns its own `Drop`, so the
+invariant holds for every early return rather than the ones written so far. Also
+fixed: the staging suffix could push a legal destination name past `NAME_MAX`; the
+publish half of the copy had **no test at all**, so deleting the mode mask kept the
+suite green; the `flock` line added to `docs/m4-verify.md` two commits earlier
+described flags that do not do what it said (`flock(1)` always creates the file,
+and `-E 1` is the default); and an eleventh contract, on the `claim_network()`
+wrapper, still said crash recovery needs no step.
 
 Pass 4 also produced one new **non-claim** rather than a fix. `copy_out` keeps the
 executable bit by design — a binary built in the sandbox should arrive runnable —
