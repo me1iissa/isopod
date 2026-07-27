@@ -164,6 +164,38 @@ described flags that do not do what it said (`flock(1)` always creates the file,
 and `-E 1` is the default); and an eleventh contract, on the `claim_network()`
 wrapper, still said crash recovery needs no step.
 
+A **sixth** pass found no defect in the drop guard — 24 concurrent copies with 12
+aimed at one destination left every success byte-intact and no residue, and the
+pass-5 leak is gone (five malformed chunks left five staging files before, zero
+now). What it found was one operational hazard and two false claims:
+
+- **The installed binaries predated every fix.** `~/.local/bin/isopod` and
+  `isopod-mcp` were 14 hours older than the first of them, so the running MCP
+  server — whose host-I/O root is the source tree — still held the delete
+  primitive while the repository was green and pushed. "CI green" is not "in
+  force"; the binaries are now reinstalled and a canary survives.
+- **A test docstring claimed coverage that did not exist**, contradicting a code
+  comment 1030 lines away that had it right: removing `O_NOFOLLOW` from the
+  staging open changes nothing observable, because `O_CREAT|O_EXCL` already
+  returns `EEXIST` on a symlink. Only `O_EXCL` is pinned, and the docstring now
+  says so.
+- **The `tokio::time::timeout` added to the FIFO test was inert.** `tokio::fs`
+  hands the open to `spawn_blocking`; cancelling the future does not cancel a
+  thread parked in `open(2)`, and the test runtime's drop then waits for it —
+  measured, the suite wedged identically with and without the timeout. The open
+  now runs on a detached thread joined through `recv_timeout`, and dropping
+  `O_NONBLOCK` makes the suite go red in ten seconds instead of hanging.
+
+Four mutants that survived a mutation survey are now killed: publishing before
+the rename rather than after, classifying a device as staged, dropping the
+character-boundary walk-back in the name clamp (a reachable panic — the
+destination is caller-supplied and may be multibyte), and widening the staging
+file's in-flight mode. The staging error hint no longer tells every failure that
+the directory must be writable when the cause was a leftover file or a missing
+directory. And a guest-chosen mode is no longer applied to a `Direct`
+destination: carrying the exec bit exists so an artifact isopod created arrives
+runnable, and a device or FIFO the operator already owns is not that.
+
 Pass 4 also produced one new **non-claim** rather than a fix. `copy_out` keeps the
 executable bit by design — a binary built in the sandbox should arrive runnable —
 and the default host-I/O root is the server's working directory, i.e. a project

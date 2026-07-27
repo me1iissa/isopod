@@ -885,8 +885,9 @@ enum CopyOutDest {
     /// the device or the pipe's reader as they arrive, so a copy that fails
     /// partway has already delivered what it sent. There is no way around that —
     /// a pipe cannot be un-written — and it is why the guarantee is stated for a
-    /// *file* destination rather than for `copy_out` as a whole. `set_permissions`
-    /// still fires on this arm, so a guest-chosen mode reaches the node itself.
+    /// *file* destination rather than for `copy_out` as a whole. The guest's mode
+    /// is **not** applied on this arm — the node belongs to the operator, not to
+    /// the copy — so a device or FIFO keeps the permissions it had.
     Direct { file: tokio::fs::File },
 }
 
@@ -904,14 +905,23 @@ impl CopyOutDest {
     /// its final name carrying the wrong bits.
     async fn commit(mut self, mode: u32) -> Result<(), AgentError> {
         use std::os::unix::fs::PermissionsExt;
+        // Only on the staging file, never on a `Direct` node. Carrying the mode
+        // exists so a binary built in the sandbox arrives executable — that is a
+        // property of an artifact isopod created. A device or FIFO the operator
+        // already owns is not an artifact, and letting a guest-chosen number
+        // land on it (measured: a `0600` FIFO became `0755`) is authority the
+        // feature never needed to hand over.
+        //
         // Through the descriptor, not the path. A path-based `chmod` here is a
         // second lookup of a name that was already resolved once, so a symlink
         // swapped in after the open would take the guest's mode bits —
         // including an exec bit — to a file of somebody else's choosing.
-        let _ = self
-            .file()
-            .set_permissions(std::fs::Permissions::from_mode(mode))
-            .await;
+        if matches!(self, Self::Staged { .. }) {
+            let _ = self
+                .file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .await;
+        }
         match self {
             Self::Staged {
                 file,
@@ -1056,11 +1066,29 @@ async fn stage_copy_out(dest: &Path) -> Result<CopyOutDest, AgentError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&temp)
         .await
-        .map_err(io_err(format!(
-            "creating copy-out staging file {} (the copy is staged beside the \
-             destination, so its directory has to be writable)",
-            temp.display()
-        )))?;
+        .map_err(|e| {
+            // Condition the hint on what actually went wrong. An unconditional
+            // "the directory has to be writable" is wrong for the two failures
+            // that reach normal operation — a leftover staging file from a run
+            // killed by a signal, and a destination directory that does not
+            // exist — and sends the reader after the wrong thing.
+            let hint = match e.raw_os_error() {
+                Some(libc::EACCES | libc::EROFS) => {
+                    " (the copy is staged beside the destination, so its \
+                      directory has to be writable, not just the file)"
+                }
+                Some(libc::EEXIST) => {
+                    " (something is already at that name — most likely a staging \
+                      file left by a run killed mid-copy, which is safe to delete)"
+                }
+                Some(libc::ENOENT) => " (the destination's directory does not exist)",
+                _ => "",
+            };
+            io_err(format!(
+                "creating copy-out staging file {}{hint}",
+                temp.display()
+            ))(e)
+        })?;
     Ok(CopyOutDest::Staged {
         file,
         temp: StagingFile(Some(temp)),
@@ -1941,16 +1969,29 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        // Bounded: without `O_NONBLOCK` this call blocks forever, and an
-        // assertion that hangs is a wedged CI job rather than a red test.
-        let opened = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            open_copy_out_dest(&fifo),
-        )
-        .await
-        .expect("opening a reader-less FIFO must return, not block");
+        // Bounded, and it has to be bounded from *outside* the runtime.
+        // `tokio::time::timeout` around this call is inert: `tokio::fs` hands the
+        // open to `spawn_blocking`, cancelling the future does not cancel a
+        // thread parked in `open(2)`, and `#[tokio::test]`'s runtime drop then
+        // waits for that thread forever — the timeout fires and the binary still
+        // wedges. Measured: dropping `O_NONBLOCK` wedged the suite identically
+        // with and without a `tokio::time::timeout`. A detached thread with its
+        // own runtime can be abandoned instead, because Rust does not join
+        // threads at exit, so the test goes red and the suite finishes.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = tx.send(rt.block_on(open_copy_out_dest(&probe)).is_err());
+        });
+        let opened_is_err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a reader-less FIFO must return, not block");
         assert!(
-            opened.is_err(),
+            opened_is_err,
             "a FIFO with no reader must fail rather than block"
         );
 
@@ -2073,11 +2114,14 @@ mod tests {
     /// The staging file is created `O_EXCL` and `O_NOFOLLOW`, and a destination
     /// whose name nearly fills `NAME_MAX` still works.
     ///
-    /// Both flags are the entire defence against a planted staging file, and the
-    /// name is predictable (pid plus a counter from zero), so a mutation removing
-    /// either has to fail a test. The long-name case is a regression guard: the
-    /// staging suffix costs ~21 bytes, and a destination the kernel accepts must
-    /// not become a staging name it refuses.
+    /// The name is predictable (pid plus a counter from zero), so `O_EXCL` is
+    /// what stops a planted file being adopted, and a mutation removing it has to
+    /// fail a test. `O_NOFOLLOW` is *not* pinned here and cannot be: `O_CREAT |
+    /// O_EXCL` already returns `EEXIST` on a symlink, so removing `O_NOFOLLOW`
+    /// changes no observable behaviour — see the comment in `stage_copy_out`.
+    /// The long-name case is a regression guard: the staging suffix costs ~21
+    /// bytes, and a destination the kernel accepts must not become a staging name
+    /// it refuses.
     #[tokio::test]
     async fn the_staging_file_refuses_a_planted_name_and_survives_a_long_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -2188,6 +2232,98 @@ mod tests {
         assert!(
             temp.path().file_name().unwrap().len() <= NAME_MAX,
             "staging name overflowed NAME_MAX"
+        );
+        drop(sink);
+    }
+
+    /// The branches the drop guard exists for, which nothing else reaches.
+    ///
+    /// A mutation survey over this file found four live mutants: publishing
+    /// before the rename rather than after, classifying a device as staged,
+    /// dropping the char-boundary walk-back in the name clamp, and widening the
+    /// staging file's in-flight mode. Each is asserted here.
+    #[tokio::test]
+    async fn the_staging_guard_covers_the_branches_no_other_test_reaches() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+
+        // The staging file is 0600 while in flight, whatever the artifact ends
+        // up as: it is readable only by the user who will own the result.
+        let dest = dir.path().join("artifact.bin");
+        let sink = stage_copy_out(&dest).await.expect("staging");
+        let CopyOutDest::Staged { temp, .. } = &sink else {
+            panic!("a regular-file destination must stage");
+        };
+        let staged_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            staged_mode, 0o600,
+            "staging file must not be world-readable"
+        );
+        drop(sink);
+
+        // A rename that cannot succeed must still leave nothing behind. A
+        // directory at the destination is the cleanest way to force it: `rename`
+        // refuses to replace a non-empty directory with a file.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("occupant"), b"x").unwrap();
+        let sink = stage_copy_out(&blocked).await.expect("staging");
+        let err = sink
+            .commit(0o644)
+            .await
+            .expect_err("renaming onto a non-empty directory must fail");
+        assert!(
+            format!("{err}").contains("publishing copy-out dest"),
+            "the failure must name the publish step: {err}"
+        );
+        assert!(
+            blocked.join("occupant").exists(),
+            "a failed publish must not disturb the destination"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".part"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a failed publish must unlink its staging file: {strays:?}"
+        );
+
+        // A device must not be staged: renaming onto /dev/null would replace the
+        // node with a regular file. Skipped rather than failed where /dev/null is
+        // not a character device, so the suite still runs in odd containers.
+        let devnull = Path::new("/dev/null");
+        if devnull.exists() {
+            let sink = open_copy_out_dest(devnull).await.expect("/dev/null opens");
+            assert!(
+                matches!(sink, CopyOutDest::Direct { .. }),
+                "a device destination must be written through, never staged"
+            );
+            let before = std::fs::metadata(devnull).unwrap().permissions().mode();
+            sink.commit(0o755).await.expect("commit on a device");
+            assert_eq!(
+                std::fs::metadata(devnull).unwrap().permissions().mode(),
+                before,
+                "a guest-chosen mode must not be applied to a host device node"
+            );
+        }
+
+        // A multibyte basename long enough to be clamped must be trimmed on a
+        // character boundary. Slicing mid-character panics, and the destination
+        // is caller-supplied, so this is reachable rather than theoretical.
+        let wide = dir.path().join("中".repeat(120)); // 360 bytes, all 3-byte chars
+        let sink = stage_copy_out(&wide)
+            .await
+            .expect("a multibyte name must clamp without panicking");
+        let CopyOutDest::Staged { temp, .. } = &sink else {
+            unreachable!()
+        };
+        let name = temp.path().file_name().unwrap().to_string_lossy();
+        assert!(name.len() <= NAME_MAX, "clamped name still overflows");
+        assert!(
+            std::str::from_utf8(name.as_bytes()).is_ok(),
+            "the clamp split a character"
         );
         drop(sink);
     }
