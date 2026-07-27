@@ -6,6 +6,64 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.0] — 2026-07-27
+
+Stages now record which *build* of the base image their layers were made over,
+and a fork refuses a base that has been rebuilt since. Existing stages are
+unaffected: they carry no stamp, so there is nothing to disagree with, and they
+fork exactly as they did.
+
+### Added — a stage records the base build, and a fork checks it
+
+`StageMeta` gains `base_sha256`: the content id (the image sidecar's sha256) of
+the base image the run actually booted. Every commit stamps it; `isopod stage
+list` / `stage info` and the MCP `stage_list` / `stage_info` surface it.
+
+The flavor slug was never enough to identify a base. `isopod image build-all`
+replaces `base-alpine` with a different root under the same name — new Alpine
+packages, a new guest agent — and a stage's layers are overlay **upperdirs over
+that build**. They still mount: the merge succeeds, the run starts, and the
+breakage arrives later as a chain whose contents no longer match what is beneath
+them (site-packages whose interpreter moved is the usual shape). Nothing in the
+0.11.0 run path could tell the two apart.
+
+`isopod run --stage <ref>` now compares the stage's stamp against the image on
+this host before anything boots, and refuses a mismatch, naming both content ids
+and both ways out. The comparison is also made in the store, so a stacked commit
+cannot record a chain whose layers were built over two different bases.
+
+Three cases deliberately do **not** refuse:
+
+- **A stage with no stamp** — everything committed before this release. Nothing
+  was recorded, so there is nothing to compare; it forks unchecked, as before.
+- **An image with no build sidecar.** The run warns that the check could not be
+  made and points at `isopod image build-all`, rather than refusing to boot over
+  a missing stamp.
+- **A flavor mismatch** is refused in every case, including under the override
+  below. Those layers are not stale, they belong to a different root.
+
+`ISOPOD_ALLOW_BASE_SKEW=1` overrides the refusal, loudly. It covers the commit as
+well as the boot on purpose: rebuilding the guest images changes the base of
+every stage at once, and an escape hatch that boots the fork but then refuses to
+save what it produced would strand exactly the work it exists for. Forking with
+the variable set and committing the result is the ordinary way to rebase a stage
+onto a rebuilt image — the new layer records the new image, and the old parent
+keeps its own stamp, so the store keeps the evidence either way.
+
+Three mutations were added to `scripts/mutation-check.py` covering the new
+guards: accepting any content id, dropping the stamp at commit time (which fails
+nothing at the time and silently disables the check for good), and letting the
+override excuse a flavor mismatch.
+
+### Included from the unreleased 0.11.1
+
+`scripts/mutation-check.py` itself, which asserts that a fixed set of deliberate
+breakages makes the suite fail — CI proves the tests pass, not that they check
+anything. It failed on its first run: the `copy_out` staging-name test sampled a
+single name where the clamp point depends on the pid's digit count, so whether
+it caught a mid-character split was decided by luck. That test now sweeps every
+UTF-8 width at every suffix length the real caller can produce.
+
 ## [0.11.0] — 2026-07-26
 
 A hardening release. An adversarial review of shipped 0.10.0 — 34 agents, no

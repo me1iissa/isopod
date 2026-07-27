@@ -377,6 +377,38 @@ flowchart TB
 Only a clean exit commits: a setup command that fails never leaves a broken
 stage behind.
 
+#### When the base image is rebuilt
+
+A stage's layers are overlay upperdirs over one *build* of the base image, not
+over the flavor name. `isopod image build-all` replaces that build — new Alpine
+packages, a new guest agent — and the old layers would still mount over the new
+root without complaint, leaving a chain whose contents no longer match what is
+beneath them (site-packages whose interpreter moved, a binary linked against a
+library that changed soname).
+
+Every commit records the content id of the base image it was built on
+(`base_sha256` in `stage info`), and a fork checks it before anything boots:
+
+```mermaid
+flowchart TB
+    S["stage myproj/deps<br/>base_sha256 = ccca1229…"]
+    S --> Q{"host's base-alpine<br/>image today"}
+    Q -->|"same content id"| RUN["fork boots"]
+    Q -->|"no sidecar<br/>(image predates stamping)"| WARN["warns, boots<br/>nothing to compare"]
+    Q -->|"rebuilt: different id"| REFUSE["refused before boot"]
+    REFUSE -->|"rebuild the stage on the new image"| FRESH["run --stage base, commit again"]
+    REFUSE -->|"ISOPOD_ALLOW_BASE_SKEW=1"| RUN
+```
+
+The refusal names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1`
+covers the commit as well as the boot, so the ordinary way to rebase a stage
+onto a rebuilt image is to fork it with the variable set and commit the result —
+the new layer records the new image. It does **not** excuse a different base
+*flavor*: those layers belong to another root, not an older one.
+
+Stages committed before isopod 0.12.0 carry no content id. They fork exactly as
+they did, unchecked — there is nothing recorded to disagree with.
+
 ### Sizing a VM
 
 | Flag | Default | Bounds |

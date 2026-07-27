@@ -200,6 +200,44 @@ MUTATIONS = [
         ),
         filter="net::",
     ),
+    Mutation(
+        name="base-skew-accepted",
+        file="crates/core/src/stage.rs",
+        old="    if stamped == present {",
+        new="    if true {",
+        defect=(
+            "The base check accepts any content id, so a stage forks onto an "
+            "image rebuilt since it was committed — the overlay mounts, the run "
+            "succeeds, and the chain no longer matches the root beneath it."
+        ),
+        filter="stage::",
+    ),
+    Mutation(
+        name="base-stamp-not-recorded",
+        file="crates/core/src/stage.rs",
+        old="        base_sha256: base.sha256.clone(),",
+        new="        base_sha256: None,",
+        defect=(
+            "A commit stops recording the base build it was made on. Nothing "
+            "fails at commit time: every stage simply becomes unstamped, which "
+            "is indistinguishable from a pre-0.12.0 stage and silently disables "
+            "the fork check for good."
+        ),
+        filter="stage::",
+    ),
+    Mutation(
+        name="base-skew-opt-in-covers-flavors",
+        file="crates/core/src/stage.rs",
+        old="                if flavor_skew || !allow_base_skew {",
+        new="                if !allow_base_skew {",
+        defect=(
+            "The opt-out for a rebuilt base starts excusing a different base "
+            "*flavor* too, so a busybox chain can be stacked onto an Alpine one. "
+            "The escape hatch is for layers that are stale, not for layers that "
+            "belong to another root."
+        ),
+        filter="stage::",
+    ),
 ]
 
 

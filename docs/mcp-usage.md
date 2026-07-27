@@ -161,7 +161,7 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | Tool | Semantics |
 |---|---|
 | `sandbox_run` | **The core tool.** Boot a VM, run `cmd` via `/bin/sh -c`, optionally commit the result as a stage, destroy the VM. Ephemeral by default — nothing persists unless `commit_as` is set and the command exits 0. |
-| `stage_list` | List every committed stage (id, vanity name, label, parent, base, allocated bytes, created time). |
+| `stage_list` | List every committed stage (id, vanity name, label, parent, base, `base_sha256`, allocated bytes, created time). |
 | `stage_info` | Full metadata plus the resolved layer chain for one stage (by id, vanity name, or unique label). |
 | `stage_rm` | Remove a stage. Refuses if another stage's chain still forks from it. |
 | `vm_list` | Recent VM records (id, vanity name, flavor, created, directory size) — useful for finding a vanity name after the fact. |
@@ -187,6 +187,15 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `mem_mib` | `512` | Guest memory in MiB, bounded 128..=host free RAM (with headroom). Over-cap errors before boot. |
 | `scratch_mib` | ~`1024` | Writable overlay scratch in MiB (128..=65536, sparse). Raise for build workloads; passing it forces the cold (disk-upper) path. |
 | `copy_out` | — | List of `{guest, host}` mappings: stream guest files to host paths after a successful exec — the binary-safe artifact channel. A copy failure fails the call; written files are listed in the result's `copied`. `host` is confined to the host-I/O root and the guest's file mode is masked — see [Host paths](#host-paths-stdin_file-and-copy_out) below. |
+
+Forking checks the base *build*, not just the flavor. Every stage records the
+content id of the image it was made over (`base_sha256`); if that image has been
+rebuilt since — `isopod image build-all`, a new guest agent — the fork is refused
+before boot rather than mounting layers over a root they no longer match. The
+error names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1` in
+the server's environment overrides it, for the commit as well as the boot, which
+is how a stage is rebased onto a new image. Stages committed before isopod
+0.12.0 record no content id and fork unchecked.
 
 Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,

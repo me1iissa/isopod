@@ -50,6 +50,55 @@ const LAYER_FILE: &str = "layer.ext4";
 /// Basename of the stage metadata file inside a stage directory.
 const META_FILE: &str = "meta.json";
 
+/// Identity of the squashfs base a stage's layers were built against.
+///
+/// The flavor slug alone does not identify a base: `base-alpine` is rebuilt
+/// whenever its pinned packages or the baked-in guest agent move, and a stage's
+/// layers are overlay upperdirs over *that build's* root. `sha256` is the
+/// content id the image's build sidecar records ([`crate::image::ImageMeta`]),
+/// or `None` for an image carrying no sidecar — one built before stamping
+/// existed, where nothing can be compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseId {
+    /// Base flavor slug (`base-sqfs` / `base-alpine`).
+    pub flavor: String,
+    /// sha256 of the base image file, when its sidecar records one.
+    pub sha256: Option<String>,
+}
+
+impl BaseId {
+    /// A base identity with whatever content id the caller could establish.
+    #[must_use]
+    pub fn new(flavor: impl Into<String>, sha256: Option<String>) -> Self {
+        Self {
+            flavor: flavor.into(),
+            sha256,
+        }
+    }
+
+    /// A base whose content id is unknown (no build sidecar). Stages committed
+    /// against it record no stamp, and forks of them are not content-checked.
+    #[must_use]
+    pub fn unstamped(flavor: impl Into<String>) -> Self {
+        Self::new(flavor, None)
+    }
+}
+
+/// The outcome of comparing a stage's recorded base against the base image this
+/// host would actually boot it on. See [`check_base`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseCheck {
+    /// Compatible — either the content ids match, or one side records none and
+    /// there is nothing to compare.
+    Ok,
+    /// The stage records a content id but the image on this host has no
+    /// sidecar, so the comparison could not be made. Carries the advisory.
+    Unverifiable(String),
+    /// The image differs from the build the layers were made against. Carries
+    /// the full explanation, ending with how to get back to a bootable stage.
+    Mismatch(String),
+}
+
 /// Metadata describing one committed stage.
 ///
 /// Serialized verbatim to `meta.json` and re-used as the CLI's JSON view (so the
@@ -68,14 +117,95 @@ pub struct StageMeta {
     pub parent: Option<String>,
     /// Full lineage, root-first, ending with `stage_id` itself.
     pub chain: Vec<String>,
-    /// Base image identifier (always `base-sqfs` in v1).
+    /// Base image identifier (`base-sqfs` / `base-alpine`).
     pub base: String,
+    /// Content id (sha256) of the base image *build* the layers were made
+    /// against, when that image carried a build sidecar.
+    ///
+    /// `None` for a stage committed before this field existed, or on an
+    /// unstamped image. Unstamped stages keep booting unchecked: nothing was
+    /// recorded, so there is nothing to disagree with (see [`check_base`]).
+    #[serde(default)]
+    pub base_sha256: Option<String>,
     /// Creation time (Unix seconds).
     pub created_unix: u64,
     /// Apparent (logical) size of `layer.ext4` in bytes.
     pub bytes_apparent: u64,
     /// Allocated (on-disk) size of `layer.ext4` in bytes (smaller — it is sparse).
     pub bytes_allocated: u64,
+}
+
+impl StageMeta {
+    /// The base identity this stage was committed against.
+    #[must_use]
+    pub fn base_id(&self) -> BaseId {
+        BaseId::new(self.base.clone(), self.base_sha256.clone())
+    }
+}
+
+/// Compare the base a stage was committed on against `current` — the base image
+/// this host would boot it on now.
+///
+/// A rebuilt base image is not the base the stage's layers were made over. The
+/// layers are overlay upperdirs, so they still *mount*: the merge succeeds and
+/// the breakage surfaces later, as a chain whose contents no longer match the
+/// root beneath them (site-packages whose interpreter moved is the usual shape).
+/// This is the check that turns that into a refusal before the VM boots.
+///
+/// Pure — every input is supplied by the caller, so the messages are unit
+/// testable without an image store. Policy (refuse / warn / override) belongs to
+/// the caller; this only reports what the comparison says.
+#[must_use]
+pub fn check_base(stage: &StageMeta, current: &BaseId) -> BaseCheck {
+    if stage.base != current.flavor {
+        return BaseCheck::Mismatch(format!(
+            "stage {} ({:?}) was committed on base {:?}, but this run resolved base {:?}. \
+             A stage's layers only mean anything over the base they were built on; fork it \
+             without `--base` (a stage's recorded base is authoritative) or rebuild the stage \
+             on {:?}.",
+            stage.stage_id, stage.label, stage.base, current.flavor, current.flavor,
+        ));
+    }
+    // Nothing recorded ⇒ nothing to disagree with. Every stage committed before
+    // stamping existed lands here, and keeps booting exactly as it did.
+    let Some(stamped) = stage.base_sha256.as_deref() else {
+        return BaseCheck::Ok;
+    };
+    let Some(present) = current.sha256.as_deref() else {
+        return BaseCheck::Unverifiable(format!(
+            "stage {} ({:?}) records the {} image it was built on ({}), but that image has no \
+             build-metadata sidecar on this host, so the two cannot be compared — the stage is \
+             booting on a base that may not be the one its layers were made over. Restore the \
+             check with `isopod image build-all`.",
+            stage.stage_id,
+            stage.label,
+            stage.base,
+            short_id(stamped),
+        ));
+    };
+    if stamped == present {
+        return BaseCheck::Ok;
+    }
+    BaseCheck::Mismatch(format!(
+        "stage {} ({:?}) was built on {} image {}, but this host's {} image is {} — it has been \
+         rebuilt since. The stage's layers are overlay upperdirs over the older root, so they \
+         would mount silently over the new one and leave a chain that no longer matches what is \
+         beneath it. Rebuild the stage on the current image: re-run what produced it starting \
+         from `--stage base --base {}`.",
+        stage.stage_id,
+        stage.label,
+        stage.base,
+        short_id(stamped),
+        stage.base,
+        short_id(present),
+        stage.base,
+    ))
+}
+
+/// First 12 characters of a content id, for messages (full sha256s make the
+/// difference between two of them harder to see, not easier).
+fn short_id(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
 }
 
 /// Commit a scratch image as a new stage and return its metadata.
@@ -90,18 +220,38 @@ pub struct StageMeta {
 /// is returned unchanged (the artifact is immutable, so `label`/`parent` on the
 /// second call are ignored).
 ///
+/// `base` is the base image this run actually booted; its content id is stamped
+/// into the stage so a later fork can refuse a base that has been rebuilt since
+/// (see [`check_base`]).
+///
+/// `allow_base_skew` carries the operator's opt-out forward from the boot. A run
+/// that was allowed to *start* on a rebuilt base must also be allowed to save
+/// what it produced — otherwise the escape hatch strands the work it exists to
+/// enable, and rebasing a stage onto a new image becomes impossible. A *flavor*
+/// mismatch is refused either way: those layers are not stale, they belong to a
+/// different root.
+///
 /// # Errors
 /// - the label is empty,
 /// - the named `parent` does not exist,
+/// - the parent was committed on a base this one may not stack on,
 /// - the resulting chain would exceed [`MAX_CHAIN_DEPTH`],
 /// - or the file cannot be hashed / copied / written.
 pub fn commit(
     scratch_path: &Path,
     label: &str,
     parent: Option<&str>,
-    base: &str,
+    base: &BaseId,
+    allow_base_skew: bool,
 ) -> Result<StageMeta> {
-    commit_in(&paths::stages_dir()?, scratch_path, label, parent, base)
+    commit_in(
+        &paths::stages_dir()?,
+        scratch_path,
+        label,
+        parent,
+        base,
+        allow_base_skew,
+    )
 }
 
 /// List every committed stage, sorted oldest-first (`created_unix`, then
@@ -185,7 +335,8 @@ fn commit_in(
     scratch_path: &Path,
     label: &str,
     parent: Option<&str>,
-    base: &str,
+    base: &BaseId,
+    allow_base_skew: bool,
 ) -> Result<StageMeta> {
     if label.trim().is_empty() {
         bail!("stage label must not be empty");
@@ -243,11 +394,20 @@ fn commit_in(
         Some(pid) => {
             let pmeta = get_by_id_in(root, pid)?
                 .ok_or_else(|| anyhow!("parent stage {pid:?} not found in the stage store"))?;
-            if pmeta.base != base {
-                bail!(
-                    "base mismatch: stacking on stage {pid:?} (base {:?}) but this run used \
-                     base {base:?}; a chain must share one base",
-                    pmeta.base
+            // Same flavor is not enough: a rebuilt image is a different root
+            // under the same slug, and the run path refuses to boot that fork
+            // unless the operator opted out. Re-checking here keeps the store
+            // from recording a mixed-build chain that nobody asked for, while
+            // letting the opt-out through — that is how a stage gets rebased
+            // onto a new image at all.
+            if let BaseCheck::Mismatch(why) = check_base(&pmeta, base) {
+                let flavor_skew = pmeta.base != base.flavor;
+                if flavor_skew || !allow_base_skew {
+                    bail!("refusing to stack on stage {pid:?}: {why}");
+                }
+                eprintln!(
+                    "stage commit: stacking on stage {pid:?} across a rebuilt base, \
+                     as the caller allowed: {why}"
                 );
             }
             (Some(pmeta.stage_id), pmeta.chain)
@@ -288,7 +448,8 @@ fn commit_in(
         label: label.to_string(),
         parent: parent_id,
         chain,
-        base: base.to_string(),
+        base: base.flavor.clone(),
+        base_sha256: base.sha256.clone(),
         created_unix: now_unix(),
         bytes_apparent: fmeta.len(),
         bytes_allocated: fmeta.blocks() * 512,
@@ -498,6 +659,18 @@ mod tests {
         p
     }
 
+    /// The busybox base with no content id — the shape every store test that is
+    /// not about base stamping wants, and the shape a host with unstamped images
+    /// produces.
+    fn sqfs() -> BaseId {
+        BaseId::unstamped("base-sqfs")
+    }
+
+    /// The busybox base as a specific build.
+    fn sqfs_build(sha: &str) -> BaseId {
+        BaseId::new("base-sqfs", Some(sha.to_string()))
+    }
+
     #[test]
     fn commit_round_trip_meta_and_id_and_mode() {
         let home = tempfile::tempdir().unwrap();
@@ -506,7 +679,7 @@ mod tests {
 
         let content = b"isopod stage fixture content \x00\x01\x02";
         let scratch = fixture(home.path(), "scratch.img", content);
-        let meta = commit_in(&root, &scratch, "demo/first", None, "base-sqfs").unwrap();
+        let meta = commit_in(&root, &scratch, "demo/first", None, &sqfs(), false).unwrap();
 
         // Content-addressed id is the first 16 hex of BLAKE3(content).
         let expect_id = format!(
@@ -537,7 +710,7 @@ mod tests {
         // Idempotent: re-committing identical content under the SAME label returns
         // the same stage. This is the case that happens in practice — the same
         // build run twice — and it must stay a no-op rather than an error.
-        let again = commit_in(&root, &scratch, "demo/first", None, "base-sqfs").unwrap();
+        let again = commit_in(&root, &scratch, "demo/first", None, &sqfs(), false).unwrap();
         assert_eq!(again, meta, "re-commit of identical content is idempotent");
         assert_eq!(
             list_in(&root).unwrap().len(),
@@ -550,7 +723,7 @@ mod tests {
         // content, so the requested label was silently dropped and every later
         // `stage: "some/other-label"` failed to resolve — which reads as a commit
         // that was lost rather than a label that was never written.
-        let why = commit_in(&root, &scratch, "some/other-label", None, "base-sqfs")
+        let why = commit_in(&root, &scratch, "some/other-label", None, &sqfs(), false)
             .expect_err("must refuse")
             .to_string();
         assert!(why.contains("byte-identical"), "{why}");
@@ -568,12 +741,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let first = fixture(home.path(), "a.img", b"first content");
-        let original = commit_in(&root, &first, "myenv", None, "base-sqfs").unwrap();
+        let original = commit_in(&root, &first, "myenv", None, &sqfs(), false).unwrap();
         // "my" resolves to it today, by unique label prefix.
         assert_eq!(resolve_in(&root, "my").unwrap().stage_id, original.stage_id);
 
         let second = fixture(home.path(), "b.img", b"different content entirely");
-        let why = commit_in(&root, &second, "my", None, "base-sqfs")
+        let why = commit_in(&root, &second, "my", None, &sqfs(), false)
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string());
         // Committing *is* allowed here — "my" is not an existing label, only a
@@ -589,7 +762,7 @@ mod tests {
 
         // The case that must never be permitted: reusing the exact label.
         let third = fixture(home.path(), "c.img", b"third content");
-        let why = commit_in(&root, &third, "myenv", None, "base-sqfs")
+        let why = commit_in(&root, &third, "myenv", None, &sqfs(), false)
             .expect_err("an exact label collision must be refused")
             .to_string();
         assert!(why.contains("already refers to"), "{why}");
@@ -608,7 +781,7 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
         let scratch = fixture(home.path(), "s.img", b"only stage");
-        commit_in(&root, &scratch, "sole", None, "base-sqfs").unwrap();
+        commit_in(&root, &scratch, "sole", None, &sqfs(), false).unwrap();
 
         for empty in ["", "   "] {
             let why = resolve_in(&root, empty)
@@ -626,7 +799,7 @@ mod tests {
         let root = home.path().join("stages");
         std::fs::create_dir_all(&root).unwrap();
         let scratch = fixture(home.path(), "s.img", b"x");
-        assert!(commit_in(&root, &scratch, "   ", None, "base-sqfs").is_err());
+        assert!(commit_in(&root, &scratch, "   ", None, &sqfs(), false).is_err());
     }
 
     #[test]
@@ -640,7 +813,8 @@ mod tests {
             &fixture(home.path(), "a", b"alpha-bytes"),
             "alpha",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let b = commit_in(
@@ -648,7 +822,8 @@ mod tests {
             &fixture(home.path(), "b", b"alpine-bytes"),
             "alpine",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let c = commit_in(
@@ -656,7 +831,8 @@ mod tests {
             &fixture(home.path(), "c", b"beta-bytes"),
             "beta",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
 
@@ -682,7 +858,8 @@ mod tests {
             &fixture(home.path(), "a", b"aa"),
             "alpha",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let b = commit_in(
@@ -690,7 +867,8 @@ mod tests {
             &fixture(home.path(), "b", b"bb"),
             "alpine",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
 
@@ -716,7 +894,8 @@ mod tests {
             &fixture(home.path(), "a", b"layerA"),
             "A",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let b = commit_in(
@@ -724,7 +903,8 @@ mod tests {
             &fixture(home.path(), "b", b"layerB"),
             "B",
             Some(&a.stage_id),
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let c = commit_in(
@@ -732,7 +912,8 @@ mod tests {
             &fixture(home.path(), "c", b"layerC"),
             "C",
             Some(&b.stage_id),
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
 
@@ -772,7 +953,8 @@ mod tests {
             &fixture(home.path(), "s", b"z"),
             "l",
             Some("st-doesnotexist0"),
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .expect_err("missing parent must error");
         assert!(err.to_string().contains("not found"), "{err}");
@@ -789,7 +971,8 @@ mod tests {
             &fixture(home.path(), "a", b"pA"),
             "A",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let b = commit_in(
@@ -797,7 +980,8 @@ mod tests {
             &fixture(home.path(), "b", b"pB"),
             "B",
             Some(&a.stage_id),
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         // Delete parent A's directory out from under B (bypassing `remove`, which
@@ -824,6 +1008,7 @@ mod tests {
             parent: None,
             chain: over.clone(),
             base: "base-sqfs".into(),
+            base_sha256: None,
             created_unix: 0,
             bytes_apparent: 0,
             bytes_allocated: 0,
@@ -846,12 +1031,20 @@ mod tests {
                 &format!("f{i}"),
                 format!("layer-{i}").as_bytes(),
             );
-            let m = commit_in(&root, &f, &format!("l{i}"), parent.as_deref(), "base-sqfs").unwrap();
+            let m = commit_in(
+                &root,
+                &f,
+                &format!("l{i}"),
+                parent.as_deref(),
+                &sqfs(),
+                false,
+            )
+            .unwrap();
             assert_eq!(m.chain.len(), i + 1);
             parent = Some(m.stage_id);
         }
         let over = fixture(home.path(), "over", b"one-too-many");
-        let err = commit_in(&root, &over, "over", parent.as_deref(), "base-sqfs")
+        let err = commit_in(&root, &over, "over", parent.as_deref(), &sqfs(), false)
             .expect_err("committing past the cap must error");
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
@@ -867,7 +1060,8 @@ mod tests {
             &fixture(home.path(), "a", b"rA"),
             "A",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let b = commit_in(
@@ -875,7 +1069,8 @@ mod tests {
             &fixture(home.path(), "b", b"rB"),
             "B",
             Some(&a.stage_id),
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
 
@@ -904,7 +1099,8 @@ mod tests {
             &fixture(home.path(), "x", b"one"),
             "one",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         commit_in(
@@ -912,7 +1108,8 @@ mod tests {
             &fixture(home.path(), "y", b"two"),
             "two",
             None,
-            "base-sqfs",
+            &sqfs(),
+            false,
         )
         .unwrap();
         let listed = list_in(&root).unwrap();
@@ -958,7 +1155,7 @@ mod tests {
             m.len()
         );
 
-        let meta = commit_in(&root, &scratch, "e2e/real-ext4", None, "base-sqfs").unwrap();
+        let meta = commit_in(&root, &scratch, "e2e/real-ext4", None, &sqfs(), false).unwrap();
         assert_eq!(meta.stage_id, stage_id_for(&scratch).unwrap());
 
         let layer = root.join(&meta.stage_id).join("layer.ext4");
@@ -980,5 +1177,317 @@ mod tests {
                 .map(|p| p.join("mkfs.ext4"))
                 .find(|p| p.exists())
         })
+    }
+
+    // -- base stamping and the skew check ------------------------------------
+
+    #[test]
+    fn commit_stamps_the_base_build_and_it_survives_the_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let scratch = fixture(home.path(), "s", b"stamped");
+        let meta = commit_in(
+            &root,
+            &scratch,
+            "stamped",
+            None,
+            &sqfs_build("aa11bb22cc33"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(meta.base, "base-sqfs");
+        assert_eq!(meta.base_sha256.as_deref(), Some("aa11bb22cc33"));
+
+        // Through the real writer and back through the real reader: the stamp is
+        // what a later fork will actually see.
+        let reread = resolve_in(&root, "stamped").unwrap();
+        assert_eq!(reread, meta);
+        assert_eq!(reread.base_id(), sqfs_build("aa11bb22cc33"));
+    }
+
+    /// The 35 stages that exist on a real host were committed before this field
+    /// did. Their `meta.json` has no `base_sha256` key at all, and they must keep
+    /// loading, resolving and forking exactly as they did.
+    ///
+    /// The fixture is produced by the production writer and then has the one key
+    /// removed — hand-writing the legacy JSON would test a shape the writer never
+    /// emitted.
+    #[test]
+    fn a_stage_committed_before_stamping_still_loads_and_forks() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let scratch = fixture(home.path(), "legacy", b"pre-stamp layer");
+        let meta = commit_in(&root, &scratch, "legacy/env", None, &sqfs(), false).unwrap();
+
+        // Strip the key, leaving every other field exactly as written.
+        let mp = root.join(&meta.stage_id).join(META_FILE);
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mp).unwrap())
+                .expect("the writer emits valid JSON");
+        assert!(
+            doc.as_object_mut().unwrap().remove("base_sha256").is_some(),
+            "the writer must have emitted the key for this test to be removing it"
+        );
+        std::fs::write(&mp, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let legacy =
+            resolve_in(&root, "legacy/env").expect("a pre-stamp meta.json must still load");
+        assert_eq!(legacy.base_sha256, None);
+        assert_eq!(legacy.stage_id, meta.stage_id);
+        assert_eq!(list_in(&root).unwrap().len(), 1);
+        assert_eq!(chain_paths_in(&root, &legacy).unwrap().len(), 1);
+
+        // Unstamped ⇒ unchecked, on any build of the recorded base.
+        assert_eq!(check_base(&legacy, &sqfs()), BaseCheck::Ok);
+        assert_eq!(
+            check_base(&legacy, &sqfs_build("whatever-is-there")),
+            BaseCheck::Ok
+        );
+
+        // And it can still be stacked on.
+        let next = fixture(home.path(), "next", b"stacked on a legacy stage");
+        let stacked = commit_in(
+            &root,
+            &next,
+            "legacy/env2",
+            Some(&legacy.stage_id),
+            &sqfs(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stacked.chain,
+            vec![legacy.stage_id, stacked.stage_id.clone()]
+        );
+    }
+
+    #[test]
+    fn check_base_accepts_the_build_the_stage_was_made_on() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = fixture(home.path(), "s", b"same build");
+        let meta = commit_in(
+            &root,
+            &scratch,
+            "env",
+            None,
+            &sqfs_build("deadbeef1234"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_base(&meta, &sqfs_build("deadbeef1234")),
+            BaseCheck::Ok
+        );
+    }
+
+    #[test]
+    fn check_base_refuses_an_image_rebuilt_since_the_stage_was_committed() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = fixture(home.path(), "s", b"built on the old image");
+        let meta = commit_in(
+            &root,
+            &scratch,
+            "env/deps",
+            None,
+            &sqfs_build("0000aaaa1111bbbb"),
+            false,
+        )
+        .unwrap();
+
+        let BaseCheck::Mismatch(why) = check_base(&meta, &sqfs_build("9999cccc8888dddd")) else {
+            panic!("a rebuilt base must not be accepted");
+        };
+        // Both ids, the stage, and a way out — a refusal naming neither build
+        // leaves the operator guessing which image changed.
+        assert!(why.contains("0000aaaa1111"), "stamped id: {why}");
+        assert!(why.contains("9999cccc8888"), "present id: {why}");
+        assert!(
+            why.contains(&meta.stage_id) && why.contains("env/deps"),
+            "{why}"
+        );
+        assert!(
+            why.contains("--stage base --base base-sqfs"),
+            "the fix: {why}"
+        );
+        // Short ids, not full 64-hex walls of text.
+        assert!(!why.contains("0000aaaa1111bbbb"), "id is shortened: {why}");
+    }
+
+    #[test]
+    fn check_base_reports_an_unstamped_image_as_unverifiable() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = fixture(home.path(), "s", b"stamped stage, unstamped image");
+        let meta = commit_in(
+            &root,
+            &scratch,
+            "env",
+            None,
+            &sqfs_build("abcdef012345"),
+            false,
+        )
+        .unwrap();
+
+        let BaseCheck::Unverifiable(why) = check_base(&meta, &sqfs()) else {
+            panic!("an image with no sidecar cannot be compared, and must say so");
+        };
+        assert!(why.contains("abcdef012345"), "{why}");
+        assert!(why.contains("isopod image build-all"), "the fix: {why}");
+    }
+
+    #[test]
+    fn check_base_refuses_a_different_flavor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = fixture(home.path(), "s", b"busybox layer");
+        let meta = commit_in(&root, &scratch, "env", None, &sqfs(), false).unwrap();
+
+        let BaseCheck::Mismatch(why) = check_base(&meta, &BaseId::unstamped("base-alpine")) else {
+            panic!("a stage's layers do not transfer between flavors");
+        };
+        assert!(
+            why.contains("base-sqfs") && why.contains("base-alpine"),
+            "{why}"
+        );
+    }
+
+    /// The run path refuses to boot a fork across a rebuilt base, so a stacked
+    /// commit across one should be unreachable — but the store is what the chain
+    /// outlives, and a caller that never went through the run path must not be
+    /// able to record a mixed-build chain by accident.
+    #[test]
+    fn stacking_refuses_a_parent_built_on_another_image() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"parent"),
+            "A",
+            None,
+            &sqfs_build("1111111111111111"),
+            false,
+        )
+        .unwrap();
+
+        let err = commit_in(
+            &root,
+            &fixture(home.path(), "b", b"child"),
+            "B",
+            Some(&a.stage_id),
+            &sqfs_build("2222222222222222"),
+            false,
+        )
+        .expect_err("stacking across a rebuilt base must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to stack"), "{msg}");
+        assert!(
+            msg.contains("111111111111") && msg.contains("222222222222"),
+            "{msg}"
+        );
+        assert_eq!(list_in(&root).unwrap().len(), 1, "nothing was recorded");
+
+        // Same image ⇒ ordinary stacking, unaffected.
+        let ok = commit_in(
+            &root,
+            &fixture(home.path(), "c", b"child"),
+            "B",
+            Some(&a.stage_id),
+            &sqfs_build("1111111111111111"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(ok.base_sha256.as_deref(), Some("1111111111111111"));
+    }
+
+    /// A stamped parent on a host whose image lost its sidecar: nothing can be
+    /// compared, so stacking proceeds and the new layer records what it knows,
+    /// which is nothing. It must not inherit a stamp it never verified.
+    #[test]
+    fn stacking_on_an_unstamped_image_records_no_stamp() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"parent"),
+            "A",
+            None,
+            &sqfs_build("3333333333333333"),
+            false,
+        )
+        .unwrap();
+        let b = commit_in(
+            &root,
+            &fixture(home.path(), "b", b"child"),
+            "B",
+            Some(&a.stage_id),
+            &sqfs(),
+            false,
+        )
+        .expect("an unverifiable base is not a mismatch");
+        assert_eq!(b.base_sha256, None);
+    }
+
+    /// The opt-in exists so a stage can be rebased onto a rebuilt image. It has
+    /// to reach the commit too: a run allowed to boot across the skew and then
+    /// refused the commit would throw away exactly the work the operator asked
+    /// for. It does not extend to a different flavor — those layers are for
+    /// another root, not an older one.
+    #[test]
+    fn the_opt_in_stacks_across_a_rebuilt_image_but_never_across_flavors() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"parent"),
+            "A",
+            None,
+            &sqfs_build("4444444444444444"),
+            false,
+        )
+        .unwrap();
+
+        let rebased = commit_in(
+            &root,
+            &fixture(home.path(), "b", b"child"),
+            "B",
+            Some(&a.stage_id),
+            &sqfs_build("5555555555555555"),
+            true,
+        )
+        .expect("the operator opted in; the layer is saved");
+        assert_eq!(rebased.chain, vec![a.stage_id.clone(), rebased.stage_id]);
+        assert_eq!(
+            rebased.base_sha256.as_deref(),
+            Some("5555555555555555"),
+            "the new layer records the image it was actually built on, not its parent's"
+        );
+
+        let err = commit_in(
+            &root,
+            &fixture(home.path(), "c", b"other-flavor child"),
+            "C",
+            Some(&a.stage_id),
+            &BaseId::new("base-alpine", Some("4444444444444444".into())),
+            true,
+        )
+        .expect_err("the opt-in is about a rebuilt base, not a different one");
+        assert!(err.to_string().contains("base-alpine"), "{err}");
     }
 }

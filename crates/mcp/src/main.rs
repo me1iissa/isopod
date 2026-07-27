@@ -574,6 +574,11 @@ struct StageEntry {
     chain: Vec<String>,
     /// Base image identifier the chain was built on (`base-alpine`/`base-sqfs`).
     base: String,
+    /// Content id (sha256) of the base image build the layers were made
+    /// against. `null` for a stage committed before stamping existed, or on an
+    /// image with no build sidecar — those fork unchecked. A fork is refused
+    /// when this disagrees with the base image on the host.
+    base_sha256: Option<String>,
     /// Creation time (Unix seconds).
     created_unix: u64,
     /// Apparent (logical) size of the layer artifact, bytes.
@@ -591,6 +596,7 @@ impl From<StageMeta> for StageEntry {
             parent: m.parent,
             chain: m.chain,
             base: m.base,
+            base_sha256: m.base_sha256,
             created_unix: m.created_unix,
             bytes_apparent: m.bytes_apparent,
             bytes_allocated: m.bytes_allocated,

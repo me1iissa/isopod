@@ -101,6 +101,13 @@ run + commit  ──►  stage (immutable)  ──►  fork ──► run ──
                           └──►  fork ──► ephemeral run  (parent untouched)
 ```
 
+A stage's layers belong to the *build* of the base image they were made over, so
+each one records that image's content id and a fork refuses a base rebuilt since
+— naming both ids and both ways out, rather than mounting silently over a root
+that no longer matches. Stages committed before this existed fork unchecked.
+[docs/getting-started.md](docs/getting-started.md#when-the-base-image-is-rebuilt)
+has the diagram and the escape hatch.
+
 ### Warm pool
 
 A cold boot is fast (~0.4 s), but a warm resume is faster still. isopod keeps a **full-VM memory snapshot** of a booted-idle, network-less VM, keyed on the exact environment it must match. A fresh `sandbox_run` that qualifies (fresh base image, network on, no commit, default scratch — the full rules are in [docs/getting-started.md](docs/getting-started.md)) **hot-resumes** that snapshot into a free network slot in tens of milliseconds instead of cold-booting, then re-applies the slot's IP and re-syncs the guest clock over vsock. Any change to the key (Firecracker build, host kernel, CPU model, base flavor, vCPUs, memory, snapshot format) silently invalidates the cache and falls back to a cold boot.

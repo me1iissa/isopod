@@ -1285,9 +1285,11 @@ enum BootPlan {
     Stage {
         /// Squashfs base image (`vda`, read-only root).
         base_sqfs: PathBuf,
-        /// Base flavor slug this run booted (recorded on any committed stage so
-        /// forks reuse the same base — a chain must share one base).
-        base_flavor: String,
+        /// Identity of that image — flavor slug plus, when it is stamped, the
+        /// content id of the build. Recorded on any stage committed from this
+        /// run, so a later fork can tell "the same base" from "the same slug,
+        /// rebuilt since" (a chain must share one base *build*).
+        base: stage::BaseId,
         /// Committed layer artifacts, root-first (oldest-first) = the PUT order
         /// for `vdb..`.
         layer_paths: Vec<PathBuf>,
@@ -1296,9 +1298,13 @@ enum BootPlan {
     },
 }
 
+/// Environment escape hatch for [`enforce_base_compat`]: boot a stage whose base
+/// image has been rebuilt since the stage was committed.
+const ALLOW_BASE_SKEW_VAR: &str = "ISOPOD_ALLOW_BASE_SKEW";
+
 /// Resolve a `--stage <ref>` into a [`BootPlan::Stage`]: locate the squashfs
-/// base, and (unless `ref` is the reserved word `base`) resolve the stage and
-/// its full layer chain.
+/// base, and (unless `ref` is the reserved word `base`) resolve the stage, check
+/// it against the base image on this host, and resolve its full layer chain.
 fn resolve_stage_plan(stage_ref: &str, base: RootfsFlavor) -> Result<BootPlan> {
     // A fresh `--stage base` run uses the requested base flavor. Forking an
     // existing stage instead uses the stage's RECORDED base — the layers were
@@ -1306,22 +1312,92 @@ fn resolve_stage_plan(stage_ref: &str, base: RootfsFlavor) -> Result<BootPlan> {
     // produce a broken merge; the recorded base is authoritative and `--base` is
     // ignored for forks (removing a silent footgun).
     if stage_ref == STAGE_BASE {
+        let base_sqfs = image::base_image_path(base)?;
+        let base_id = base_identity(&base_sqfs, base.slug());
         return Ok(BootPlan::Stage {
-            base_sqfs: image::base_image_path(base)?,
-            base_flavor: base.slug().to_string(),
+            base_sqfs,
+            base: base_id,
             layer_paths: Vec::new(),
             parent: None,
         });
     }
     let meta = stage::resolve(stage_ref)?;
     let recorded_base = RootfsFlavor::from_slug(&meta.base)?;
+    let base_sqfs = image::base_image_path(recorded_base)?;
+    // Same slug, possibly a different build: `isopod image build-all` replaces
+    // the root these layers were made over, and an overlay merge onto the wrong
+    // root succeeds silently. Refuse before anything boots.
+    let base_id = base_identity(&base_sqfs, recorded_base.slug());
+    enforce_base_compat(&meta, &base_id)?;
     let layer_paths = stage::chain_paths(&meta)?;
     Ok(BootPlan::Stage {
-        base_sqfs: image::base_image_path(recorded_base)?,
-        base_flavor: meta.base.clone(),
+        base_sqfs,
+        base: base_id,
         layer_paths,
         parent: Some(meta.stage_id),
     })
+}
+
+/// The identity of the base image at `base_sqfs`: its flavor slug plus the
+/// content id its build sidecar records.
+///
+/// An unreadable sidecar degrades to "unstamped" with a warning rather than
+/// failing the run — the same tolerance [`image::check_image_proto`] applies. A
+/// missing stamp must never be the reason a VM cannot start; it only means this
+/// run has nothing to compare.
+fn base_identity(base_sqfs: &Path, flavor: &str) -> stage::BaseId {
+    match image::read_image_meta(base_sqfs) {
+        Ok(meta) => stage::BaseId::new(flavor, meta.map(|m| m.sha256)),
+        Err(e) => {
+            eprintln!(
+                "run: warning: unreadable image metadata for {}: {e:#}",
+                base_sqfs.display()
+            );
+            stage::BaseId::unstamped(flavor)
+        }
+    }
+}
+
+/// Apply [`stage::check_base`]'s verdict to a fork: refuse a rebuilt base, warn
+/// when the comparison could not be made, and stay silent when it agrees.
+///
+/// The refusal is overridable, because it can otherwise wall off a whole store:
+/// rebuilding the guest images (which the proto guard already forces whenever
+/// the guest agent moves) changes the base of every stage at once. Layers that
+/// genuinely do not depend on what changed should still be bootable — with the
+/// operator saying so, and a warning on the record.
+fn enforce_base_compat(meta: &StageMeta, current: &stage::BaseId) -> Result<()> {
+    enforce_base_compat_with(meta, current, base_skew_allowed())
+}
+
+/// Core of [`enforce_base_compat`] with the override decided by the caller, so
+/// the policy is unit-testable without mutating the process environment (which
+/// is global, and unsafe to touch from parallel tests).
+fn enforce_base_compat_with(
+    meta: &StageMeta,
+    current: &stage::BaseId,
+    allow_skew: bool,
+) -> Result<()> {
+    match stage::check_base(meta, current) {
+        stage::BaseCheck::Ok => Ok(()),
+        stage::BaseCheck::Unverifiable(why) => {
+            eprintln!("run: warning: {why}");
+            Ok(())
+        }
+        stage::BaseCheck::Mismatch(why) if allow_skew => {
+            eprintln!("run: warning: {ALLOW_BASE_SKEW_VAR}=1 — booting it anyway. {why}");
+            Ok(())
+        }
+        stage::BaseCheck::Mismatch(why) => bail!(
+            "{why} If these layers do not depend on what changed, set \
+             {ALLOW_BASE_SKEW_VAR}=1 to boot the stage unchecked."
+        ),
+    }
+}
+
+/// Whether the operator has opted out of the base-skew refusal.
+fn base_skew_allowed() -> bool {
+    std::env::var(ALLOW_BASE_SKEW_VAR).as_deref() == Ok("1")
 }
 
 /// Async driver: create the VM dir, materialize the guest disks, boot + exec,
@@ -1363,7 +1439,7 @@ async fn run_exec(
         // Report the ACTUAL base the overlay booted (base-sqfs vs base-alpine),
         // not a hardcoded constant — a stage run on the Alpine toolchain base
         // must not mislabel itself as busybox (dogfood finding via MCP).
-        BootPlan::Stage { base_flavor, .. } => base_flavor.clone(),
+        BootPlan::Stage { base, .. } => base.flavor.clone(),
     };
     let vanity = assign_vanity_name(&vm_id, &vm_dir, &flavor_label)?;
 
@@ -1595,10 +1671,10 @@ fn warm_snapshot_key(
     if opts.commit_as.is_some() || !opts.network || opts.scratch_mib.is_some() {
         return None;
     }
-    let BootPlan::Stage { base_flavor, .. } = plan else {
+    let BootPlan::Stage { base, .. } = plan else {
         return None;
     };
-    match build_snapshot_key(fc, kernel, base_flavor, resources) {
+    match build_snapshot_key(fc, kernel, &base.flavor, resources) {
         Ok(key) => Some(key),
         Err(e) => {
             eprintln!("run: could not compute the warm-pool key ({e:#}); cold-booting");
@@ -2019,8 +2095,9 @@ enum DiskConfig {
     Stage {
         /// Squashfs base (`vda`, read-only root).
         base_sqfs: PathBuf,
-        /// Base flavor slug (recorded on any stage committed from this run).
-        base_flavor: String,
+        /// Identity of that base image — slug plus content id when it is
+        /// stamped — recorded on any stage committed from this run.
+        base: stage::BaseId,
         /// Committed layers, root-first (the `vdb..` PUT order).
         layer_paths: Vec<PathBuf>,
         /// Fresh writable scratch (the overlay upperdir; removed unless `--keep`).
@@ -2040,7 +2117,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path, scratch_mib: u64) -> Result<Disk
         }
         BootPlan::Stage {
             base_sqfs,
-            base_flavor,
+            base,
             layer_paths,
             parent,
         } => {
@@ -2048,7 +2125,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path, scratch_mib: u64) -> Result<Disk
             stage::make_scratch_ext4(&scratch, scratch_mib)?;
             Ok(DiskConfig::Stage {
                 base_sqfs: base_sqfs.clone(),
-                base_flavor: base_flavor.clone(),
+                base: base.clone(),
                 layer_paths: layer_paths.clone(),
                 scratch,
                 parent: parent.clone(),
@@ -2087,7 +2164,7 @@ fn maybe_commit_stage(
     let DiskConfig::Stage {
         scratch,
         parent,
-        base_flavor,
+        base,
         ..
     } = disk
     else {
@@ -2123,7 +2200,10 @@ fn maybe_commit_stage(
         );
         return Ok(None);
     }
-    let meta = stage::commit(scratch, label, parent.as_deref(), base_flavor)?;
+    // The same opt-in the boot honoured: a run allowed to start across a rebuilt
+    // base must be allowed to save what it produced, or rebasing a stage onto a
+    // new image would be impossible.
+    let meta = stage::commit(scratch, label, parent.as_deref(), base, base_skew_allowed())?;
     eprintln!(
         "run: committed stage {} ({}) labelled {:?}",
         meta.stage_id, meta.name, meta.label
@@ -2916,7 +2996,7 @@ mod tests {
         // Stage topology adds isopod.layers=<N>.
         let stage = DiskConfig::Stage {
             base_sqfs: PathBuf::from("/i/base.sqfs"),
-            base_flavor: "base-sqfs".into(),
+            base: stage::BaseId::unstamped("base-sqfs"),
             layer_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
             scratch: PathBuf::from("/v/scratch.ext4"),
             parent: None,
@@ -2925,6 +3005,72 @@ mod tests {
         assert!(args.starts_with(BOOT_ARGS));
         assert!(args.contains(" isopod.layers=2"));
         assert!(!args.contains("isopod.net="));
+    }
+
+    // --- base-skew policy ---------------------------------------------------
+
+    /// A stage as the store would have written it, stamped with `base_sha256`.
+    fn stage_on(base_sha256: Option<&str>) -> StageMeta {
+        StageMeta {
+            stage_id: "st-0123456789abcdef".into(),
+            name: "radiant-ghost".into(),
+            label: "myproj/deps".into(),
+            parent: None,
+            chain: vec!["st-0123456789abcdef".into()],
+            base: "base-alpine".into(),
+            base_sha256: base_sha256.map(str::to_string),
+            created_unix: 0,
+            bytes_apparent: 0,
+            bytes_allocated: 0,
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_base_refuses_the_fork_and_names_the_way_out() {
+        let meta = stage_on(Some("1111aaaa2222bbbb"));
+        let now = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
+
+        let err = enforce_base_compat_with(&meta, &now, false)
+            .expect_err("a rebuilt base must not boot the stage");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("myproj/deps"), "{msg}");
+        assert!(
+            msg.contains("1111aaaa2222") && msg.contains("3333cccc4444"),
+            "{msg}"
+        );
+        // Both ways out: rebuild the stage, or say you accept the skew.
+        assert!(msg.contains("--stage base --base base-alpine"), "{msg}");
+        assert!(msg.contains(ALLOW_BASE_SKEW_VAR), "{msg}");
+    }
+
+    #[test]
+    fn the_override_boots_the_skewed_stage() {
+        let meta = stage_on(Some("1111aaaa2222bbbb"));
+        let now = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
+
+        enforce_base_compat_with(&meta, &now, true)
+            .expect("the operator opted in; the run proceeds");
+    }
+
+    /// The unstamped cases are the ones that must not start refusing: a stage
+    /// committed before stamping, and an image with no sidecar.
+    #[test]
+    fn unstamped_stages_and_images_still_fork() {
+        let alpine = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
+        enforce_base_compat_with(&stage_on(None), &alpine, false)
+            .expect("a stage committed before stamping must keep booting");
+        enforce_base_compat_with(
+            &stage_on(None),
+            &stage::BaseId::unstamped("base-alpine"),
+            false,
+        )
+        .expect("neither side stamped is not a mismatch");
+        enforce_base_compat_with(
+            &stage_on(Some("1111aaaa2222bbbb")),
+            &stage::BaseId::unstamped("base-alpine"),
+            false,
+        )
+        .expect("an image with no sidecar warns, it does not refuse");
     }
 
     // --- filtered egress ---------------------------------------------------
