@@ -24,6 +24,10 @@ Usage:
     python3 scripts/mutation-check.py --only NAME[,NAME...]
     python3 scripts/mutation-check.py --json     # machine-readable summary
 
+Mutations are applied to a `git archive HEAD` export, not to the working tree —
+so a mutation aimed at uncommitted code reports STALE against a file that does
+not have it yet. Commit (or stash) before running.
+
 Exit status is 0 only when every mutation was caught.
 """
 
