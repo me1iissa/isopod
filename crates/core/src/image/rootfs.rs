@@ -106,7 +106,7 @@ pub enum RootfsFlavor {
     /// vsock while emitting the same `ISOPOD-*` / `TICK` markers as `dev-busybox`.
     DevAgent,
     /// M3 stage base: the `dev-agent` population plus empty overlay mountpoints
-    /// (`/rom`, `/overlay`, `/layers/0..9`, `/mnt`), packed read-only with
+    /// (`/overlay`, `/layers`, `/mnt`), packed read-only with
     /// `mksquashfs` into `base.sqfs`. The agent overlays committed stage layers
     /// and a writable scratch on top of it and pivots in.
     BaseSqfs,
@@ -643,13 +643,24 @@ fn populate_dev_agent(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Empty overlay mountpoint directories the `base-sqfs` image ships (relative to
-/// the rootfs). `/rom` is reserved; `/overlay` is the scratch (writable upper)
-/// mountpoint; `/mnt` is the pivot staging point. `/layers/0..9` are the stage
-/// layer mountpoints (see [`BASE_LAYER_SLOTS`]).
-const BASE_OVERLAY_DIRS: &[&str] = &["rom", "overlay", "mnt"];
-/// Number of preallocated `/layers/<i>` stage mountpoints (`/layers/0..9`).
-const BASE_LAYER_SLOTS: usize = 10;
+/// Empty overlay mountpoint directories a squashfs base image ships (relative to
+/// the rootfs): `/overlay` is the scratch (writable upper) mountpoint, `/mnt` is
+/// the pivot staging point, and `/layers` is where the guest mounts a tmpfs and
+/// creates one mountpoint per committed stage layer.
+///
+/// Every entry here is mounted over by the guest agent. `/rom` used to be in this
+/// list, described by its own comment as "reserved" — nothing in the agent or the
+/// host ever opened it, so it shipped in every image as a directory whose only
+/// purpose was to be documented.
+///
+/// `/layers` must exist in the image — a tmpfs needs something to mount over, and
+/// the base root is a read-only squashfs — but the numbered `/layers/<i>`
+/// subdirectories must **not** be preallocated. The image used to ship `0..9`,
+/// which capped a chain at 9 layers: the guest numbers mountpoints from 1 and
+/// could not create a tenth on read-only media (dogfood #26). The guest now
+/// creates each one on the tmpfs at boot, so a fixed set is dead weight that can
+/// only ever constrain the thing it was meant to enable.
+const BASE_OVERLAY_DIRS: &[&str] = &["overlay", "mnt", "layers"];
 
 /// Populate the `base-sqfs` flavor: the `dev-agent` population (agent as
 /// `/sbin/init`, busybox applets, `/bin/sh`, `/root`) plus the empty overlay
@@ -663,15 +674,11 @@ fn populate_base_sqfs(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create the empty overlay mountpoints (`/rom`, `/overlay`, `/mnt`,
-/// `/layers/0..9`) — split out so it is unit-testable without a busybox or agent.
+/// Create the empty overlay mountpoints ([`BASE_OVERLAY_DIRS`]) — split out so it
+/// is unit-testable without a busybox or agent.
 fn write_base_overlay_dirs(root: &Path) -> Result<()> {
     for dir in BASE_OVERLAY_DIRS {
         std::fs::create_dir_all(root.join(dir)).with_context(|| format!("mkdir /{dir}"))?;
-    }
-    for i in 0..BASE_LAYER_SLOTS {
-        let dir = root.join(format!("layers/{i}"));
-        std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     }
     Ok(())
 }
@@ -1668,15 +1675,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_base_overlay_dirs(root).unwrap();
-        for d in ["rom", "overlay", "mnt"] {
+        for d in ["overlay", "mnt", "layers"] {
             assert!(root.join(d).is_dir(), "missing overlay mountpoint /{d}");
         }
-        for i in 0..BASE_LAYER_SLOTS {
-            assert!(
-                root.join(format!("layers/{i}")).is_dir(),
-                "missing stage mountpoint /layers/{i}"
-            );
-        }
+
+        // `/layers` is the mountpoint for a tmpfs the guest creates the numbered
+        // mountpoints on. Shipping `/layers/<i>` directories instead is what
+        // capped a chain at 9 layers, so their ABSENCE is the property to hold:
+        // a preallocated set can only ever be too small again.
+        let preallocated: Vec<String> = std::fs::read_dir(root.join("layers"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            preallocated.is_empty(),
+            "/layers must ship empty; found {preallocated:?}"
+        );
     }
 
     #[test]

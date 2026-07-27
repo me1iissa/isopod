@@ -230,6 +230,33 @@ MUTATIONS = [
         filter="stage::",
     ),
     Mutation(
+        name="layers-mountpoint-not-shipped",
+        file="crates/core/src/image/rootfs.rs",
+        old='const BASE_OVERLAY_DIRS: &[&str] = &["overlay", "mnt", "layers"];',
+        new='const BASE_OVERLAY_DIRS: &[&str] = &["overlay", "mnt"];',
+        defect=(
+            "The base image stops shipping /layers. The guest mounts a tmpfs "
+            "over it to create the per-layer mountpoints, and a read-only "
+            "squashfs root cannot grow the directory — so every stage fork "
+            "fails to assemble its overlay and silently boots the bare base "
+            "instead, which is finding #26's failure mode with a new cause."
+        ),
+        filter="image::",
+    ),
+    Mutation(
+        name="owner-token-format-drifts",
+        file="crates/core/src/vm/registry.rs",
+        old='        Some(started) => format!("{pid} {started}"),',
+        new='        Some(started) => format!("{pid}:{started}"),',
+        defect=(
+            "The token writer changes separator while the parser still splits "
+            "on whitespace, so every owner.pid reads as a bare pid — the weaker "
+            "check this pairing exists to replace. Nothing errors; `vm gc` just "
+            "starts trusting recycled pids again."
+        ),
+        filter="vm::registry::",
+    ),
+    Mutation(
         name="base-skew-opt-in-covers-flavors",
         file="crates/core/src/stage.rs",
         old="                if flavor_skew || !allow_base_skew {",

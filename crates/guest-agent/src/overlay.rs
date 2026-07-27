@@ -395,8 +395,10 @@ mod tests {
         assert_eq!(layer_mountpoint(1), "/layers/1");
         assert_eq!(layer_mountpoint(9), "/layers/9");
         // Depth 10 — the last depth MAX_CHAIN_DEPTH permits — must work too:
-        // the base image only baked /layers/0..9, which silently broke the
-        // 1-based 10th mountpoint until the tmpfs fix (finding #26).
+        // the base image used to bake /layers/0..9, which silently broke the
+        // 1-based 10th mountpoint until the tmpfs fix (finding #26). The image
+        // no longer ships numbered mountpoints at all; this is the assertion
+        // that would notice if they came back too small again.
         assert_eq!(layer_mountpoint(10), "/layers/10");
     }
 

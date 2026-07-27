@@ -511,6 +511,58 @@ mod tests {
         assert!(!owner_token_alive("junk 1"), "an unparseable one is not");
     }
 
+    /// The token's format is a contract between two functions and nobody else:
+    /// `owner_token` writes the string, `owner_token_alive` parses it, and every
+    /// caller in between treats it as opaque. Nothing else would notice the two
+    /// drifting apart — and the failure mode is not an error, it is `vm gc`
+    /// reading every live run as dead (or every dead one as live) while the
+    /// suite stays green. So pin the shape: a change to either side has to
+    /// change this test.
+    #[test]
+    fn the_written_token_is_exactly_what_the_parser_reads() {
+        let token = owner_token();
+        let fields: Vec<&str> = token.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            2,
+            "pid and start time, nothing else: {token:?}"
+        );
+        assert_eq!(
+            fields[0].parse::<u32>().ok(),
+            Some(std::process::id()),
+            "field 0 is this process's pid: {token:?}"
+        );
+        assert_eq!(
+            fields[1].parse::<u64>().ok(),
+            proc_starttime(std::process::id() as i32),
+            "field 1 is that pid's start time, as the parser re-reads it: {token:?}"
+        );
+        assert_eq!(
+            token,
+            format!("{} {}", fields[0], fields[1]),
+            "one space, no padding, no trailing newline: {token:?}"
+        );
+
+        // Through the file, the way a run writes it and the reaper reads it —
+        // the parser sees bytes off disk, not the String it was handed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.pid");
+        std::fs::write(&path, owner_token()).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            owner_token_alive(raw.trim()),
+            "a token round-tripped through owner.pid must read as live: {raw:?}"
+        );
+        // Hand-editing that file leaves a trailing newline; every reader trims,
+        // so the parser must agree that this is the same token.
+        std::fs::write(&path, format!("{}\n", owner_token())).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            owner_token_alive(raw.trim()),
+            "a trailing newline must not change what the token means: {raw:?}"
+        );
+    }
+
     #[test]
     fn gc_never_collects_a_run_that_is_still_going() {
         // `min_age` is a guess about how long runs last — 60 s over MCP, against a
