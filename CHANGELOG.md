@@ -149,6 +149,17 @@ overstated the code, all fixed here:
   these was a hole; all of them were the defect class this release spent three
   commits fixing, so they are fixed rather than deferred.
 
+Pass 4 also produced one new **non-claim** rather than a fix. `copy_out` keeps the
+executable bit by design — a binary built in the sandbox should arrive runnable —
+and the default host-I/O root is the server's working directory, i.e. a project
+containing `.git/hooks/`. A copy-out to `.git/hooks/pre-commit` therefore lands
+executable and runs on the operator's next `git commit`, outside any VM;
+demonstrated against a running server. Stripping the bit by default would break
+artifact extraction, and enumerating which files a project treats as code is not
+something isopod can do — `.envrc`, a `Makefile`, a CI config and a
+`node_modules/.bin` entry are all the same shape. `SECURITY.md` states the limit
+plainly instead: nothing in a writable root is safe from being made executable.
+
 ### Fixed — the MCP surface could read and write arbitrary host files
 
 `sandbox_run`'s two arguments that name a **host** path, `stdin_file` (read) and
