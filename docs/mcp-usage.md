@@ -190,7 +190,8 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 
 Forking checks the base *build*, not just the flavor. Every stage records the
 content id of the image it was made over (`base_sha256`); if that image has been
-rebuilt since — `isopod image build-all`, a new guest agent — the fork is refused
+rebuilt since — `isopod image build-all`, a new guest agent, or even a rebuild over
+an unchanged tree, since `mksquashfs` is not byte-reproducible — the fork is refused
 before boot rather than mounting layers over a root they no longer match. The
 error names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1` in
 the server's environment overrides it, for the commit as well as the boot, which
