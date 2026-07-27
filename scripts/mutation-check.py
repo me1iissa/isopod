@@ -392,7 +392,13 @@ def main() -> int:
                 results.append({"name": m.name, "outcome": "stale", "detail": "no compile"})
             else:
                 killers = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M)))
+                # Name at most three, but say so when there are more: a bare list
+                # reads as "these are the tests that cover this", and a reader
+                # deciding whether a guard is defended needs to know the list was
+                # cut. The full set is in the JSON `by` field either way.
                 shown = ", ".join(killers[:3]) or "(suite failed)"
+                if len(killers) > 3:
+                    shown += f" (+{len(killers) - 3} more)"
                 print(f"    caught by {shown}", flush=True)
                 results.append({"name": m.name, "outcome": "caught", "by": killers})
     finally:
