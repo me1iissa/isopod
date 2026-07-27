@@ -98,6 +98,39 @@ single name where the clamp point depends on the pid's digit count, so whether
 it caught a mid-character split was decided by luck. That test now sweeps every
 UTF-8 width at every suffix length the real caller can produce.
 
+### Added — `isopod-oci-unpack`, the layer extractor, on its own
+
+A new workspace crate that applies OCI image layer tars onto a directory tree.
+**Nothing depends on it yet, and it is wired into no command** — that is the
+point. It is the one component whose failure writes attacker-authored bytes into
+the operator's home directory *before any VM exists*, so it exists and gets
+attacked on its own before anything dials out to a registry.
+
+Confinement is a directory-fd walk from the destination root with `O_NOFOLLOW`
+on every open, rather than a check against a resolved path. The difference is
+the cross-layer symlink: layer 1 ships `foo -> /home/you`, layer 2 ships
+`foo/.bashrc`, and each layer is innocent read alone. It is also why a
+*dangling* link — the shape that escaped `copy_out` in 0.11.0 — needs no special
+case here: nothing ever looks at a link's target.
+
+Also enforced, each with a test and a mutation: `..` and absolute names refused
+rather than normalised; hard-link targets confined by the same walk, and linked
+without `AT_SYMLINK_FOLLOW` so a link-to-a-link cannot share a host inode;
+device and FIFO entries skipped and reported; setuid, setgid and sticky bits
+recorded for the pack step and never written to the host; `.wh.` and
+`.wh..wh..opq` whiteouts applied so that nothing an image author deleted
+survives; cumulative anti-bomb ceilings measured on the decompressed stream; and
+a staging directory that is discarded on drop, so a refused image leaves nothing
+behind at all.
+
+Attacking the crate during development found one escape that the design did not
+anticipate: a whiteout marker spelled `.wh...` yields the delete target `..`,
+which is the only name that reaches the delete walk without going through the
+entry-name component loop. At the top of the tree that names the staging root's
+parent — the caller's own destination directory — and the recursive delete
+emptied it. Refused now in both the name planner and the syscall layer, with a
+mutation for each so the pairing cannot quietly become decorative.
+
 ## [0.11.0] — 2026-07-26
 
 A hardening release. An adversarial review of shipped 0.10.0 — 34 agents, no

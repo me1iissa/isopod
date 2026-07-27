@@ -148,6 +148,7 @@ flowchart TB
 | `crates/cli` | `isopod` | The `isopod` binary: `run`, `stage`, `vm`, `warmpool`, `setup`, `image`, `dev`. |
 | `crates/mcp` | `isopod-mcp` | The rmcp 2.2 stdio MCP server for Claude Code. |
 | `crates/jail` | `isopod-jail` | The optional rootless microjail that wraps each Firecracker process (user/pid namespaces, minimal chroot, per-VM cgroup caps). |
+| `crates/oci-unpack` | `isopod-oci-unpack` | Confined extractor for OCI image layer tars (whiteouts, hard links, anti-bomb ceilings). Standalone: not yet wired into any command. |
 
 ### The `sandbox_run` lifecycle
 

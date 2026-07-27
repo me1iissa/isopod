@@ -78,7 +78,7 @@ A few notes on the test suite:
 
 ## Crate map
 
-isopod is a Cargo workspace of seven crates. Solid arrows are Cargo
+isopod is a Cargo workspace of eight crates. Solid arrows are Cargo
 dependencies; dashed arrows are runtime relationships that no `Cargo.toml`
 records:
 
@@ -90,6 +90,7 @@ flowchart TB
     CORE --> PROTO["crates/proto<br/>isopod-proto"]
     GA["crates/guest-agent<br/>isopod-guest-agent"] --> PROTO
     CORE -.->|"execs it when ISOPOD_JAIL=1"| JAIL["crates/jail<br/>isopod-jail"]
+    OCI["crates/oci-unpack<br/>isopod-oci-unpack"] -.->|"standalone: nothing depends on it yet"| NONE["image import<br/>not wired up — wave 1 is the extractor alone"]
     FCC -.->|"HTTP/JSON over a per-VM unix socket"| FCB["firecracker<br/>not a crate — the vendored VMM"]
     GA -.->|"baked into the image, runs as PID 1"| VM["guest microVM<br/>not a crate — the sandbox itself"]
 ```
@@ -107,6 +108,7 @@ which is why its `PROTO_VERSION` gates host/guest compatibility.
 | `crates/cli` | `isopod` | The `isopod` binary — `run`, `stage`, `vm`, `warmpool`, `setup`, `image`, `dev`. One-shot argv + JSON. |
 | `crates/mcp` | `isopod-mcp` | The rmcp 2.2 stdio MCP server exposing `sandbox_run`, `stage_list`/`stage_info`/`stage_rm`, `vm_list`/`vm_gc`. A thin async shim over `isopod-core`. |
 | `crates/jail` | `isopod-jail` | The rootless microjail helper that wraps each Firecracker process when `ISOPOD_JAIL=1`: user/pid namespaces, minimal bind-mount chroot, per-VM cgroup v2 caps. |
+| `crates/oci-unpack` | `isopod-oci-unpack` | Confined extractor for OCI image layer tars: a directory-fd walk with `O_NOFOLLOW` that applies untrusted layers, whiteouts and all, without following a symbolic link a layer planted. **Depends on nothing in the workspace and nothing depends on it yet** — it is deliberately reviewable on its own, because it is the one component that writes attacker-authored bytes onto the host before any VM exists. |
 
 Supporting directories: `images/` (checked-in kernel config, image build inputs), `skill/` (the Claude Code workflow skill), `docs/` (getting started, MCP usage, engineering logs), `vendor/firecracker/` (the pinned submodule).
 

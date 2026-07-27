@@ -325,6 +325,182 @@ MUTATIONS = [
         ),
         filter="image::",
     ),
+    # --- isopod-oci-unpack ------------------------------------------------
+    # This crate writes attacker-authored bytes onto the host as the operator's
+    # user, before any VM exists, so every guard below is load-bearing on its
+    # own. The whole crate suite runs for each rather than a module filter: the
+    # tree-walk guards are reached from several directions (entry paths, hard
+    # link targets, whiteout targets, the cleanup on refusal) and narrowing the
+    # run would hide which direction stopped being defended.
+    Mutation(
+        name="oci-parent-walk-follows-symlinks",
+        file="crates/oci-unpack/src/sys.rs",
+        old="    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;",
+        new="    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;",
+        defect=(
+            "The directory-fd walk drops O_NOFOLLOW, so a symbolic link an "
+            "earlier layer planted is followed by a later one. This is the "
+            "cross-layer image escape: layer 1 ships `foo -> /home/user`, layer "
+            "2 ships `foo/.bashrc`, and each layer is innocent on its own."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-hardlink-follows-symlink",
+        file="crates/oci-unpack/src/sys.rs",
+        old="                d.as_ptr(),\n                0,\n            )",
+        new="                d.as_ptr(),\n                libc::AT_SYMLINK_FOLLOW,\n            )",
+        defect=(
+            "`linkat` starts following the source symbolic link, so a hard link "
+            "whose target is a link becomes a second name for an inode outside "
+            "the tree. Confining the target's *parent* chain is not enough, and "
+            "afterwards no path check can see the sharing at all."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-name-cannot-address-a-parent",
+        file="crates/oci-unpack/src/sys.rs",
+        old=' || bytes == b"." || bytes == b".."',
+        new="",
+        defect=(
+            "The syscall layer stops refusing `.` and `..` as component names. "
+            "A whiteout marker spelled `.wh...` yields the target `..`, which "
+            "reaches the delete walk without passing through the entry-name "
+            "component loop — and `..` from the staging root is the caller's "
+            "destination directory. Found by attacking this crate, not by "
+            "reading its design."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-dotdot-normalised-away",
+        file="crates/oci-unpack/src/name.rs",
+        old='            "" | "." => {}',
+        new='            "" | "." | ".." => {}',
+        defect=(
+            "`..` is silently collapsed instead of refused, so "
+            "`foo/../../etc/passwd` becomes the in-root `foo/etc/passwd`. "
+            "Nothing escapes, and that is the trap: the extractor's idea of the "
+            "path and the archive's now differ, so every later whiteout and "
+            "duplicate comparison is made against a path nobody wrote."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-absolute-path-accepted",
+        file="crates/oci-unpack/src/name.rs",
+        old="    if name.starts_with('/') {",
+        new="    if false {",
+        defect=(
+            "An absolute entry name is re-rooted instead of refused, so an "
+            "image naming `/etc/passwd` silently gets a file in the image root "
+            "— an import that quietly differs from the archive it came from."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-whiteout-target-escapes-upward",
+        file="crates/oci-unpack/src/name.rs",
+        old='        if target == ".." {',
+        new="        if false {",
+        defect=(
+            "The whiteout target stops being checked for `..`, leaving only the "
+            "syscall-layer guard between `.wh...` and a recursive delete of the "
+            "staging root's parent. The pairing is deliberate, and this "
+            "mutation is what proves the outer guard is not decorative."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-whiteout-prefix-not-recognised",
+        file="crates/oci-unpack/src/name.rs",
+        old='const WH: &str = ".wh.";',
+        new='const WH: &str = ".wh.never-matches.";',
+        defect=(
+            "`.wh.` markers are treated as ordinary files, so nothing is "
+            "deleted and the markers themselves are materialised. The image "
+            "works and contains every file its author removed — including "
+            "whatever a `RUN rm` was supposed to have taken out."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-setuid-reaches-the-host",
+        file="crates/oci-unpack/src/lib.rs",
+        old="const fn host_mode(raw: u32) -> u32 {\n    raw & 0o777\n}",
+        new="const fn host_mode(raw: u32) -> u32 {\n    raw & 0o7777\n}",
+        defect=(
+            "setuid, setgid and sticky bits reach the host tree. A Debian-"
+            "derived base image carries about fifteen setuid binaries, so "
+            "importing one would drop attacker-authored setuid files into the "
+            "operator's home directory before any VM exists."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-opaque-keeps-lower-content",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if !keep.contains(&key) {",
+        new="        if false {",
+        defect=(
+            "An opaque whiteout stops deleting anything, so a directory the "
+            "layer declared empty keeps every lower-layer file in it."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-opaque-prune-stops-at-one-level",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if sys::is_dir(&st) {\n            let sub = dir.open_dir(&child)?;",
+        new="        if false {\n            let sub = dir.open_dir(&child)?;",
+        defect=(
+            "The opaque prune keeps a whole subtree whenever the layer wrote "
+            "one file inside it, instead of applying the rule again one level "
+            "down. The subtle half of the whiteout contract: the image looks "
+            "right and still carries the lower layer's secret."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-entry-bytes-unbounded",
+        file="crates/oci-unpack/src/lib.rs",
+        old="            if this_entry + n64 > self.limits.max_entry_bytes {",
+        new="            if false {",
+        defect=(
+            "The per-entry ceiling stops firing, so a few kilobytes of gzip "
+            "expand to whatever the archive declared. The counter sits on the "
+            "decompressed stream precisely so the declared size never matters."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-refusal-leaves-a-staging-tree",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if self.promoted {\n            return;\n        }",
+        new="        if true {\n            return;\n        }",
+        defect=(
+            "A refused image stops discarding its staging tree, so a partly "
+            "applied stack of untrusted layers survives on disk beside the "
+            "destination — invariant 9, which is what makes every other "
+            "refusal safe to be total."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-dangling-destination-adopted",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if std::fs::symlink_metadata(dest).is_ok() {",
+        new="        if dest.exists() {",
+        defect=(
+            "The destination check goes back to `exists()`, which follows a "
+            "symbolic link and reports false when its target is absent — so a "
+            "dangling link at the destination is adopted and the promoting "
+            "rename lands somewhere the caller never named. The same shape as "
+            "the copy-out escape found in 0.11.0."
+        ),
+        package="isopod-oci-unpack",
+    ),
 ]
 
 

@@ -1,0 +1,23 @@
+[package]
+name = "isopod-oci-unpack"
+description = "Confined extractor for OCI image layer tars: applies untrusted layers onto a host directory tree without ever letting an entry, a symlink or a hard link name a path outside it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Entry iteration only. `Archive::unpack` is never called — its traversal
+# handling is exactly what this crate exists to replace.
+tar = { workspace = true }
+# `openat`/`mkdirat`/`unlinkat`/`linkat` and friends: the whole confinement is a
+# directory-fd walk with O_NOFOLLOW, which std cannot express. All of it lives
+# in `sys.rs`, the only module with `unsafe`. Matches the raw-libc style of the
+# sibling crates (no `nix`), and is already in the lockfile.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Only the tests decompress. The extractor takes an already-decompressed
+# reader, so the bomb fixtures have to build the compressed stream themselves
+# to prove the byte counter sits on the *decompressed* side.
+flate2 = { workspace = true }

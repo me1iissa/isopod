@@ -8,6 +8,7 @@ members = [
     "crates/cli",
     "crates/mcp",
     "crates/jail",
+    "crates/oci-unpack",
 ]
 
 [workspace.package]
