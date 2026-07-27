@@ -115,8 +115,8 @@ MUTATIONS = [
     Mutation(
         name="staging-name-overflows",
         file="crates/core/src/agent.rs",
-        old="let mut keep = NAME_MAX.saturating_sub(suffix.len() + 1).min(base.len());",
-        new="let mut keep = base.len();",
+        old="    let mut keep = NAME_MAX.saturating_sub(suffix_len + 1).min(base.len());",
+        new="    let mut keep = base.len();",
         defect=(
             "The staging name is no longer clamped to NAME_MAX, so a destination "
             "basename the kernel accepts produces a staging name it refuses."
