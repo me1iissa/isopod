@@ -1020,6 +1020,30 @@ async fn open_copy_out_dest(dest: &Path) -> Result<CopyOutDest, AgentError> {
     }
 }
 
+/// How much of a destination's name a staging file may copy.
+///
+/// The staging name is `.<base><suffix>`, and all of it has to fit inside
+/// `NAME_MAX` — otherwise a destination the kernel accepts produces a staging
+/// name it refuses, which is a copy failing on a name the caller never chose.
+/// Uniqueness comes from the pid and the sequence number in the suffix, not from
+/// the copied part, so trimming costs nothing.
+///
+/// Pure, and separated from `stage_copy_out` so it can be tested over every
+/// length rather than at whatever length one process's pid happens to produce.
+/// The first version of this was inline, and its test picked a single name whose
+/// truncation point depended on the pid's digit count — it passed locally and
+/// let a mutation through on CI, where the pid was a digit longer.
+fn clamp_stage_base(base: &str, suffix_len: usize) -> &str {
+    // `+ 1` for the leading dot that marks the staging file hidden.
+    let mut keep = NAME_MAX.saturating_sub(suffix_len + 1).min(base.len());
+    // `floor_char_boundary` is unstable; walking back is the stable equivalent.
+    // Slicing mid-character panics, and `base` is caller-supplied.
+    while keep > 0 && !base.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    &base[..keep]
+}
+
 /// Create the sibling temporary that a staged copy streams into.
 async fn stage_copy_out(dest: &Path) -> Result<CopyOutDest, AgentError> {
     let parent = match dest.parent() {
@@ -1038,18 +1062,10 @@ async fn stage_copy_out(dest: &Path) -> Result<CopyOutDest, AgentError> {
     // and two of them into one directory must not pick the same name.
     let n = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     let suffix = format!(".isopod-{}-{n}.part", std::process::id());
-    // The suffix plus the leading dot has to fit inside `NAME_MAX` alongside the
-    // destination's own name, so trim the copied part rather than let the
-    // staging open fail on a destination the kernel would have accepted: a
-    // 240-byte basename is a legal file and must not become a 261-byte staging
-    // name. Uniqueness comes from the pid and the sequence number, not from the
-    // name being complete, so trimming costs nothing. `floor_char_boundary` is
-    // unstable, hence the walk back to a boundary.
-    let mut keep = NAME_MAX.saturating_sub(suffix.len() + 1).min(base.len());
-    while keep > 0 && !base.is_char_boundary(keep) {
-        keep -= 1;
-    }
-    let temp = parent.join(format!(".{}{suffix}", &base[..keep]));
+    let temp = parent.join(format!(
+        ".{}{suffix}",
+        clamp_stage_base(&base, suffix.len())
+    ));
     // `O_EXCL` so this never adopts a file somebody else left — or planted — at
     // that name. It also refuses a symlink there: `O_CREAT|O_EXCL` returns
     // `EEXIST` on one rather than following it, so `O_NOFOLLOW` below is
@@ -2309,9 +2325,9 @@ mod tests {
             );
         }
 
-        // A multibyte basename long enough to be clamped must be trimmed on a
-        // character boundary. Slicing mid-character panics, and the destination
-        // is caller-supplied, so this is reachable rather than theoretical.
+        // A multibyte basename long enough to be clamped must survive the real
+        // call too — `clamp_stage_base`'s own test covers every length, this
+        // proves `stage_copy_out` actually routes through it.
         let wide = dir.path().join("中".repeat(120)); // 360 bytes, all 3-byte chars
         let sink = stage_copy_out(&wide)
             .await
@@ -2319,13 +2335,60 @@ mod tests {
         let CopyOutDest::Staged { temp, .. } = &sink else {
             unreachable!()
         };
-        let name = temp.path().file_name().unwrap().to_string_lossy();
-        assert!(name.len() <= NAME_MAX, "clamped name still overflows");
         assert!(
-            std::str::from_utf8(name.as_bytes()).is_ok(),
-            "the clamp split a character"
+            temp.path().file_name().unwrap().len() <= NAME_MAX,
+            "clamped name still overflows"
         );
         drop(sink);
+    }
+
+    /// The staging-name clamp, over every length and every character width.
+    ///
+    /// Testing this through `stage_copy_out` cannot work: the truncation point
+    /// depends on the pid's digit count, so a single name is a coin flip about
+    /// whether it lands mid-character. That is not hypothetical — the first
+    /// version of this test did exactly that, passed on a five-digit pid, and
+    /// let the mutation that removes the boundary walk-back through on CI, where
+    /// the pid was six digits. A pure function can be swept instead of sampled.
+    #[test]
+    fn the_staging_name_clamp_never_splits_a_character() {
+        // Every width that exists in UTF-8, so no suffix length can dodge them
+        // all: whatever `keep` lands on, some width is misaligned to it.
+        for (label, ch) in [
+            ("1-byte", "a"),
+            ("2-byte", "é"),
+            ("3-byte", "中"),
+            ("4-byte", "𝄞"),
+        ] {
+            let base = ch.repeat(300);
+            // Sweep the suffix length across the whole plausible range, which
+            // covers every pid width and sequence number the real caller can
+            // produce, plus the degenerate ends.
+            for suffix_len in 0..=NAME_MAX + 8 {
+                let kept = clamp_stage_base(&base, suffix_len);
+                // `.{kept}{suffix}` is the whole staging name: dot + kept + suffix.
+                assert!(
+                    kept.len() + suffix_len < NAME_MAX || kept.is_empty(),
+                    "{label}/{suffix_len}: staging name would exceed NAME_MAX"
+                );
+                assert!(
+                    base.starts_with(kept),
+                    "{label}/{suffix_len}: clamp must return a prefix"
+                );
+                // `kept` being a `&str` at all is the boundary guarantee — a
+                // mid-character slice panics rather than returning. Asserting the
+                // round-trip makes that explicit rather than incidental.
+                assert_eq!(
+                    std::str::from_utf8(kept.as_bytes()).unwrap(),
+                    kept,
+                    "{label}/{suffix_len}: clamp split a character"
+                );
+            }
+        }
+        // A name shorter than the budget is copied whole.
+        assert_eq!(clamp_stage_base("short.bin", 24), "short.bin");
+        // An empty name stays empty rather than underflowing.
+        assert_eq!(clamp_stage_base("", 24), "");
     }
 
     /// A copy that fails must not destroy the file it was aimed at.

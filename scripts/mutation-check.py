@@ -130,7 +130,23 @@ MUTATIONS = [
         new="",
         defect=(
             "The name clamp stops walking back to a character boundary, so a "
-            "multibyte destination name long enough to clamp panics on a slice."
+            "multibyte destination name long enough to clamp panics on a slice. "
+            "Caught only by a test that sweeps every suffix length: the "
+            "truncation point depends on the pid's digit count, so a single "
+            "sampled name passes or fails by luck — this mutation survived CI "
+            "once for exactly that reason."
+        ),
+        filter="agent::",
+    ),
+    Mutation(
+        name="staging-name-unclamped-length",
+        file="crates/core/src/agent.rs",
+        old="    let mut keep = NAME_MAX.saturating_sub(suffix_len + 1).min(base.len());",
+        new="    let mut keep = NAME_MAX.saturating_sub(suffix_len).min(base.len());",
+        defect=(
+            "The clamp forgets the leading dot, so a staging name lands exactly "
+            "one byte over NAME_MAX — the off-by-one that only shows up at the "
+            "boundary, on a destination the kernel would have accepted."
         ),
         filter="agent::",
     ),
