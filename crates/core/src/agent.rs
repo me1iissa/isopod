@@ -607,7 +607,9 @@ impl AgentClient {
     /// count disagrees with `FileDone` (file changed mid-copy), the stream
     /// exceeded `max_bytes` (host-enforced), or the connection died,
     /// [`AgentError::Timeout`] if the guest went silent mid-stream, or a
-    /// connect/framing/IO error. On any error the partial host file is removed.
+    /// connect/framing/IO error. On any error `dest` is left exactly as it was —
+    /// the bytes are staged beside it and only moved onto it once the guest has
+    /// said the file is complete (see [`CopyOutDest`]).
     pub async fn copy_out(
         &self,
         guest_path: &str,
@@ -626,7 +628,7 @@ impl AgentClient {
         )
         .await?;
 
-        let mut file = create_copy_out_dest(dest).await?;
+        let mut sink = open_copy_out_dest(dest).await?;
         let mut written: u64 = 0;
         let result = loop {
             // Idle-bounded per frame (F8): a healthy guest streams chunks
@@ -670,7 +672,7 @@ impl AgentClient {
                              (guest ignored max_bytes)"
                         )));
                     }
-                    match file.write_all(&bytes).await {
+                    match sink.file().write_all(&bytes).await {
                         Ok(()) => written = written.saturating_add(bytes.len() as u64),
                         Err(e) => {
                             break Err(
@@ -686,7 +688,7 @@ impl AgentClient {
                              {total_bytes} (file changed mid-copy?)"
                         )));
                     }
-                    if let Err(e) = file.flush().await {
+                    if let Err(e) = sink.file().flush().await {
                         break Err(io_err(format!("flushing copy-out dest {}", dest.display()))(e));
                     }
                     break Ok(CopyOutcome { total_bytes, mode });
@@ -695,20 +697,19 @@ impl AgentClient {
                 other => break Err(unexpected("copy_out", &other)),
             }
         };
-        if result.is_ok() {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = host_mode_for(result.as_ref().map(|c| c.mode).unwrap_or(0o644));
-            // Through the descriptor, not the path. A path-based `chmod` here is
-            // a second lookup of a name that was already resolved once, so a
-            // symlink swapped in after the open would take the guest's mode bits
-            // — including an exec bit — to a file of somebody else's choosing.
-            let _ = file
-                .set_permissions(std::fs::Permissions::from_mode(mode))
-                .await;
-        } else {
-            let _ = tokio::fs::remove_file(dest).await;
+        match result {
+            Ok(outcome) => {
+                sink.commit(host_mode_for(outcome.mode)).await?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                // The destination is left exactly as it was — see
+                // [`CopyOutDest`]. A failed copy is not a licence to destroy the
+                // file the caller named.
+                sink.abandon().await;
+                Err(e)
+            }
         }
-        result
     }
 
     // -- internals ----------------------------------------------------------
@@ -820,23 +821,199 @@ impl AgentClient {
 /// blocking-pool thread with no timeout of its own. It is ignored for regular
 /// files, so it costs the ordinary case nothing, and it leaves a device
 /// destination such as `/dev/null` working.
-async fn create_copy_out_dest(dest: &Path) -> Result<tokio::fs::File, AgentError> {
-    tokio::fs::OpenOptions::new()
+/// Distinguishes the staging files of concurrent copies into one directory.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// An opened copy-out destination, and how bytes reach it.
+///
+/// A copy can fail long after the destination is opened: the guest can report a
+/// missing source, stream fewer bytes than it promised, blow the ceiling, or go
+/// silent. The file the caller named must not be collateral damage when it
+/// does. Opening it `O_TRUNC` and unlinking it on the error path made `copy_out`
+/// a *delete* primitive over the whole destination tree — a caller that produced
+/// no bytes at all could name any file and destroy it — which is a good deal
+/// more than "write an artifact here".
+#[derive(Debug)]
+enum CopyOutDest {
+    /// The destination is a regular file, or does not exist yet.
+    ///
+    /// Bytes go to a sibling temporary; it is renamed onto the destination once
+    /// the guest says the file is complete, and unlinked if anything goes wrong.
+    /// So a failed copy leaves the destination byte-identical, and a successful
+    /// one replaces it in a single step with no window in which a reader sees it
+    /// half-written.
+    ///
+    /// The cost is that publishing needs write permission on the *directory*, not
+    /// just on the destination, and that a copy killed mid-flight leaves the
+    /// staging file behind. It is named `.<dest>.isopod-<pid>-<n>.part` so it is
+    /// recognisable, and a leftover is inert — the previous behaviour left a
+    /// truncated file at the destination's own name, which is worse, because it
+    /// looks exactly like the artifact.
+    Staged {
+        file: tokio::fs::File,
+        temp: PathBuf,
+        dest: PathBuf,
+    },
+    /// The destination is a device, or a FIFO with a reader.
+    ///
+    /// There is nothing to replace and a rename would *destroy the node* — a
+    /// copy to `/dev/null` would leave a regular file where the device was — so
+    /// the bytes are written straight through, as they always were.
+    Direct { file: tokio::fs::File },
+}
+
+impl CopyOutDest {
+    /// The descriptor the stream writes into.
+    fn file(&mut self) -> &mut tokio::fs::File {
+        match self {
+            Self::Staged { file, .. } | Self::Direct { file } => file,
+        }
+    }
+
+    /// Publish a completed copy.
+    ///
+    /// The mode is applied before the rename, so the file is never visible at
+    /// its final name carrying the wrong bits.
+    async fn commit(mut self, mode: u32) -> Result<(), AgentError> {
+        use std::os::unix::fs::PermissionsExt;
+        // Through the descriptor, not the path. A path-based `chmod` here is a
+        // second lookup of a name that was already resolved once, so a symlink
+        // swapped in after the open would take the guest's mode bits —
+        // including an exec bit — to a file of somebody else's choosing.
+        let _ = self
+            .file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .await;
+        match self {
+            Self::Staged { file, temp, dest } => {
+                // Close before renaming: the bytes have to be in the file, not
+                // in a buffer owned by a descriptor that outlives the move.
+                drop(file);
+                if let Err(e) = tokio::fs::rename(&temp, &dest).await {
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    return Err(io_err(format!(
+                        "publishing copy-out dest {} (staged at {})",
+                        dest.display(),
+                        temp.display()
+                    ))(e));
+                }
+                Ok(())
+            }
+            Self::Direct { .. } => Ok(()),
+        }
+    }
+
+    /// Abandon a failed copy, leaving the destination as it was.
+    async fn abandon(self) {
+        if let Self::Staged { file, temp, .. } = self {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+    }
+}
+
+/// Open a copy-out destination and decide how to write it.
+///
+/// `O_NOFOLLOW` moves the symlink guarantee from the check to the syscall: the
+/// write refuses to traverse a link whatever the check concluded. It applies to
+/// the **final** component only, so a destination reached through a symlinked
+/// directory still works, and the MCP path — which passes the already
+/// canonicalised destination — is unaffected in every legitimate case.
+///
+/// This is on the shared path rather than the MCP one because the CLI does not
+/// want a surprise traversal either. `isopod run --copy-out g:/host/p` says
+/// "write the artifact to `/host/p`"; if `/host/p` is a link, the bytes land
+/// somewhere the operator did not name, and the mode bits the guest chose land
+/// there too. The operator keeps every unconfined destination they had — they
+/// are only asked to name the file rather than a link to it, and the refusal
+/// says so.
+///
+/// `O_NONBLOCK` is set for a different failure: `open(O_WRONLY)` on a FIFO
+/// blocks until a reader arrives, which under the MCP server would wedge a
+/// blocking-pool thread with no timeout of its own. It is ignored for regular
+/// files, so it costs the ordinary case nothing, and it leaves a device
+/// destination such as `/dev/null` working.
+///
+/// The open carries neither `O_CREAT` nor `O_TRUNC`: this call learns what the
+/// destination *is* without altering it, so a copy that never delivers a byte
+/// cannot have changed the host. What it learns picks the [`CopyOutDest`] arm.
+async fn open_copy_out_dest(dest: &Path) -> Result<CopyOutDest, AgentError> {
+    match tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dest)
         .await
-        .map_err(|e| {
+    {
+        Ok(file) => {
+            let kind = file
+                .metadata()
+                .await
+                .map_err(io_err(format!(
+                    "inspecting copy-out dest {}",
+                    dest.display()
+                )))?
+                .file_type();
+            if kind.is_file() {
+                stage_copy_out(dest).await
+            } else {
+                Ok(CopyOutDest::Direct { file })
+            }
+        }
+        // Not there yet is the ordinary case for a build artifact.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => stage_copy_out(dest).await,
+        Err(e) => {
             let hint = if e.raw_os_error() == Some(libc::ELOOP) {
                 " (it is a symbolic link, and isopod will not write through one: \
                   name the file the link points at)"
             } else {
                 ""
             };
-            io_err(format!("creating copy-out dest {}{hint}", dest.display()))(e)
-        })
+            Err(io_err(format!(
+                "creating copy-out dest {}{hint}",
+                dest.display()
+            ))(e))
+        }
+    }
+}
+
+/// Create the sibling temporary that a staged copy streams into.
+async fn stage_copy_out(dest: &Path) -> Result<CopyOutDest, AgentError> {
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        // A bare filename: the destination's directory is the process cwd.
+        _ => PathBuf::from("."),
+    };
+    let base = dest
+        .file_name()
+        .ok_or_else(|| {
+            AgentError::Unexpected(format!("copy-out dest {} names no file", dest.display()))
+        })?
+        .to_string_lossy()
+        .into_owned();
+    // Unique per process and per call: the MCP server serves copies in parallel,
+    // and two of them into one directory must not pick the same name.
+    let n = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{base}.isopod-{}-{n}.part", std::process::id()));
+    // `O_EXCL` so this never adopts a file somebody else left — or planted — at
+    // that name, and `O_NOFOLLOW` so it is never a link to one. Mode `0600`
+    // until [`CopyOutDest::commit`] applies the real bits: the staging file is
+    // never readable by anyone the finished artifact would not be.
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&temp)
+        .await
+        .map_err(io_err(format!(
+            "creating copy-out staging file {}",
+            temp.display()
+        )))?;
+    Ok(CopyOutDest::Staged {
+        file,
+        temp,
+        dest: dest.to_path_buf(),
+    })
 }
 
 /// The mode a copied-out file lands with on the host.
@@ -1693,7 +1870,7 @@ mod tests {
         std::os::unix::fs::symlink(&absent, &dangling).unwrap();
 
         for link in [&live, &dangling] {
-            let err = create_copy_out_dest(link)
+            let err = open_copy_out_dest(link)
                 .await
                 .expect_err("a symlink destination must be refused");
             assert!(
@@ -1713,33 +1890,135 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(
-            create_copy_out_dest(&fifo).await.is_err(),
+            open_copy_out_dest(&fifo).await.is_err(),
             "a FIFO with no reader must fail rather than block"
         );
 
         // A directory is refused by the kernel (EISDIR), and the ordinary cases
-        // — a new file, and an existing one to truncate — still work.
-        assert!(create_copy_out_dest(dir.path()).await.is_err());
+        // — a new file, and an existing one — still work.
+        assert!(open_copy_out_dest(dir.path()).await.is_err());
         let fresh = dir.path().join("artifact.bin");
-        drop(create_copy_out_dest(&fresh).await.expect("a new file"));
-        std::fs::write(&fresh, b"stale bytes to be replaced").unwrap();
-        drop(
-            create_copy_out_dest(&fresh)
-                .await
-                .expect("an existing file"),
+        open_copy_out_dest(&fresh)
+            .await
+            .expect("a new file")
+            .abandon()
+            .await;
+        assert!(
+            !fresh.exists(),
+            "an abandoned copy must not leave the destination behind"
         );
-        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0, "truncated");
+
+        // Opening an existing destination must not disturb it. The bytes are
+        // only replaced by `commit`, so everything between here and there —
+        // including a guest that never sends a chunk — leaves it intact.
+        std::fs::write(&fresh, b"stale bytes to be replaced").unwrap();
+        open_copy_out_dest(&fresh)
+            .await
+            .expect("an existing file")
+            .abandon()
+            .await;
+        assert_eq!(
+            std::fs::read(&fresh).unwrap(),
+            b"stale bytes to be replaced",
+            "opening a destination must not truncate it"
+        );
+
+        // Nothing may be left lying beside it either.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".part"))
+            .collect();
+        assert!(strays.is_empty(), "staging files leaked: {strays:?}");
 
         // A symlinked *directory* in the path is still fine: O_NOFOLLOW applies
         // to the final component only, so a project laid out through links keeps
         // working.
         let via = dir.path().join("via");
         std::os::unix::fs::symlink(outside.path(), &via).unwrap();
-        drop(
-            create_copy_out_dest(&via.join("through-a-linked-dir"))
+        open_copy_out_dest(&via.join("through-a-linked-dir"))
+            .await
+            .expect("a linked directory is not the final component")
+            .abandon()
+            .await;
+    }
+
+    /// A copy that fails must not destroy the file it was aimed at.
+    ///
+    /// The destination used to be opened `O_TRUNC` before the guest had said
+    /// whether the source even existed, and unlinked again on the error path.
+    /// That made `copy_out` a delete primitive over the whole destination tree:
+    /// name any file, produce no bytes, and it was gone. Both halves are
+    /// asserted here — the contents survive, and so does the file itself.
+    #[tokio::test]
+    async fn a_failed_copy_out_leaves_the_destination_untouched() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for failure in ["guest-error", "closed-mid-stream"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("vsock.sock");
+            let dest = dir.path().join("keepme.txt");
+            std::fs::write(&dest, b"ORIGINAL-IMPORTANT-DATA").unwrap();
+            let before = std::fs::metadata(&dest).unwrap().permissions().mode();
+
+            let listener = UnixListener::bind(&sock).unwrap();
+            let mode = failure;
+            let server = tokio::spawn(async move {
+                let mut conn = accept_handshake(&listener).await;
+                let req = read_req(&mut conn).await;
+                assert!(matches!(req.op, RequestOp::CopyOut { .. }));
+                if mode == "guest-error" {
+                    // The shape that was reported: the guest has no such file.
+                    write_resp(
+                        &mut conn,
+                        req.id,
+                        ResponseBody::Error {
+                            message: "No such file or directory (os error 2)".into(),
+                        },
+                    )
+                    .await;
+                    let mut b = [0u8; 1];
+                    let _ = conn.read(&mut b).await;
+                } else {
+                    // Bytes arrive and then the guest dies, so the failure comes
+                    // after the sink has been written to.
+                    write_resp(
+                        &mut conn,
+                        req.id,
+                        ResponseBody::FileChunk {
+                            data_b64: b64_encode(b"PARTIAL"),
+                        },
+                    )
+                    .await;
+                }
+            });
+
+            let client = AgentClient::new(&sock);
+            let err = client
+                .copy_out("/does-not-exist", &dest, 1024)
                 .await
-                .expect("a linked directory is not the final component"),
-        );
+                .expect_err("the copy must fail");
+
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                b"ORIGINAL-IMPORTANT-DATA",
+                "{failure}: a failed copy overwrote the destination ({err})"
+            );
+            assert_eq!(
+                std::fs::metadata(&dest).unwrap().permissions().mode(),
+                before,
+                "{failure}: a failed copy changed the destination's mode"
+            );
+            let strays: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .filter(|n| n.to_string_lossy().contains(".part"))
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "{failure}: staging file leaked: {strays:?}"
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

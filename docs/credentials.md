@@ -106,8 +106,10 @@ link, not its target.
 
 ### `host` is checked against the parser that will dial it
 
-`host` is a name or an address literal, exactly as it will be dialled. Two
-refusals happen before the broker starts, both naming the alias:
+`host` is a name or an address literal. Case and one trailing dot are normalised
+when the store is read rather than refused — `API.Example.COM.` is stored,
+recorded and dialled as `api.example.com` — and beyond that it is used exactly as
+written. Three refusals happen before the broker starts, all naming the alias:
 
 - **An address this broker will not dial** — loopback, link-local (the metadata
   service at `169.254.169.254`), a slot's own `10.107.0.0/16` gateway, or a
@@ -123,10 +125,17 @@ refusals happen before the broker starts, both naming the alias:
   itself is one isopod would dial: an `egress.denied` record saying
   `host: "2852039166"` is one no operator will grep for `169.254.169.254`.
   Write the dotted quad.
+- **A host the URL parser cannot read at all.** A name whose last label is
+  entirely digits or `0x`-hex — `api.123`, `svc.0x1` — sends a WHATWG parser down
+  its "this is an address" branch, where it fails as a malformed IPv4 literal.
+  The HTTP client would refuse to dial it too, so the credential could never be
+  spent; the run is refused at startup instead of at the first call. The message
+  says "invalid IPv4 address" even though you wrote a name, because that is the
+  branch the parser took.
 
-A pinned **name** is untouched by both, and is floored where it belongs — at
-resolution, so a name whose DNS answers `127.0.0.1` gets no connection rather
-than an `Authorization` header.
+A pinned **name** that parses is untouched by the first two, and is floored where
+it belongs — at resolution, so a name whose DNS answers `127.0.0.1` gets no
+connection rather than an `Authorization` header.
 
 ### `allow` is mandatory
 

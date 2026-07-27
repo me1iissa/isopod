@@ -151,9 +151,12 @@ struct RunArgs {
     stdin_file: Option<String>,
     /// Stream a guest file to the host after the command finishes (repeatable):
     /// `--copy-out /guest/path:/host/path`. Attempted only when the exec
-    /// completed without timing out; a copy failure fails the run. The host
-    /// path is opened without following a symlink at its final component, so
-    /// guest-authored bytes land on the path you named or nowhere.
+    /// completed without timing out; a copy failure fails the run. The host path
+    /// is opened without following a symlink at its final component, so the
+    /// bytes are never written through a link you named — though a symlink among
+    /// its parent directories is still followed. Bytes are staged beside the
+    /// destination and moved onto it only once the guest says the file is
+    /// complete, so a failed copy leaves an existing file untouched.
     #[arg(long = "copy-out", value_name = "GUEST:HOST")]
     copy_out: Vec<String>,
     /// Permit egress to this host (repeatable). Presence switches the run to

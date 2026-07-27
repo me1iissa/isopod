@@ -26,9 +26,12 @@
 //! At runtime a VM **claims** a free slot by taking a non-blocking exclusive
 //! `flock` on `~/.isopod/net/slot-<i>.lock`, and holds it for the run's whole
 //! lifetime; [`Slot`] drop closes the descriptor, which is what releases it.
-//! Crash recovery needs no sweep and no bookkeeping: the kernel drops the lock
-//! when the holding process dies, however it died. The manifest
-//! `~/.isopod/net/slots.json` records what `setup` provisioned.
+//! The *lock* needs no sweep and no bookkeeping: the kernel drops it when the
+//! holding process dies, however it died. The *slot* is a different question —
+//! a supervisor killed with `SIGKILL` leaves its Firecracker running and still
+//! holding the tap, so callers run [`crate::vm::registry::reap_orphans`] before
+//! claiming. The manifest `~/.isopod/net/slots.json` records what `setup`
+//! provisioned.
 //!
 //! The `*_in(root)` helpers take an explicit state root so the slot logic is
 //! unit-testable against a temp directory without a real `~/.isopod`.
@@ -445,9 +448,14 @@ fn all_taps_present(slot_count: usize, present: impl Fn(&str) -> bool) -> Result
 /// Claim the lowest-numbered free **public** slot (NAT egress to the public
 /// internet).
 ///
-/// The returned [`Slot`] releases itself on drop. There is no crash-recovery
-/// step to run first: a slot whose owner died is already free, because the
-/// kernel released its `flock`.
+/// The returned [`Slot`] releases itself on drop, and the kernel releases the
+/// `flock` if the process dies instead — so there is no lock to sweep.
+///
+/// That is not the same as the slot being usable. A supervisor killed with
+/// `SIGKILL` leaves its Firecracker alive and still holding the tap, and the
+/// lock says nothing about that. Callers are expected to run
+/// [`crate::vm::registry::reap_orphans`] first, which is what actually frees the
+/// tap; both of isopod's do.
 ///
 /// # Errors
 /// If setup has not run, the manifest cannot be read, or every public slot is

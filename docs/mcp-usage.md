@@ -262,14 +262,18 @@ not the sandbox. Since 0.11.0 both are confined:
 
 ```mermaid
 flowchart TB
-    C["a sandbox_run argument<br/>naming a host path"] --> N["normalised — trailing separators<br/>and '.' dropped, '..' refused"]
+    C["a sandbox_run argument<br/>naming a host path"] --> N["normalised — trailing separators<br/>and '.' dropped, a dangling '..' refused"]
     N --> R{"resolved — symlinks<br/>followed first"}
     R -->|"inside the host-I/O root"| OK["allowed"]
     R -->|"outside it"| NO["refused, naming the root<br/>and the variable that moves it"]
     OK --> M{"which direction?"}
     M -->|"stdin_file"| RD["regular files only,<br/>4 MiB ceiling"]
     M -->|"copy_out[].host"| WR["opened O_NOFOLLOW, so the write<br/>refuses a symlink whatever the check said"]
-    WR --> MO["mode masked: never setuid,<br/>setgid, sticky, group/other write"]
+    WR --> ST["bytes staged in a sibling<br/>.name.isopod-pid-n.part"]
+    ST --> MO["mode masked: never setuid,<br/>setgid, sticky, group/other write"]
+    MO --> RN{"guest reported<br/>the file complete?"}
+    RN -->|"yes"| PUB["renamed onto the destination<br/>in one step"]
+    RN -->|"no"| DEL["staging file removed —<br/>the destination is untouched"]
 ```
 
 The root defaults to **the server's working directory** — the project a coding
@@ -279,14 +283,26 @@ inside the root cannot reach out of it.
 
 A write destination is **normalised first**: trailing separators and `.`
 components are dropped so that every guard sees the same final component the
-kernel will, and `..` stays refused. That matters because it went wrong — the
-guard that refuses a dangling symlink was skipped entirely by writing the link as
-`link/` rather than `link`, since `symlink_metadata` on a path with a trailing
-separator reports `ENOTDIR`. The write then opens the final component with
-`O_NOFOLLOW`, so it refuses to traverse a symlink whatever the check concluded; a
-check and an open are two lookups of one name, and only the syscall can close the
-gap. The same flag applies to the `isopod` CLI's `--copy-out`, which now writes to
-the path you named or fails, rather than to wherever it points.
+kernel will. A `..` below the deepest existing directory is refused outright; any
+other `..` is resolved against the existing prefix and then re-tested against the
+root. That matters because it went wrong — the guard that refuses a dangling
+symlink was skipped entirely by writing the link as `link/` rather than `link`,
+since `symlink_metadata` on a path with a trailing separator reports `ENOTDIR`.
+The write then opens the final component with `O_NOFOLLOW`, so it refuses to
+traverse a symlink whatever the check concluded; a check and an open are two
+lookups of one name, and only the syscall can close the gap. The same flag applies
+to the `isopod` CLI's `--copy-out`, which now writes to the path you named or
+fails, rather than through it to wherever it points — at the final component;
+a symlink among the parent directories is still followed, which `SECURITY.md`
+records as an explicit non-claim.
+
+The bytes do not go to the destination directly. They are staged in a sibling
+`.<name>.isopod-<pid>-<n>.part` and renamed onto it only once the guest reports
+the file complete. A copy that fails partway — a missing guest source, a blown
+ceiling, a guest that goes silent — leaves the destination byte-identical, where
+it used to leave it truncated or deleted. A device or a reader-backed FIFO is
+still written straight through, since renaming onto `/dev/null` would replace the
+node with a regular file.
 
 | Variable | Effect |
 |---|---|

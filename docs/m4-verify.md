@@ -132,13 +132,24 @@ installed package (import works) while the parent stage stays byte-identical.
 ## 5. 👤 Leak / crash recovery
 
 ```bash
-# Kill a run mid-flight (Ctrl-C or kill -9) and confirm its slot is immediately
-# reusable — no slot is permanently lost:
-ls ~/.isopod/net/                     # the slot-<i>.lock files persist; they are empty
-                                      # and always present, so this says nothing about
-                                      # occupancy. The kernel does:
-flock -n ~/.isopod/net/slot-0.lock true && echo "slot 0 is free"
-./target/debug/isopod run -- /bin/sh -c 'echo recovered'   # reuses the dead run's slot
+# Kill a run mid-flight (Ctrl-C or kill -9) and confirm no slot is permanently
+# lost. Two separate things have to come back, and only one of them is the lock.
+ls ~/.isopod/net/                     # empty slot-<i>.lock files, created lazily —
+                                      # one appears the first time that index is
+                                      # claimed, and none of them says anything
+                                      # about occupancy either way.
+
+# The LOCK is released by the kernel the moment the owning process dies. But a
+# free lock does NOT mean a usable slot: `kill -9` of the supervisor leaves its
+# Firecracker running and still holding the tap, so this can report "free" while
+# the slot is unusable. Do not treat it as a health check.
+#   (`-E 1` and the redirect keep it from creating the lockfile at your umask —
+#    plain `flock ... true` will create a 0644 one where isopod uses 0600.)
+flock -n -E 1 ~/.isopod/net/slot-0.lock true 2>/dev/null && echo "slot 0's lock is free"
+
+# The SLOT comes back when the next run reaps the orphaned VMM. That is the
+# check that actually matters:
+./target/debug/isopod run -- /bin/sh -c 'echo recovered'   # reaps, then reuses the slot
 pgrep -a firecracker || echo "no leaked VMM"
 ```
 

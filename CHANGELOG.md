@@ -60,18 +60,21 @@ the same thing as a fix that closes the class.
   built the destination with no trailing separator — the one spelling that already
   worked.
 
-  The fix is in two places on purpose. The destination is normalised (trailing
-  separators and `.` components dropped, `..` still refused) before any guard
-  runs, so no guard can be shown a different final component from the one that
-  will be opened. And the write itself now opens with **`O_NOFOLLOW`**, so it
-  refuses to traverse a link whatever the check concluded — because a path check
-  and a `File::create` are two lookups of one name, and a symlink planted between
-  them defeats any amount of checking. `O_NONBLOCK` goes on with it, so a FIFO
-  destination fails instead of blocking a thread forever. This is on the shared
-  path, so the CLI gets it too: `isopod run --copy-out g:/host/p` now writes to
-  `/host/p` or fails, rather than to wherever `/host/p` points. The read path
-  (`stdin_file`) was verified unaffected — it canonicalises, and both spellings
-  were already refused.
+  The fix is in two places on purpose. The destination is normalised before any
+  guard runs — trailing separators and `.` components dropped, a `..` below the
+  deepest existing directory refused outright and any other `..` resolved against
+  the existing prefix and re-tested against the root — so no guard can be shown a
+  different final component from the one that will be opened. And the write itself
+  now opens with **`O_NOFOLLOW`**, so it refuses to traverse a link whatever the
+  check concluded — because a path check and a `File::create` are two lookups of
+  one name, and a symlink planted between them defeats any amount of checking.
+  `O_NONBLOCK` goes on with it, so a FIFO destination fails instead of blocking a
+  thread forever. This is on the shared path, so the CLI gets it too: `isopod run
+  --copy-out g:/host/p` now writes to `/host/p` or fails, rather than through
+  `/host/p` to wherever it points. That is a statement about the **final
+  component**; a symlink among the parent directories is still followed, which
+  `SECURITY.md` records as an explicit non-claim. The read path (`stdin_file`) was
+  verified unaffected — it canonicalises, and both spellings were already refused.
 - **The pinned-host floor checked a different parser than the dialer uses.** The
   guard added earlier in this release classified a credential's pinned host with
   `host.parse::<IpAddr>()` and skipped anything that failed, reasoning that a name
@@ -86,8 +89,11 @@ the same thing as a fix that closes the class.
   with the same parser the dialer uses, and additionally refuses any pinned host
   the parser rewrites at all — `egress.denied` recorded `host: "2852039166"`,
   which an operator cannot grep for `169.254.169.254`, so the store, the log and
-  the destination are now required to be one string. A pinned *name* is untouched
-  and still floored at resolution.
+  the destination are now required to be one string. A pinned *name* that the URL
+  parser accepts is untouched and still floored at resolution; one whose last
+  label is all digits or `0x`-hex (`api.123`) takes the parser's address branch,
+  fails there, and is refused at startup — `reqwest` could not have dialled it
+  either, so the credential could never have been spent.
 - **Three lockfile shapes the `flock` claim stopped handling.** Replacing
   `O_CREAT|O_EXCL` with `O_CREAT` (necessary — the lockfile is now durable)
   incidentally dropped the refusal `O_EXCL` was providing. A **FIFO** at
@@ -109,6 +115,39 @@ the same thing as a fix that closes the class.
   pid-and-start-time liveness test. Reproduced: the lock read free within 2 s while
   the orphaned VMM still held `isopod-tap0`. Both that bullet and the CHANGELOG's
   "correct the instant after" now say what actually happens.
+
+A **fourth** pass, over the third pass's fixes, found no way to escape the
+confinement — three independent reviews, 42 end-to-end escape attempts all
+refused with no filesystem delta, a 2,770,211-host fuzz of the pinned-host
+classifier with zero invariant violations, and 36 concurrent slot claimants with
+zero double-claims. It found one behavioural defect and a cluster of prose that
+overstated the code, all fixed here:
+
+- **A failed `copy_out` destroyed the file it was aimed at.** The destination was
+  opened `O_TRUNC` before the guest had said whether the source existed, and
+  unlinked again on the error path — so naming any writable file and producing no
+  bytes deleted it. Reproduced end to end: a `--copy-out` of a nonexistent guest
+  path removed 23 bytes of unrelated host data. Bytes are now staged in a sibling
+  `.<name>.isopod-<pid>-<n>.part` and renamed onto the destination only once the
+  guest reports the file complete, so a failure leaves it byte-identical and a
+  success replaces it in one step with no half-written window. A device or a
+  reader-backed FIFO is still written straight through — renaming onto `/dev/null`
+  would replace the node with a regular file.
+- **Prose that claimed more than the code did**, in ten places, all introduced by
+  this release's own fixes. `docs/m4-verify.md` told an operator to conclude "slot
+  0 is free" from `flock -n`, the exact inference this release documents as false;
+  it also called the lockfiles "always present" when they are created lazily, and
+  its command created one at `0644` where isopod uses `0600`. `net.rs`'s module doc
+  and `claim()`'s contract both said crash recovery needs no step, while both
+  callers run `reap_orphans()` first for the reason the contract denied.
+  `SECURITY.md` and the CHANGELOG said `..` is "refused" when it is resolved and
+  re-tested. The CLI's `--copy-out` help promised bytes "land on the path you named
+  or nowhere", which the parent chain and the truncation defect both contradicted.
+  `docs/credentials.md` said a pinned host is used "exactly as it will be dialled"
+  (case and one trailing dot are normalised first) and that a pinned name is
+  "untouched" (one whose last label is all digits is refused at startup). None of
+  these was a hole; all of them were the defect class this release spent three
+  commits fixing, so they are fixed rather than deferred.
 
 ### Fixed — the MCP surface could read and write arbitrary host files
 
@@ -266,8 +305,10 @@ process cannot read the live ruleset to confirm it.
   the isolation boundary, but it was a live one. The tests missed it because they
   claim and release in milliseconds, inside the grace period, and because the one
   test that built a lockfile by hand wrote the bare pid the code had stopped
-  writing. Fixture lockfiles are now built only through the claiming path, and the
-  regression test ages a real lock past the old grace before re-claiming.
+  writing. No fixture stands in for a *held* lock any more — the regression test
+  ages a real lock, taken through the claiming path, past the old grace before
+  re-claiming. The two tests that still write a lockfile by hand do so precisely
+  to prove an unheld file's contents are never read.
 
   Also fixed with it, and previously listed here as not fixed: deciding staleness
   and unlinking were two operations, so two claimants reading the same dead pid
