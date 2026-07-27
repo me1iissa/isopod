@@ -494,6 +494,20 @@ MUTATIONS = [
         package="isopod-oci-unpack",
     ),
     Mutation(
+        name="oci-teardown-cannot-unlock-what-finish-locked",
+        file="crates/oci-unpack/src/lib.rs",
+        old="            let _ = dir.chmod_child(name, 0o700);\n",
+        new="",
+        defect=(
+            "The teardown stops relaxing a directory's mode before descending "
+            "into it, so it cannot remove a tree that `finish` has already "
+            "locked down on the image's behalf — 0o000 refuses the open, 0o500 "
+            "refuses the unlink. Invariant 9 would then hold for every refusal "
+            "except one that happens after the modes are applied."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
         name="oci-dangling-destination-adopted",
         file="crates/oci-unpack/src/lib.rs",
         old="        if std::fs::symlink_metadata(dest).is_ok() {",
