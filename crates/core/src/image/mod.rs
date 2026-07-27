@@ -11,6 +11,7 @@ mod rootfs;
 mod s3;
 
 pub use kernel::{fetch_kernel, FetchKernelOutcome};
+pub(crate) use rootfs::base_image_path_in;
 pub use rootfs::{
     base_content_id, base_image_path, build_rootfs, check_image_proto, list_images,
     make_scratch_ext4, read_image_meta, BuildRootfsOutcome, ImageEntry, ImageList, ImageMeta,

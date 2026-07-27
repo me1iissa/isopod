@@ -62,7 +62,12 @@ const META_FILE: &str = "meta.json";
 pub struct BaseId {
     /// Base flavor slug (`base-sqfs` / `base-alpine`).
     pub flavor: String,
-    /// sha256 of the base image file, when its sidecar records one.
+    /// The sha256 the image's build sidecar *claims* for it, when there is one.
+    ///
+    /// Deliberately not a re-hash: hashing hundreds of MB on every run to catch
+    /// a case that only arises if someone edits the image store by hand is the
+    /// wrong trade. It does mean this identifies the recorded build, not the
+    /// bytes on disk — [`check_base`] can only be as truthful as the sidecar.
     pub sha256: Option<String>,
 }
 
@@ -86,6 +91,13 @@ impl BaseId {
 
 /// The outcome of comparing a stage's recorded base against the base image this
 /// host would actually boot it on. See [`check_base`].
+///
+/// The two failure modes are separate variants rather than one `Mismatch`
+/// because they have different answers: a rebuilt base is the *same* root moved
+/// on, which an operator may knowingly accept, while another flavor is a
+/// different root entirely and is never acceptable. Collapsing them into one
+/// value let a caller write a single `if allow_skew` arm and excuse both — which
+/// is exactly what happened, and what the type now prevents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaseCheck {
     /// Compatible — either the content ids match, or one side records none and
@@ -94,9 +106,33 @@ pub enum BaseCheck {
     /// The stage records a content id but the image on this host has no
     /// sidecar, so the comparison could not be made. Carries the advisory.
     Unverifiable(String),
-    /// The image differs from the build the layers were made against. Carries
-    /// the full explanation, ending with how to get back to a bootable stage.
-    Mismatch(String),
+    /// Same flavor, different build: the image has been rebuilt since the layers
+    /// were made over it. Refusable-but-overridable — the operator may know the
+    /// layers do not depend on what changed.
+    RebuiltBase(String),
+    /// A different base flavor altogether. **Never** overridable: these layers
+    /// were not built over an older version of this root, they were built over
+    /// another one.
+    WrongFlavor(String),
+}
+
+impl BaseCheck {
+    /// The explanation, for the variants that carry one.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            BaseCheck::Ok => None,
+            BaseCheck::Unverifiable(m) | BaseCheck::RebuiltBase(m) | BaseCheck::WrongFlavor(m) => {
+                Some(m)
+            }
+        }
+    }
+
+    /// Whether this verdict blocks the fork outright, regardless of any opt-in.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, BaseCheck::WrongFlavor(_))
+    }
 }
 
 /// Metadata describing one committed stage.
@@ -158,7 +194,7 @@ impl StageMeta {
 #[must_use]
 pub fn check_base(stage: &StageMeta, current: &BaseId) -> BaseCheck {
     if stage.base != current.flavor {
-        return BaseCheck::Mismatch(format!(
+        return BaseCheck::WrongFlavor(format!(
             "stage {} ({:?}) was committed on base {:?}, but this run resolved base {:?}. \
              A stage's layers only mean anything over the base they were built on; fork it \
              without `--base` (a stage's recorded base is authoritative) or rebuild the stage \
@@ -167,26 +203,31 @@ pub fn check_base(stage: &StageMeta, current: &BaseId) -> BaseCheck {
         ));
     }
     // Nothing recorded ⇒ nothing to disagree with. Every stage committed before
-    // stamping existed lands here, and keeps booting exactly as it did.
-    let Some(stamped) = stage.base_sha256.as_deref() else {
+    // stamping existed lands here, and keeps booting exactly as it did. A blank
+    // stamp counts as nothing recorded: it cannot have come from `sha256_file`,
+    // and comparing it produces "was built on image , but this host's is …".
+    let Some(stamped) = non_empty(stage.base_sha256.as_deref()) else {
         return BaseCheck::Ok;
     };
-    let Some(present) = current.sha256.as_deref() else {
+    let Some(present) = non_empty(current.sha256.as_deref()) else {
         return BaseCheck::Unverifiable(format!(
             "stage {} ({:?}) records the {} image it was built on ({}), but that image has no \
              build-metadata sidecar on this host, so the two cannot be compared — the stage is \
-             booting on a base that may not be the one its layers were made over. Restore the \
-             check with `isopod image build-all`.",
+             booting on a base that may not be the one its layers were made over. Rebuilding \
+             the image (`isopod image build-rootfs --flavor {} --force`) restores the stamp, \
+             but stamps it as a NEW build: every stage recording the old one then refuses to \
+             fork until it is rebuilt or booted with the opt-in.",
             stage.stage_id,
             stage.label,
             stage.base,
             short_id(stamped),
+            stage.base,
         ));
     };
     if stamped == present {
         return BaseCheck::Ok;
     }
-    BaseCheck::Mismatch(format!(
+    BaseCheck::RebuiltBase(format!(
         "stage {} ({:?}) was built on {} image {}, but this host's {} image is {} — it has been \
          rebuilt since. The stage's layers are overlay upperdirs over the older root, so they \
          would mount silently over the new one and leave a chain that no longer matches what is \
@@ -202,10 +243,20 @@ pub fn check_base(stage: &StageMeta, current: &BaseId) -> BaseCheck {
     ))
 }
 
+/// A content id that is present and not blank.
+fn non_empty(sha: Option<&str>) -> Option<&str> {
+    sha.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// First 12 characters of a content id, for messages (full sha256s make the
 /// difference between two of them harder to see, not easier).
-fn short_id(sha: &str) -> &str {
-    &sha[..sha.len().min(12)]
+///
+/// Counts characters, not bytes: these ids come off disk as `String`s with no
+/// validation, so a corrupt or hand-edited `meta.json` can carry any UTF-8 at
+/// all. Byte-slicing one would abort inside the function that exists to explain
+/// a refusal — turning "your stage cannot boot, here is why" into a panic.
+fn short_id(sha: &str) -> String {
+    sha.chars().take(12).collect()
 }
 
 /// Commit a scratch image as a new stage and return its metadata.
@@ -286,6 +337,27 @@ pub fn remove(reference: &str) -> Result<StageMeta> {
     remove_in(&paths::stages_dir()?, reference)
 }
 
+/// Compare **every stage in a chain** against the base image this host would
+/// boot it on, returning the most serious verdict.
+///
+/// [`check_base`] alone is not enough, because a chain is only as sound as its
+/// oldest layer. Checking the tip lets one unstamped link launder everything
+/// behind it: fork a stamped stage while the image is unstamped and the commit
+/// records `None`; that child then compares clean against any image forever,
+/// while its chain still mounts an ancestor's layers built over a root that is
+/// gone. The ancestors are what get mounted, so the ancestors are what must be
+/// checked.
+///
+/// Severity order is [`BaseCheck::WrongFlavor`] > [`BaseCheck::RebuiltBase`] >
+/// [`BaseCheck::Unverifiable`] > [`BaseCheck::Ok`]; the message names the
+/// offending ancestor, which is rarely the stage the operator asked for.
+///
+/// # Errors
+/// If the stage store cannot be read.
+pub fn check_base_chain(stage: &StageMeta, current: &BaseId) -> Result<BaseCheck> {
+    check_base_chain_in(&paths::stages_dir()?, stage, current)
+}
+
 /// Resolve a stage's `layer.ext4` paths in overlay-lowerdir order (root-first =
 /// oldest-first), validating the chain depth and that every referenced layer
 /// exists on disk.
@@ -330,7 +402,7 @@ pub fn stage_id_for(path: &Path) -> Result<String> {
 // Root-parameterized implementations (unit-testable without $ISOPOD_HOME).
 // ===========================================================================
 
-fn commit_in(
+pub(crate) fn commit_in(
     root: &Path,
     scratch_path: &Path,
     label: &str,
@@ -400,15 +472,32 @@ fn commit_in(
             // from recording a mixed-build chain that nobody asked for, while
             // letting the opt-out through — that is how a stage gets rebased
             // onto a new image at all.
-            if let BaseCheck::Mismatch(why) = check_base(&pmeta, base) {
-                let flavor_skew = pmeta.base != base.flavor;
-                if flavor_skew || !allow_base_skew {
-                    bail!("refusing to stack on stage {pid:?}: {why}");
+            //
+            // The whole parent CHAIN is checked, not just the parent: the new
+            // layer is mounted over every ancestor, so an ancestor built over a
+            // vanished root is this commit's problem too, however clean the
+            // immediate parent looks.
+            match check_base_chain_in(root, &pmeta, base)? {
+                BaseCheck::Ok => {}
+                BaseCheck::Unverifiable(why) => {
+                    eprintln!("stage commit: stacking on stage {pid:?}: {why}");
                 }
-                eprintln!(
-                    "stage commit: stacking on stage {pid:?} across a rebuilt base, \
-                     as the caller allowed: {why}"
-                );
+                v @ BaseCheck::WrongFlavor(_) => {
+                    bail!(
+                        "refusing to stack on stage {pid:?}: {}",
+                        v.message().unwrap_or_default()
+                    );
+                }
+                v @ BaseCheck::RebuiltBase(_) => {
+                    let why = v.message().unwrap_or_default();
+                    if !allow_base_skew {
+                        bail!("refusing to stack on stage {pid:?}: {why}");
+                    }
+                    eprintln!(
+                        "stage commit: stacking on stage {pid:?} across a rebuilt base, \
+                         as the caller allowed: {why}"
+                    );
+                }
             }
             (Some(pmeta.stage_id), pmeta.chain)
         }
@@ -488,7 +577,7 @@ fn list_in(root: &Path) -> Result<Vec<StageMeta>> {
     Ok(out)
 }
 
-fn resolve_in(root: &Path, reference: &str) -> Result<StageMeta> {
+pub(crate) fn resolve_in(root: &Path, reference: &str) -> Result<StageMeta> {
     // The empty string is a prefix of every label, so step 4 below resolved it to
     // whatever the single stage in a one-stage store happened to be — forking a
     // layer chain nobody named. An omitted stage has its own spelling (`None`,
@@ -555,7 +644,72 @@ fn remove_in(root: &Path, reference: &str) -> Result<StageMeta> {
     Ok(target)
 }
 
-fn chain_paths_in(root: &Path, stage: &StageMeta) -> Result<Vec<PathBuf>> {
+pub(crate) fn check_base_chain_in(
+    root: &Path,
+    stage: &StageMeta,
+    current: &BaseId,
+) -> Result<BaseCheck> {
+    // Rank so the worst verdict in the chain is the one returned: a single
+    // WrongFlavor ancestor decides the whole chain, and an Unverifiable link
+    // must not mask a RebuiltBase one further down.
+    fn rank(c: &BaseCheck) -> u8 {
+        match c {
+            BaseCheck::Ok => 0,
+            BaseCheck::Unverifiable(_) => 1,
+            BaseCheck::RebuiltBase(_) => 2,
+            BaseCheck::WrongFlavor(_) => 3,
+        }
+    }
+
+    let mut worst = BaseCheck::Ok;
+    for id in &stage.chain {
+        // The tip is in its own chain; use the meta we were handed rather than
+        // re-reading it, so a caller checking an uncommitted stage still works.
+        let ancestor = if id == &stage.stage_id {
+            stage.clone()
+        } else {
+            match get_by_id_in(root, id)? {
+                Some(m) => m,
+                // A layer with no readable meta.json: the artifact is there (a
+                // missing one is `chain_paths`' error to raise) but nothing says
+                // what it was built over. That is precisely the state this check
+                // must not read as "fine".
+                None => {
+                    let unknown = BaseCheck::Unverifiable(format!(
+                        "stage {} ({:?}) has an ancestor {id} whose metadata is missing, so what \
+                         its layers were built over cannot be established.",
+                        stage.stage_id, stage.label,
+                    ));
+                    if rank(&unknown) > rank(&worst) {
+                        worst = unknown;
+                    }
+                    continue;
+                }
+            }
+        };
+        let verdict = check_base(&ancestor, current);
+        if rank(&verdict) > rank(&worst) {
+            worst = verdict;
+        }
+    }
+    // Name the chain when the offending stage is not the one that was asked for:
+    // "stage X was built on …" is baffling when the operator typed Y.
+    if let (Some(msg), true) = (worst.message(), stage.chain.len() > 1) {
+        let annotated = format!(
+            "{msg} (reached through the chain of stage {} ({:?}), which mounts that layer)",
+            stage.stage_id, stage.label,
+        );
+        worst = match worst {
+            BaseCheck::Unverifiable(_) => BaseCheck::Unverifiable(annotated),
+            BaseCheck::RebuiltBase(_) => BaseCheck::RebuiltBase(annotated),
+            BaseCheck::WrongFlavor(_) => BaseCheck::WrongFlavor(annotated),
+            BaseCheck::Ok => BaseCheck::Ok,
+        };
+    }
+    Ok(worst)
+}
+
+pub(crate) fn chain_paths_in(root: &Path, stage: &StageMeta) -> Result<Vec<PathBuf>> {
     if stage.chain.is_empty() {
         bail!("stage {} has an empty chain", stage.stage_id);
     }
@@ -1303,7 +1457,7 @@ mod tests {
         )
         .unwrap();
 
-        let BaseCheck::Mismatch(why) = check_base(&meta, &sqfs_build("9999cccc8888dddd")) else {
+        let BaseCheck::RebuiltBase(why) = check_base(&meta, &sqfs_build("9999cccc8888dddd")) else {
             panic!("a rebuilt base must not be accepted");
         };
         // Both ids, the stage, and a way out — a refusal naming neither build
@@ -1342,7 +1496,17 @@ mod tests {
             panic!("an image with no sidecar cannot be compared, and must say so");
         };
         assert!(why.contains("abcdef012345"), "{why}");
-        assert!(why.contains("isopod image build-all"), "the fix: {why}");
+        assert!(
+            why.contains("build-rootfs --flavor base-sqfs --force"),
+            "the fix names the one flavor, not a whole-store rebuild: {why}"
+        );
+        // Following the advice re-stamps the image as a NEW build, which turns
+        // this warning into a refusal for every stage holding the old id. Advice
+        // that costs that much has to say so.
+        assert!(
+            why.contains("refuses to fork"),
+            "the cost of the fix: {why}"
+        );
     }
 
     #[test]
@@ -1353,7 +1517,8 @@ mod tests {
         let scratch = fixture(home.path(), "s", b"busybox layer");
         let meta = commit_in(&root, &scratch, "env", None, &sqfs(), false).unwrap();
 
-        let BaseCheck::Mismatch(why) = check_base(&meta, &BaseId::unstamped("base-alpine")) else {
+        let BaseCheck::WrongFlavor(why) = check_base(&meta, &BaseId::unstamped("base-alpine"))
+        else {
             panic!("a stage's layers do not transfer between flavors");
         };
         assert!(
@@ -1410,6 +1575,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.base_sha256.as_deref(), Some("1111111111111111"));
+    }
+
+    /// The laundering shape, at the store level: A stamped, B committed while
+    /// the image was unstamped, C on a third image. Checking only the immediate
+    /// parent let B's `None` vouch for A, so C — whose chain still mounts A's
+    /// layer — was recorded with nobody having opted into anything.
+    #[test]
+    fn an_unstamped_link_cannot_launder_a_stale_ancestor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let a = commit_in(
+            &root,
+            &fixture(home.path(), "a", b"A"),
+            "A",
+            None,
+            &sqfs_build("1111111111111111"),
+            false,
+        )
+        .unwrap();
+        // The image lost its sidecar: nothing can be compared, so B is allowed
+        // and records nothing. This link is legitimate — it is what it hides
+        // that is not.
+        let b = commit_in(
+            &root,
+            &fixture(home.path(), "b", b"B"),
+            "B",
+            Some(&a.stage_id),
+            &sqfs(),
+            false,
+        )
+        .expect("an unverifiable base is not a mismatch");
+        assert_eq!(b.base_sha256, None);
+
+        // A third image. B alone looks clean against it; B's CHAIN does not.
+        let err = commit_in(
+            &root,
+            &fixture(home.path(), "c", b"C"),
+            "C",
+            Some(&b.stage_id),
+            &sqfs_build("2222222222222222"),
+            false,
+        )
+        .expect_err("an ancestor built over a vanished root must refuse the stack");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&a.stage_id),
+            "names the ancestor, not just the parent: {msg}"
+        );
+        assert_eq!(list_in(&root).unwrap().len(), 2, "nothing new was recorded");
+
+        // And the verdict is reported for the chain, not only for the tip.
+        assert!(matches!(
+            check_base_chain_in(&root, &b, &sqfs_build("2222222222222222")).unwrap(),
+            BaseCheck::RebuiltBase(_)
+        ));
+        assert_eq!(
+            check_base(&b, &sqfs_build("2222222222222222")),
+            BaseCheck::Ok,
+            "the tip alone still looks fine — which is exactly why the chain is what counts"
+        );
+    }
+
+    /// Content ids come off disk as unvalidated strings. Truncating one by bytes
+    /// aborts inside the function whose whole job is to explain a refusal.
+    #[test]
+    fn a_corrupt_content_id_still_produces_a_refusal_rather_than_a_panic() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("stages");
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = commit_in(
+            &root,
+            &fixture(home.path(), "s", b"x"),
+            "env",
+            None,
+            &sqfs_build("0123456789€uro-not-a-sha"),
+            false,
+        )
+        .unwrap();
+
+        let BaseCheck::RebuiltBase(why) = check_base(&meta, &sqfs_build("abcdef0123456789")) else {
+            panic!("a different id is still a different id, however malformed");
+        };
+        assert!(
+            why.contains("0123456789€"),
+            "truncates on characters: {why}"
+        );
     }
 
     /// A stamped parent on a host whose image lost its sidecar: nothing can be

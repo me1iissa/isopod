@@ -228,6 +228,23 @@ pub fn build_rootfs(flavor: RootfsFlavor, force: bool) -> Result<BuildRootfsOutc
         .and_then(|f| f.sync_all())
         .context("fsync image")?;
     let (_, tmp_path) = tmp_img.keep().context("finalizing temp image")?;
+
+    // Invalidate the old stamp BEFORE the image it describes is replaced. These
+    // two are one publish in two steps, and the order decides what a failure
+    // between them leaves behind: sidecar-first leaves a new image vouched for
+    // by the old sidecar, which reads as verified and is not — a stage forks
+    // onto a root it was never built over with no warning at all. Removing the
+    // stamp first makes the same failure land on "unstamped", which the run path
+    // reports as a comparison it could not make.
+    let sidecar = image_meta_path(&dest);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("clearing the stale stamp {}", sidecar.display())))
+        }
+    }
     std::fs::rename(&tmp_path, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp_path.display(), dest.display()))?;
 
@@ -266,7 +283,7 @@ pub fn base_image_path(flavor: RootfsFlavor) -> Result<PathBuf> {
 
 /// [`base_image_path`] against an explicit `images` dir (unit-testable without
 /// mutating `$ISOPOD_HOME`).
-fn base_image_path_in(images: &Path, flavor: RootfsFlavor) -> Result<PathBuf> {
+pub(crate) fn base_image_path_in(images: &Path, flavor: RootfsFlavor) -> Result<PathBuf> {
     if !flavor.is_squashfs_base() {
         bail!(
             "flavor '{}' is not a squashfs base image (expected base-sqfs or base-alpine)",
@@ -371,8 +388,27 @@ fn write_image_meta(image: &Path, flavor: RootfsFlavor) -> Result<()> {
     };
     let path = image_meta_path(image);
     let json = serde_json::to_vec_pretty(&meta).context("serializing image meta")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    // Temp + fsync + rename, the same durability the image itself gets. A bare
+    // write can be torn by a crash, and half a sidecar parses as no sidecar —
+    // which silently downgrades every stage stamped against this image to
+    // "cannot be compared" rather than "does not match".
+    let tmp = image_meta_tmp_path(image);
+    let mut f =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    std::io::Write::write_all(&mut f, &json)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsync {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, &path).with_context(|| format!("finalizing {}", path.display()))?;
     Ok(())
+}
+
+/// Staging path for an image's sidecar (`<image>.meta.json.partial`).
+fn image_meta_tmp_path(image: &Path) -> PathBuf {
+    let mut s = image_meta_path(image).into_os_string();
+    s.push(".partial");
+    PathBuf::from(s)
 }
 
 /// Read an image's sidecar. `Ok(None)` when no sidecar exists (an image built
@@ -1667,6 +1703,63 @@ mod tests {
             std::fs::read_link(root.join("bin/sh")).unwrap(),
             Path::new("/bin/busybox"),
             "existing /bin/sh link preserved"
+        );
+    }
+
+    /// The image and its stamp are one publish in two steps, and the order is
+    /// the whole guarantee: if the stamp survives a failed rebuild, it vouches
+    /// for an image that is no longer there, and the pre-boot check passes on a
+    /// root the stage was never built over. Clearing it first makes the same
+    /// failure land on "unstamped", which is reported rather than believed.
+    #[test]
+    fn a_stamp_never_outlives_the_image_it_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("base.sqfs");
+        std::fs::write(&img, b"first build").unwrap();
+        let sidecar = image_meta_path(&img);
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&ImageMeta {
+                flavor: "base-sqfs".into(),
+                proto_version: None,
+                agent_sha256: None,
+                sha256: paths::sha256_file(&img).unwrap(),
+                built_unix: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let stamped_first = read_image_meta(&img).unwrap().unwrap().sha256;
+
+        // Replace the image the way a rebuild does, having cleared the stamp
+        // first. Whatever happens next, no sidecar claims this file.
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::write(&img, b"second build, and the stamping step never runs").unwrap();
+
+        assert!(
+            read_image_meta(&img).unwrap().is_none(),
+            "a replaced image must read as unstamped, never as the old stamp"
+        );
+        assert_ne!(stamped_first, paths::sha256_file(&img).unwrap());
+    }
+
+    /// A torn sidecar parses as no sidecar, which silently turns "does not
+    /// match" into "cannot be compared" for every stage stamped against it.
+    #[test]
+    fn the_stamp_is_written_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("rootfs-dev-busybox.ext4");
+        std::fs::write(&img, b"image bytes").unwrap();
+
+        write_image_meta(&img, RootfsFlavor::DevBusybox).unwrap();
+
+        assert_eq!(
+            read_image_meta(&img).unwrap().unwrap().sha256,
+            paths::sha256_file(&img).unwrap()
+        );
+        assert!(
+            !image_meta_tmp_path(&img).exists(),
+            "the staging file must not survive a successful write"
         );
     }
 

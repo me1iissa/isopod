@@ -173,9 +173,10 @@ Concrete options this unlocks (all backlog, none v1):
 | vdb..vdN | stage layers — sparse ext4, each a previous run's overlay upperdir | RO |
 | last | scratch — fresh sparse ext4 from a prewarmed empty-image pool | RW |
 
-**Guest boot (agent as PID 1):** mount pseudo-fs; mount base at `/rom`, each stage at
-`/layers/<i>`, scratch at `/overlay`; one overlay mount
-`lowerdir=/layers/N:…:/layers/1:/rom, upperdir=/overlay/root, workdir=/overlay/work`
+**Guest boot (agent as PID 1):** mount pseudo-fs; the base is already the root device, so
+each stage mounts at `/layers/<i>` (1-based, on a tmpfs the agent mounts over `/layers` — the
+base is read-only squashfs and cannot grow mountpoints) and scratch at `/overlay`; one overlay
+mount `lowerdir=/layers/N/upper:…:/layers/1/upper:/, upperdir=/overlay/upper, workdir=/overlay/work`
 (multi-lowerdir in a SINGLE mount — overlay-on-overlay nests are kernel-capped at depth 2);
 pivot_root; resync clock; listen on vsock. Add `redirect_dir=on` for rename-heavy builds.
 
@@ -249,7 +250,7 @@ layers; xattr survival.
   `reboot=k panic=1 pci=off quiet`.
 - **Rootfs:** `isopod image build-rootfs` — `apk.static --root` install of
   `alpine-base python3 py3-pip nodejs npm git gcc musl-dev make busybox` into a dir +
-  guest-agent at `/sbin/init` + pre-created mountpoints (`/rom /layers /overlay`) →
+  guest-agent at `/sbin/init` + pre-created mountpoints (`/layers /overlay /mnt`) →
   `mksquashfs -all-root` (unprivileged).
 - **Scratch pool:** pre-made empty sparse ext4 images (`mkfs.ext4 -d` unprivileged, lazy itable
   init DISABLED for deterministic prewarmed boots).

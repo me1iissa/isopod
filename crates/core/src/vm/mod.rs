@@ -1273,6 +1273,7 @@ impl Drop for OwnerMark {
 /// How a run's guest disks are laid out. `Flavor` is the legacy single-ext4
 /// root (no overlay); `Stage` is the overlay topology (squashfs base as `vda`,
 /// N committed read-only stage layers `vdb..`, then a fresh writable scratch).
+#[derive(Debug)]
 enum BootPlan {
     /// Legacy dev-agent ext4 root, no overlay.
     Flavor {
@@ -1295,6 +1296,13 @@ enum BootPlan {
         layer_paths: Vec<PathBuf>,
         /// The forked stage's `stage_id` (the commit parent); `None` for `base`.
         parent: Option<String>,
+        /// Whether the operator opted out of the base-skew refusal for this run.
+        ///
+        /// Resolved once, here, and carried to the commit rather than re-read
+        /// from the environment there: one run must not boot under one answer
+        /// and commit under another, and a single decision point is the only
+        /// one a test can pin.
+        allow_base_skew: bool,
     },
 }
 
@@ -1306,35 +1314,60 @@ const ALLOW_BASE_SKEW_VAR: &str = "ISOPOD_ALLOW_BASE_SKEW";
 /// base, and (unless `ref` is the reserved word `base`) resolve the stage, check
 /// it against the base image on this host, and resolve its full layer chain.
 fn resolve_stage_plan(stage_ref: &str, base: RootfsFlavor) -> Result<BootPlan> {
+    resolve_stage_plan_in(
+        &paths::stages_dir()?,
+        &paths::images_dir()?,
+        stage_ref,
+        base,
+        base_skew_allowed(),
+    )
+}
+
+/// [`resolve_stage_plan`] against explicit store roots and an explicit override,
+/// so the fork check's *call site* — not just the policy function it calls — is
+/// exercisable by a test. Deleting the check here used to leave the whole suite
+/// green: every test drove the policy directly, and nothing proved the run path
+/// ever consulted it.
+fn resolve_stage_plan_in(
+    stages_root: &Path,
+    images_dir: &Path,
+    stage_ref: &str,
+    base: RootfsFlavor,
+    allow_base_skew: bool,
+) -> Result<BootPlan> {
     // A fresh `--stage base` run uses the requested base flavor. Forking an
     // existing stage instead uses the stage's RECORDED base — the layers were
     // built against that base's root, so booting them on a different base would
     // produce a broken merge; the recorded base is authoritative and `--base` is
     // ignored for forks (removing a silent footgun).
     if stage_ref == STAGE_BASE {
-        let base_sqfs = image::base_image_path(base)?;
+        let base_sqfs = image::base_image_path_in(images_dir, base)?;
         let base_id = base_identity(&base_sqfs, base.slug());
         return Ok(BootPlan::Stage {
             base_sqfs,
             base: base_id,
             layer_paths: Vec::new(),
             parent: None,
+            allow_base_skew,
         });
     }
-    let meta = stage::resolve(stage_ref)?;
+    let meta = stage::resolve_in(stages_root, stage_ref)?;
     let recorded_base = RootfsFlavor::from_slug(&meta.base)?;
-    let base_sqfs = image::base_image_path(recorded_base)?;
+    let base_sqfs = image::base_image_path_in(images_dir, recorded_base)?;
     // Same slug, possibly a different build: `isopod image build-all` replaces
     // the root these layers were made over, and an overlay merge onto the wrong
-    // root succeeds silently. Refuse before anything boots.
+    // root succeeds silently. Refuse before anything boots — and judge the whole
+    // chain, since every ancestor's layers get mounted, not just the tip's.
     let base_id = base_identity(&base_sqfs, recorded_base.slug());
-    enforce_base_compat(&meta, &base_id)?;
-    let layer_paths = stage::chain_paths(&meta)?;
+    let verdict = stage::check_base_chain_in(stages_root, &meta, &base_id)?;
+    enforce_base_compat_with(verdict, allow_base_skew)?;
+    let layer_paths = stage::chain_paths_in(stages_root, &meta)?;
     Ok(BootPlan::Stage {
         base_sqfs,
         base: base_id,
         layer_paths,
         parent: Some(meta.stage_id),
+        allow_base_skew,
     })
 }
 
@@ -1358,7 +1391,7 @@ fn base_identity(base_sqfs: &Path, flavor: &str) -> stage::BaseId {
     }
 }
 
-/// Apply [`stage::check_base`]'s verdict to a fork: refuse a rebuilt base, warn
+/// Apply a [`stage::BaseCheck`] verdict to a fork: refuse a rebuilt base, warn
 /// when the comparison could not be made, and stay silent when it agrees.
 ///
 /// The refusal is overridable, because it can otherwise wall off a whole store:
@@ -1366,32 +1399,36 @@ fn base_identity(base_sqfs: &Path, flavor: &str) -> stage::BaseId {
 /// the guest agent moves) changes the base of every stage at once. Layers that
 /// genuinely do not depend on what changed should still be bootable — with the
 /// operator saying so, and a warning on the record.
-fn enforce_base_compat(meta: &StageMeta, current: &stage::BaseId) -> Result<()> {
-    enforce_base_compat_with(meta, current, base_skew_allowed())
-}
-
-/// Core of [`enforce_base_compat`] with the override decided by the caller, so
-/// the policy is unit-testable without mutating the process environment (which
-/// is global, and unsafe to touch from parallel tests).
-fn enforce_base_compat_with(
-    meta: &StageMeta,
-    current: &stage::BaseId,
-    allow_skew: bool,
-) -> Result<()> {
-    match stage::check_base(meta, current) {
+///
+/// The opt-in arrives as an argument rather than being read from the environment
+/// here: [`resolve_stage_plan`] reads it once and carries it to the commit, so a
+/// run cannot boot under one answer and save its result under another — and the
+/// policy stays unit-testable without mutating process-global state.
+///
+/// `WrongFlavor` is refused even with the opt-in. The opt-in says "these layers
+/// do not depend on what changed in this root"; it cannot say anything about a
+/// root they were never built over. The first version of this function folded
+/// both failures into one `if allow_skew` arm and so excused the flavor case
+/// too, silently contradicting what every doc about it said.
+fn enforce_base_compat_with(verdict: stage::BaseCheck, allow_skew: bool) -> Result<()> {
+    match verdict {
         stage::BaseCheck::Ok => Ok(()),
         stage::BaseCheck::Unverifiable(why) => {
             eprintln!("run: warning: {why}");
             Ok(())
         }
-        stage::BaseCheck::Mismatch(why) if allow_skew => {
-            eprintln!("run: warning: {ALLOW_BASE_SKEW_VAR}=1 — booting it anyway. {why}");
-            Ok(())
+        v @ stage::BaseCheck::WrongFlavor(_) => bail!("{}", v.message().unwrap_or_default()),
+        v @ stage::BaseCheck::RebuiltBase(_) => {
+            let why = v.message().unwrap_or_default();
+            if allow_skew {
+                eprintln!("run: warning: {ALLOW_BASE_SKEW_VAR}=1 — booting it anyway. {why}");
+                return Ok(());
+            }
+            bail!(
+                "{why} If these layers do not depend on what changed, set \
+                 {ALLOW_BASE_SKEW_VAR}=1 to boot the stage unchecked."
+            )
         }
-        stage::BaseCheck::Mismatch(why) => bail!(
-            "{why} If these layers do not depend on what changed, set \
-             {ALLOW_BASE_SKEW_VAR}=1 to boot the stage unchecked."
-        ),
     }
 }
 
@@ -2104,6 +2141,8 @@ enum DiskConfig {
         scratch: PathBuf,
         /// Commit parent for `--commit-as` (`None` when forked from `base`).
         parent: Option<String>,
+        /// The run's base-skew opt-in, carried from [`BootPlan::Stage`].
+        allow_base_skew: bool,
     },
 }
 
@@ -2120,6 +2159,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path, scratch_mib: u64) -> Result<Disk
             base,
             layer_paths,
             parent,
+            allow_base_skew,
         } => {
             let scratch = vm_dir.join("scratch.ext4");
             stage::make_scratch_ext4(&scratch, scratch_mib)?;
@@ -2129,6 +2169,7 @@ fn prepare_disk(plan: &BootPlan, vm_dir: &Path, scratch_mib: u64) -> Result<Disk
                 layer_paths: layer_paths.clone(),
                 scratch,
                 parent: parent.clone(),
+                allow_base_skew: *allow_base_skew,
             })
         }
     }
@@ -2165,6 +2206,7 @@ fn maybe_commit_stage(
         scratch,
         parent,
         base,
+        allow_base_skew,
         ..
     } = disk
     else {
@@ -2200,10 +2242,11 @@ fn maybe_commit_stage(
         );
         return Ok(None);
     }
-    // The same opt-in the boot honoured: a run allowed to start across a rebuilt
-    // base must be allowed to save what it produced, or rebasing a stage onto a
-    // new image would be impossible.
-    let meta = stage::commit(scratch, label, parent.as_deref(), base, base_skew_allowed())?;
+    // The same opt-in the boot honoured — the value the plan resolved, not a
+    // fresh environment read: a run allowed to start across a rebuilt base must
+    // be allowed to save what it produced, or rebasing a stage onto a new image
+    // would be impossible.
+    let meta = stage::commit(scratch, label, parent.as_deref(), base, *allow_base_skew)?;
     eprintln!(
         "run: committed stage {} ({}) labelled {:?}",
         meta.stage_id, meta.name, meta.label
@@ -3000,6 +3043,7 @@ mod tests {
             layer_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
             scratch: PathBuf::from("/v/scratch.ext4"),
             parent: None,
+            allow_base_skew: false,
         };
         let args = build_boot_args(&stage, None, None);
         assert!(args.starts_with(BOOT_ARGS));
@@ -3030,7 +3074,7 @@ mod tests {
         let meta = stage_on(Some("1111aaaa2222bbbb"));
         let now = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
 
-        let err = enforce_base_compat_with(&meta, &now, false)
+        let err = enforce_base_compat_with(stage::check_base(&meta, &now), false)
             .expect_err("a rebuilt base must not boot the stage");
         let msg = format!("{err:#}");
         assert!(msg.contains("myproj/deps"), "{msg}");
@@ -3048,7 +3092,7 @@ mod tests {
         let meta = stage_on(Some("1111aaaa2222bbbb"));
         let now = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
 
-        enforce_base_compat_with(&meta, &now, true)
+        enforce_base_compat_with(stage::check_base(&meta, &now), true)
             .expect("the operator opted in; the run proceeds");
     }
 
@@ -3057,20 +3101,176 @@ mod tests {
     #[test]
     fn unstamped_stages_and_images_still_fork() {
         let alpine = stage::BaseId::new("base-alpine", Some("3333cccc4444dddd".into()));
-        enforce_base_compat_with(&stage_on(None), &alpine, false)
+        let unstamped = stage::BaseId::unstamped("base-alpine");
+        enforce_base_compat_with(stage::check_base(&stage_on(None), &alpine), false)
             .expect("a stage committed before stamping must keep booting");
+        enforce_base_compat_with(stage::check_base(&stage_on(None), &unstamped), false)
+            .expect("neither side stamped is not a mismatch");
         enforce_base_compat_with(
-            &stage_on(None),
-            &stage::BaseId::unstamped("base-alpine"),
-            false,
-        )
-        .expect("neither side stamped is not a mismatch");
-        enforce_base_compat_with(
-            &stage_on(Some("1111aaaa2222bbbb")),
-            &stage::BaseId::unstamped("base-alpine"),
+            stage::check_base(&stage_on(Some("1111aaaa2222bbbb")), &unstamped),
             false,
         )
         .expect("an image with no sidecar warns, it does not refuse");
+    }
+
+    /// The opt-in says "these layers do not depend on what changed in this
+    /// root". It cannot say anything about a root they were never built over —
+    /// and the first version of this policy excused that case too, because both
+    /// failures were one enum variant and one `if allow_skew` arm.
+    #[test]
+    fn the_override_never_excuses_a_different_flavor() {
+        let meta = stage_on(Some("1111aaaa2222bbbb")); // base-alpine
+        let other_flavor = stage::BaseId::new("base-sqfs", Some("1111aaaa2222bbbb".into()));
+
+        for allow in [false, true] {
+            let err = enforce_base_compat_with(stage::check_base(&meta, &other_flavor), allow)
+                .expect_err("busybox layers must never boot on the Alpine root, opt-in or not");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("base-alpine") && msg.contains("base-sqfs"),
+                "names both roots: {msg}"
+            );
+            assert!(
+                !msg.contains(ALLOW_BASE_SKEW_VAR),
+                "must not offer an override that does not apply: {msg}"
+            );
+        }
+    }
+
+    // --- the fork check's call site ----------------------------------------
+
+    /// A fake image store: the file the plan resolves plus the sidecar that
+    /// stamps it. Written the way `write_image_meta` writes one, so the reader
+    /// under test sees a real sidecar rather than a hand-shaped guess.
+    fn fake_base_image(images: &Path, sha256: Option<&str>) -> PathBuf {
+        std::fs::create_dir_all(images).unwrap();
+        let img = images.join("base.sqfs");
+        std::fs::write(&img, b"not really a squashfs").unwrap();
+        match sha256 {
+            Some(sha) => {
+                let meta = serde_json::json!({
+                    "flavor": "base-sqfs",
+                    "proto_version": isopod_proto::PROTO_VERSION,
+                    "agent_sha256": null,
+                    "sha256": sha,
+                    "built_unix": 0,
+                });
+                std::fs::write(
+                    images.join("base.sqfs.meta.json"),
+                    serde_json::to_vec_pretty(&meta).unwrap(),
+                )
+                .unwrap();
+            }
+            None => {
+                let _ = std::fs::remove_file(images.join("base.sqfs.meta.json"));
+            }
+        }
+        img
+    }
+
+    /// Commit a stage into `stages` through the production writer.
+    fn stage_in(
+        stages: &Path,
+        tmp: &Path,
+        label: &str,
+        parent: Option<&str>,
+        sha: Option<&str>,
+    ) -> StageMeta {
+        let scratch = tmp.join(format!("scratch-{label}"));
+        std::fs::write(&scratch, format!("layer for {label}")).unwrap();
+        stage::commit_in(
+            stages,
+            &scratch,
+            label,
+            parent,
+            &stage::BaseId::new("base-sqfs", sha.map(str::to_string)),
+            true, // the store's own guard is exercised in stage.rs; this builds fixtures
+        )
+        .unwrap()
+    }
+
+    /// The policy functions were well covered and the run path's *call* to them
+    /// was covered by nothing: deleting the check from `resolve_stage_plan` left
+    /// all 455 tests green. This drives the resolver itself.
+    #[test]
+    fn the_plan_resolver_refuses_a_fork_onto_a_rebuilt_base() {
+        let home = tempfile::tempdir().unwrap();
+        let stages = home.path().join("stages");
+        let images = home.path().join("images");
+        std::fs::create_dir_all(&stages).unwrap();
+        fake_base_image(&images, Some("1111aaaa2222bbbb"));
+        let s = stage_in(&stages, home.path(), "env", None, Some("1111aaaa2222bbbb"));
+
+        // Same image: the resolver produces a plan carrying that image.
+        let plan = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, false)
+            .expect("the image the stage was built on must resolve");
+        match &plan {
+            BootPlan::Stage {
+                layer_paths,
+                parent,
+                allow_base_skew,
+                ..
+            } => {
+                assert_eq!(layer_paths.len(), 1);
+                assert_eq!(parent.as_deref(), Some(s.stage_id.as_str()));
+                assert!(!allow_base_skew, "the opt-in is carried, not re-read later");
+            }
+            _ => panic!("expected the overlay topology"),
+        }
+
+        // Rebuilt image: refused here, before any disk is prepared.
+        fake_base_image(&images, Some("9999ffff8888eeee"));
+        let err = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, false)
+            .expect_err("the run path must consult the base check, not merely define it");
+        assert!(format!("{err:#}").contains("rebuilt since"), "{err:#}");
+
+        // ...and the opt-in reaches the plan, so the commit honours the same answer.
+        let plan = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, true)
+            .expect("the opt-in boots it");
+        match &plan {
+            BootPlan::Stage {
+                allow_base_skew, ..
+            } => assert!(*allow_base_skew),
+            _ => panic!("expected the overlay topology"),
+        }
+    }
+
+    /// One unstamped link used to launder every ancestor behind it: the fork
+    /// check looked only at the tip, so a chain whose oldest layer was built
+    /// over a vanished root booted silently. The ancestors are what get
+    /// mounted, so the ancestors are what must be checked.
+    #[test]
+    fn the_plan_resolver_refuses_a_chain_whose_ancestor_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let stages = home.path().join("stages");
+        let images = home.path().join("images");
+        std::fs::create_dir_all(&stages).unwrap();
+
+        // a: stamped on the original image. b: committed while the image had no
+        // sidecar, so it records nothing. Exactly the laundering shape.
+        let a = stage_in(&stages, home.path(), "a", None, Some("1111aaaa2222bbbb"));
+        let b = stage_in(&stages, home.path(), "b", Some(&a.stage_id), None);
+        assert_eq!(b.base_sha256, None, "the laundering link records no stamp");
+
+        // The image now records something neither of them was built on.
+        fake_base_image(&images, Some("9999ffff8888eeee"));
+
+        let err = resolve_stage_plan_in(&stages, &images, "b", RootfsFlavor::BaseSqfs, false)
+            .expect_err("an ancestor built over a vanished root must refuse the whole chain");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&a.stage_id),
+            "names the offending ancestor: {msg}"
+        );
+        assert!(
+            msg.contains(&b.stage_id),
+            "and the chain it was reached through: {msg}"
+        );
+
+        // Positive control: with the ancestor's own image back, it boots.
+        fake_base_image(&images, Some("1111aaaa2222bbbb"));
+        resolve_stage_plan_in(&stages, &images, "b", RootfsFlavor::BaseSqfs, false)
+            .expect("the chain is sound against the image it was built on");
     }
 
     // --- filtered egress ---------------------------------------------------

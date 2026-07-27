@@ -63,6 +63,11 @@ class Mutation:
     new: str
     defect: str
     count: int = 1
+    # `package` narrows the run to one crate; `filter` narrows it further to one
+    # module path. An empty filter with a package set runs that crate's whole
+    # lib suite, which is the right trade when the crate is small and the guard
+    # is defended from several directions at once.
+    package: str = "isopod-core"
     filter: str = ""
     field_names: tuple = field(default=(), repr=False)
 
@@ -258,16 +263,67 @@ MUTATIONS = [
     ),
     Mutation(
         name="base-skew-opt-in-covers-flavors",
-        file="crates/core/src/stage.rs",
-        old="                if flavor_skew || !allow_base_skew {",
-        new="                if !allow_base_skew {",
+        file="crates/core/src/vm/mod.rs",
+        old="        v @ stage::BaseCheck::WrongFlavor(_) => bail!(\"{}\", v.message().unwrap_or_default()),",
+        new="        v @ stage::BaseCheck::WrongFlavor(_) if !allow_skew => bail!(\"{}\", v.message().unwrap_or_default()),",
         defect=(
             "The opt-out for a rebuilt base starts excusing a different base "
-            "*flavor* too, so a busybox chain can be stacked onto an Alpine one. "
-            "The escape hatch is for layers that are stale, not for layers that "
-            "belong to another root."
+            "*flavor* too, so busybox layers boot on the Alpine root. The escape "
+            "hatch is for layers that are stale, not for layers that belong to "
+            "another root — and 0.12.0's first cut shipped exactly this, "
+            "contradicting every doc that described it."
         ),
-        filter="stage::",
+        filter="vm::",
+    ),
+    Mutation(
+        name="fork-check-never-consulted",
+        file="crates/core/src/vm/mod.rs",
+        old="    enforce_base_compat_with(verdict, allow_base_skew)?;",
+        new="    let _ = &verdict;",
+        defect=(
+            "The run path stops consulting the base check it defines. Every "
+            "policy test still passes — they call the policy directly — while "
+            "no fork is ever actually refused. This survived the whole suite "
+            "when 0.12.0 was first written."
+        ),
+        filter="vm::",
+    ),
+    Mutation(
+        name="fork-check-sees-only-the-tip",
+        file="crates/core/src/vm/mod.rs",
+        old="    let verdict = stage::check_base_chain_in(stages_root, &meta, &base_id)?;",
+        new="    let verdict = stage::check_base(&meta, &base_id);",
+        defect=(
+            "The fork check goes back to judging only the chain's tip, so one "
+            "unstamped link launders every ancestor behind it: a chain whose "
+            "oldest layer was built over a vanished root boots silently."
+        ),
+        filter="vm::",
+    ),
+    Mutation(
+        name="commit-always-allows-skew",
+        file="crates/core/src/vm/mod.rs",
+        old="    let meta = stage::commit(scratch, label, parent.as_deref(), base, *allow_base_skew)?;",
+        new="    let meta = stage::commit(scratch, label, parent.as_deref(), base, true)?;",
+        defect=(
+            "Every commit behaves as though the operator had opted into base "
+            "skew, so a mixed-build chain is recorded by an ordinary run. The "
+            "decision must come from the plan, which is where it was made."
+        ),
+        filter="vm::",
+    ),
+    Mutation(
+        name="stale-stamp-outlives-its-image",
+        file="crates/core/src/image/rootfs.rs",
+        old="    let sidecar = image_meta_path(&dest);",
+        new="    let sidecar = image_meta_path(&dest.with_extension(\"never\"));",
+        defect=(
+            "A rebuild stops clearing the old stamp before replacing the image, "
+            "so a failure between the two leaves a sidecar vouching for an image "
+            "that is gone — and the pre-boot check then passes a stage onto a "
+            "root it was never built over, silently."
+        ),
+        filter="image::",
     ),
 ]
 
@@ -374,8 +430,10 @@ def main() -> int:
                 continue
 
             cmd = ["cargo", "test", "--workspace"]
-            if m.filter:
-                cmd = ["cargo", "test", "-p", "isopod-core", "--lib", m.filter]
+            if m.package:
+                cmd = ["cargo", "test", "-p", m.package, "--lib"]
+                if m.filter:
+                    cmd.append(m.filter)
             rc, out = run(cmd, tree, TEST_TIMEOUT_S)
             (tree / m.file).write_text(pristine[m.file])
 

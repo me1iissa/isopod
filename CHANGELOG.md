@@ -27,10 +27,13 @@ breakage arrives later as a chain whose contents no longer match what is beneath
 them (site-packages whose interpreter moved is the usual shape). Nothing in the
 0.11.0 run path could tell the two apart.
 
-`isopod run --stage <ref>` now compares the stage's stamp against the image on
-this host before anything boots, and refuses a mismatch, naming both content ids
-and both ways out. The comparison is also made in the store, so a stacked commit
-cannot record a chain whose layers were built over two different bases.
+`isopod run --stage <ref>` now compares the stamp against the image on this host
+before anything boots, and refuses a mismatch, naming both content ids and both
+ways out. **Every stage in the chain is checked, not just the one named**: the
+layers of every ancestor are mounted too, and checking only the tip let a single
+unstamped link launder everything behind it. The same comparison runs in the
+store, so a stacked commit cannot record a chain that mixes *known-different*
+builds unless the operator opts in below.
 
 Three cases deliberately do **not** refuse:
 
@@ -50,10 +53,41 @@ the variable set and committing the result is the ordinary way to rebase a stage
 onto a rebuilt image — the new layer records the new image, and the old parent
 keeps its own stamp, so the store keeps the evidence either way.
 
-Three mutations were added to `scripts/mutation-check.py` covering the new
+Eight mutations were added to `scripts/mutation-check.py` covering the new
 guards: accepting any content id, dropping the stamp at commit time (which fails
-nothing at the time and silently disables the check for good), and letting the
-override excuse a flavor mismatch.
+nothing at the time and silently disables the check for good), letting the
+override excuse a flavor mismatch, the run path never consulting the check at
+all, the check seeing only the chain's tip, the commit path always allowing
+skew, and a rebuild leaving a stamp that outlives the image it describes.
+
+### Fixed — in this release's own new code, before it shipped
+
+An adversarial pass over the above found five defects in it. They are listed
+because the pattern is the finding: three of them were places where the tests
+covered the policy and nothing covered the code that calls it.
+
+- **One unstamped link laundered every ancestor behind it.** The fork check read
+  only the chain's tip and the commit check only the immediate parent, so a
+  stage committed while the image happened to be unstamped vouched for
+  everything under it — permanently, and reachable without touching anything by
+  hand (a pre-0.12.0 binary sharing the same `$ISOPOD_HOME` writes exactly that
+  link, and the MCP server routinely runs an older inode than the CLI). Both
+  sites now judge the whole chain.
+- **The override excused a flavor mismatch at boot**, which this changelog and
+  both docs said it never does — one `Mismatch` variant, one `if allow_skew`
+  arm. `BaseCheck` now distinguishes `RebuiltBase` from `WrongFlavor`, so the
+  policy cannot be written that way again.
+- **The whole check could be deleted from the run path with the suite green.**
+  Every test drove the policy function directly; nothing proved the run path
+  consulted it. `resolve_stage_plan` is now root-parameterized and tested, and
+  the skew opt-in is resolved once into the boot plan instead of being re-read
+  from the environment at commit time.
+- **A rebuild replaced the image before stamping it**, so any failure in between
+  left a new image vouched for by the old sidecar — which reads as *verified*
+  and is not. The stamp is now cleared before the image is replaced (failure
+  lands on "unstamped", which is reported) and written atomically.
+- **A non-ASCII content id panicked the pre-boot check**, because the id was
+  truncated by bytes for the message. Ids come off disk unvalidated.
 
 ### Included from the unreleased 0.11.1
 

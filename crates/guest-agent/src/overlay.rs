@@ -213,8 +213,9 @@ fn assemble(n_layers: usize, upper: UpperMode) -> io::Result<()> {
     // Layer mountpoints live on a fresh tmpfs over /layers: the base root is a
     // read-only squashfs, so mountpoints cannot be created directly on it — the
     // fixed set baked into the image silently capped chains at 9 layers
-    // (dogfood finding #26). The base image must ship a /layers directory (all
-    // stamped images do) for the tmpfs to mount over.
+    // (dogfood finding #26). The base image must ship a /layers directory for the
+    // tmpfs to mount over — every image isopod's own builder produces does, but
+    // that is a property of the image layout, not of it being stamped.
     if !layers.is_empty() {
         sys::mount_with_data("tmpfs", LAYERS_DIR, "tmpfs", MS_NOATIME, None).map_err(|e| {
             annotate(

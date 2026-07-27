@@ -102,9 +102,10 @@ run + commit  ──►  stage (immutable)  ──►  fork ──► run ──
 ```
 
 A stage's layers belong to the *build* of the base image they were made over, so
-each one records that image's content id and a fork refuses a base rebuilt since
-— naming both ids and both ways out, rather than mounting silently over a root
-that no longer matches. Stages committed before this existed fork unchecked.
+each one records the content id that image's build sidecar reports, and a fork
+refuses a base rebuilt since — checking every ancestor in the chain, naming both
+ids and both ways out, rather than mounting silently over a root that no longer
+matches. Stages committed before this existed fork unchecked.
 [docs/getting-started.md](docs/getting-started.md#when-the-base-image-is-rebuilt)
 has the diagram and the escape hatch.
 

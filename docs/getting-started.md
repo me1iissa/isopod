@@ -387,7 +387,10 @@ beneath them (site-packages whose interpreter moved, a binary linked against a
 library that changed soname).
 
 Every commit records the content id of the base image it was built on
-(`base_sha256` in `stage info`), and a fork checks it before anything boots.
+(`base_sha256` in `stage info` — the id the image's build sidecar reports, not a
+re-hash of the file), and a fork checks it — **for every stage in the chain, not
+just the one you named**, since an ancestor's layers get mounted too — before
+anything boots.
 **Any rebuild counts**, not just one that changes the contents: `mksquashfs`
 stamps build times into the image, so re-running the build over an unchanged tree
 still produces a new content id. The check is deliberately conservative — it

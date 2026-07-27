@@ -144,6 +144,8 @@ struct RunArgs {
     /// default) or `base-alpine` (python/node/git/gcc toolchain). Requires
     /// `--stage` — without it the run boots the legacy `--flavor` topology,
     /// which has no base, so a lone `--base` is a hard error (finding #16).
+    /// Ignored when forking an existing stage: the base it was built on is
+    /// recorded, and that recorded base is what boots.
     #[arg(long)]
     base: Option<String>,
     /// Feed the command's stdin from a file (`-` for the host's stdin).

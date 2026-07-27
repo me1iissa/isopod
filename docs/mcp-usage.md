@@ -188,7 +188,8 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `scratch_mib` | ~`1024` | Writable overlay scratch in MiB (128..=65536, sparse). Raise for build workloads; passing it forces the cold (disk-upper) path. |
 | `copy_out` | — | List of `{guest, host}` mappings: stream guest files to host paths after a successful exec — the binary-safe artifact channel. A copy failure fails the call; written files are listed in the result's `copied`. `host` is confined to the host-I/O root and the guest's file mode is masked — see [Host paths](#host-paths-stdin_file-and-copy_out) below. |
 
-Forking checks the base *build*, not just the flavor. Every stage records the
+Forking checks the base *build*, not just the flavor, for every stage in the
+chain rather than only the one named. Every stage records the
 content id of the image it was made over (`base_sha256`); if that image has been
 rebuilt since — `isopod image build-all`, a new guest agent, or even a rebuild over
 an unchanged tree, since `mksquashfs` is not byte-reproducible — the fork is refused
