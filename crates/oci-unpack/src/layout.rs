@@ -445,7 +445,7 @@ impl Layout {
     /// Resolve the index down to the single manifest for `want`.
     ///
     /// An index entry may itself be an index; that is followed, bounded by
-    /// [`MAX_INDEX_DEPTH`], so a layout whose indexes point at one another costs
+    /// `MAX_INDEX_DEPTH`, so a layout whose indexes point at one another costs
     /// a fixed amount of work rather than a stack.
     ///
     /// # Errors
