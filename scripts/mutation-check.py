@@ -600,8 +600,8 @@ MUTATIONS = [
     Mutation(
         name="oci-registry-pinned-digest-unverified-when-cached",
         file="crates/oci-registry/src/lib.rs",
-        old="        if let Want::Digest(want) = &self.reference.want {",
-        new="        if let Want::Digest(want) = &self.reference.want { if false {",
+        old="            if actual != want.encoded() {",
+        new="            if actual != want.encoded() && false {",
         defect=(
             "A pinned `repo@sha256:X` reference stops being verified against "
             "the bytes that came back. It only shows when the blob is already "
