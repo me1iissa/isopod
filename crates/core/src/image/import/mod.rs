@@ -757,7 +757,7 @@ impl ImportSource {
 /// `alpine:3.20` becomes `alpine-3.20`, `ghcr.io/org/app:v1` becomes
 /// `ghcr.io-org-app-v1`. Anything the name rules do not allow becomes `-`, and
 /// runs of `-` collapse so a path full of separators does not become a row of
-/// dashes. The result still goes through [`validate_slug`]: this is a
+/// dashes. The result still goes through `validate_slug`: this is a
 /// convenience, not the guard.
 pub fn slug_for(source: &str) -> String {
     let mut out = String::with_capacity(source.len());

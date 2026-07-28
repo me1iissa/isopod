@@ -245,7 +245,7 @@ impl fmt::Debug for Puller {
 impl Puller {
     /// Build a client for `reference`.
     ///
-    /// See [`http_client`] for what the client does and does not decide for
+    /// See `http_client` for what the client does and does not decide for
     /// itself: redirects are followed by hand, and every name it dials is
     /// resolved through the destination floor.
     ///
