@@ -41,13 +41,26 @@ For uncommitted local changes — or a guest without network access — use `std
 path — works on both the CLI `--stdin-file` and, since the #21 fix, the MCP `sandbox_run`
 param) rather than inline MCP `stdin`, which would transit the payload through model context:
 
+Send the tarball **raw**. The channel is binary-safe on both surfaces — bytes are
+base64'd inside the protocol frame either way, so encoding them yourself first only
+inflates the payload by a third:
+
 ```sh
-tar czf - Cargo.toml Cargo.lock rust-toolchain.toml crates | base64 -w0 > /tmp/src.b64
-isopod run --stage isopod-build --scratch-mib 8192 --stdin-file /tmp/src.b64 -- \
-  /bin/sh -c 'base64 -d | tar xzf - -C /root/src && cd /root/src && \
+tar czf - Cargo.toml Cargo.lock rust-toolchain.toml crates > /tmp/src.tgz
+isopod run --stage isopod-build --scratch-mib 8192 --stdin-file /tmp/src.tgz -- \
+  /bin/sh -c 'tar xzf - -C /root/src && cd /root/src && \
     export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo PATH=/root/.cargo/bin:$PATH && \
     cargo build --workspace'
 ```
+
+**There is a ceiling, and it is low.** `PutFile` is one frame, capped at
+`MAX_FRAME_LEN` (8 MiB) *after* base64 — so about **6 MiB of raw input**, or 4.5 MiB
+if you encode it yourself as well. The MCP surface refuses at 4 MiB before booting
+and names the limit; the CLI does not check, so it boots a VM and then fails with
+the post-encoding byte count. isopod's own workspace source is ~540 KiB and fits
+comfortably; a repo with its `.git` does not. Nothing larger gets in without the
+network — `copy_out` is streamed and unbounded, but there is no inbound equivalent
+(`docs/dogfood-findings.md` #46).
 
 Untarring over `/root/src` updates only changed files' mtimes, so cargo rebuilds just the
 touched crates (measured: 6.93 s after touching `crates/cli/src/main.rs`, vs 2 m 06 s clean).
@@ -55,7 +68,8 @@ To persist the refreshed state, add `--commit-as isopod-build/<date>` (label-reu
 for an existing label are untested — use versioned labels until that's gauntleted).
 
 For committed state, `git clone`/`git pull` in-guest from the remote replaces the tarball
-dance (a private repo needs a read token supplied to the guest).
+dance (a private repo needs a read token supplied to the guest), and is the only route
+for anything over the ceiling.
 
 ## Everyday check/test loop (MCP)
 

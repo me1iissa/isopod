@@ -785,3 +785,89 @@ the course of the measurements and now `6398c829…`; `base-alpine.sqfs` untouch
 so it still ships the pre-0.12.0 `/rom` + `/layers/0..9` layout — harmless, since
 the guest mounts a tmpfs over `/layers`, but it should be rebuilt for consistency
 once #30 lands, so the rebuild costs nothing.
+
+## 2026-07-28 (later) — a test-fix wave verified in-sandbox, and the ceiling that found
+
+The work was a one-commit fix to `screen_resolved`'s test (a refusal that fired
+correctly could name the wrong address and the suite stayed green). Everything
+that verifies it ran inside isopod, which is the point of this entry: the
+negative control is *deliberately broken source*, and running that on the host
+means editing the working tree and trusting a `sed` to put it back.
+
+**The verification loop works and is fast.** Forked `isopod-build/0.12.0-tested`,
+overlaid HEAD's source as a tar over `stdin_file`: `cargo test -p
+isopod-oci-registry` **31 passed** in 28.8 s wall including the incremental
+rebuild. Then the control in a second throwaway VM — same fork, `sed` the
+mutation in, **30 passed / 1 failed**, naming the intended test. Host tree never
+touched. Then the whole mutation harness in a third: `git init` over the overlaid
+source is enough for `git archive HEAD`, and `scripts/mutation-check.py --only
+oci-registry-refusal-names-the-wrong-address` reported **1/1 mutations caught**
+in 155 s from cold. A destructive-by-design harness runs unsupervised in a
+sandbox, which is the case it was written for.
+
+What it cost to get there is the finding. The bytes-in channel is the narrow one:
+
+```mermaid
+flowchart TB
+    HF["host file"] -->|"PutFile: base64 inside one JSON frame"| CAP["MAX_FRAME_LEN 8 MiB<br/>so about 6 MiB of raw input"]
+    CAP --> MCP["MCP: refuses at 4 MiB, before boot,<br/>naming the limit"]
+    CAP --> CLI["CLI: no check at all —<br/>boots a VM, then dies at the frame layer"]
+    GF["guest file"] -->|"CopyOut: FileChunk x N, then FileDone"| NOCAP["streamed since proto v3,<br/>no ceiling"]
+    NOCAP --> HP["host path, 16 GiB per file"]
+```
+
+46. **[open] MEDIUM — the host→guest file channel is single-frame and capped
+    while guest→host is streamed and unbounded.** Proto v3 gave `CopyOut` a
+    streamed channel (`FileChunk` × N + `FileDone`) explicitly so artifacts out
+    have "no `MAX_FRAME_LEN` size ceiling" (`proto/src/lib.rs:45`). The reverse
+    direction never got the same treatment: `PutFile` is documented
+    "single-frame; fits within `MAX_FRAME_LEN`" (`proto/src/msg.rs:58`), and
+    since binary rides base64 inside the JSON, an 8 MiB frame cap is a **~6 MiB
+    raw input ceiling**. Measured: a 50 995 061-byte tarball produced a
+    67 993 510-byte frame, exactly the 4/3 inflation plus JSON. That is what
+    stopped this session putting the repo *with its `.git`* (49 MiB) into a
+    guest, so `mutation-check.py` — which is built around `git archive HEAD` —
+    had to be handed a synthesized single-commit repo instead of the real
+    history. Nothing above ~6 MiB gets in without the network: no dataset, no
+    wheelhouse, no repo with history. → FIX: mirror v3's `CopyOut` with a
+    streamed `PutFile` (chunks + done). Until then the MCP's own error advises
+    "Copy it into a stage instead", which names no command isopod has — the only
+    honest workaround is its second half, splitting the payload across runs and
+    `commit_as`-ing between them.
+
+47. **[open] LOW — the CLI boots a VM before discovering the payload will not
+    fit, and reports the failure in post-base64 bytes.** `crates/cli/src/main.rs:506`
+    reads `--stdin-file` with an unbounded `std::fs::read`; the MCP path checks
+    against `MAX_STDIN_FILE_BYTES` first (`mcp/src/main.rs:84`). So the same
+    oversized file is a clean pre-boot refusal naming the limit on one surface,
+    and on the other: a booted VM, a wasted boot, and `frame length 67993510
+    exceeds cap 8388608` — printed twice, from an error chain that formats its
+    own source. Neither number is one the operator chose; they passed a 49 MiB
+    file and are told about 67 993 510 bytes. → FIX: give the CLI the same
+    pre-flight check and message, expressed in raw input bytes.
+
+48. **[open] LOW — `docs/sandbox-build.md` base64s a payload the channel already
+    carries raw, spending a third of a ceiling it never mentions.** The "Getting
+    source in" recipe pipes the tar through `base64 -w0` and decodes it guest-side.
+    Unnecessary on both surfaces — binary is base64'd *inside the frame* either
+    way, so doing it again first is pure inflation, and it moves the effective
+    ceiling from ~6 MiB down to ~4.5 MiB. Verified raw both ways this session:
+    `sandbox_run` with `stdin_file` and a plain `.tgz` (31/31 tests green
+    in-guest), and `isopod run --stdin-file` with the same file, 644 ms total.
+    → FIX: drop `base64` from the recipe and state the ceiling next to it.
+
+This entry's own diagram was proved the same way. Rendering every diagram in the
+built site needs `jsdom`, `mermaid`, `python-markdown` and `pygments`, none of
+them installed on this host and none of them wanted there; a sandbox took the
+install and the render and was thrown away — **29 diagrams checked, 0 failures,
+0 tag warnings**, site built with no missing sources and no unresolved links. It
+is the smallest possible version of the argument for the whole tool: a check that
+would otherwise not have been run, because running it meant polluting a laptop.
+
+**Checked and found sound**: `stdin_file` is binary-safe on both the MCP and CLI
+surfaces — the doc's encoding step was defensive, not required. The host-I/O root
+confinement refused a scratchpad path outside the server's working directory —
+deliberate, and already recorded as sound by the previous session; payloads went
+under `target/` again. Forking the same stage three times concurrently-in-sequence left
+the parent untouched, and none of the three throwaway VMs was committed, so the
+store gained nothing from a session that ran a full mutation harness inside it.
