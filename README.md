@@ -204,7 +204,7 @@ stateDiagram-v2
 
 ### MCP tools
 
-isopod exposes six tools. `sandbox_run` is the one you use 80% of the time; the rest inspect and prune the store.
+isopod exposes seven tools. `sandbox_run` is the one you use 80% of the time; the rest inspect and prune the store.
 
 | Tool | What it does |
 |---|---|
@@ -214,6 +214,7 @@ isopod exposes six tools. `sandbox_run` is the one you use 80% of the time; the 
 | `stage_rm` | Remove a stage (refused if another stage's chain still forks from it). |
 | `vm_list` | Recent VM records — useful for finding a vanity name after the fact. |
 | `vm_gc` | Reap orphaned Firecracker processes and prune old VM record directories. |
+| `image_list` | The base images `base` accepts: the built flavors, and every imported OCI image as `oci:<name>`, with whether each is present and stale. Read-only — importing and removing images stay on the CLI. |
 
 **Run an ephemeral snippet:**
 
@@ -307,6 +308,8 @@ isopod warmpool list
 # Import a container image as a bootable base, then run on it.
 isopod image import alpine:3.20
 isopod run --stage base --base oci:alpine-3.20 -- /bin/sh -c 'cat /etc/alpine-release'
+isopod image ls                        # built flavors and imported images, one list
+isopod image rm alpine-3.20            # refused while a stage records it as its base
 ```
 
 Every subcommand prints exactly one JSON object to stdout (human-readable logs go to stderr), so the CLI, the MCP server, humans, and CI all drive the same core.
@@ -325,6 +328,8 @@ Every subcommand prints exactly one JSON object to stdout (human-readable logs g
 | `User` | **ignored** — the agent execs as root |
 
 An imported base is named `oci:<name>` wherever a base is named — `--base oci:alpine-3.20`, and the same over MCP. A stage committed on one records it, so a fork boots the base it was built on. The image's `Env` and `WorkingDir` become run **defaults**, applied under whatever the run itself sets, so a `python:3.12` base finds `python` on `PATH` without the caller restating it.
+
+`isopod image ls` lists imported images beside the built flavors in one list — the same namespace `--base` takes — each with its origin, its size and the same staleness verdict a built image gets. `isopod image rm <name>` removes one, and is **refused while a stage records it as its base**, naming the stages; `--force` overrides and reports what it broke. Over MCP the list is the `image_list` tool, and that is the whole image surface a model gets: importing and removing stay on the CLI.
 
 The adaptation is deliberately small: the agent at `/.isopod/init` with `/init` pointing at it, the three empty overlay mountpoints, and a `/tmp` if the image ships none. The image's own `/sbin/init` is left alone. An image with **no `/bin/sh` is refused by name at import time**, since the exec surface is `/bin/sh -c` and the alternative is an exit 127 inside a VM.
 

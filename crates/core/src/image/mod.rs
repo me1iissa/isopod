@@ -14,8 +14,8 @@ mod s3;
 
 pub use base::{BaseRef, RunDefaults, IMPORTED_PREFIX};
 pub use import::{
-    adapt, import, imported_image_path, pack_and_stamp, read_provenance, slug_for, AdaptReport,
-    ImportOutcome, ImportSource, ImportSpec, OciProvenance,
+    adapt, import, imported_image_path, pack_and_stamp, read_provenance, remove_imported, slug_for,
+    AdaptReport, ImportOutcome, ImportSource, ImportSpec, OciProvenance, RemoveImportOutcome,
 };
 pub use kernel::{fetch_kernel, FetchKernelOutcome};
 pub use rootfs::{

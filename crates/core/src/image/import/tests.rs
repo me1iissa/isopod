@@ -510,6 +510,252 @@ fn a_mode_that_did_not_land_fails_the_pack() {
     );
 }
 
+// --- removing an imported base ------------------------------------------
+
+/// Lay down an imported image the way a publish leaves one: the packed file
+/// plus the sidecar recording where it came from.
+fn imported_image(images: &Path, name: &str, source_ref: &str) -> PathBuf {
+    let path = imported_image_path(images, name).expect("a valid name");
+    std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+    std::fs::write(&path, b"squashfs bytes").expect("write");
+    let provenance = OciProvenance {
+        source_ref: source_ref.to_string(),
+        platform: "linux/amd64".into(),
+        manifest_digest: "sha256:aa".into(),
+        config_digest: "sha256:bb".into(),
+        layer_digests: vec!["sha256:cc".into()],
+        env: vec![],
+        working_dir: None,
+        entrypoint: vec![],
+        cmd: vec![],
+        user: None,
+        replaced_init: false,
+        setuid_paths: vec![],
+    };
+    let meta = ImageMeta {
+        flavor: format!("oci:{name}"),
+        proto_version: Some(isopod_proto::PROTO_VERSION),
+        agent_sha256: Some("aa".repeat(32)),
+        sha256: "cd".repeat(32),
+        built_unix: 1,
+        oci: Some(provenance),
+    };
+    // Serialized from the typed value the reader parses back, rather than from
+    // hand-written JSON, so the fixture cannot drift away from the schema.
+    let mut sidecar = path.clone().into_os_string();
+    sidecar.push(".meta.json");
+    std::fs::write(
+        PathBuf::from(sidecar),
+        serde_json::to_vec_pretty(&meta).expect("serialize"),
+    )
+    .expect("write sidecar");
+    path
+}
+
+/// Record a stage in `stages` whose base is `base` — the string a real commit
+/// writes into `meta.json`, built as the typed value the store parses.
+fn stage_on(stages: &Path, id: &str, label: &str, base: &str) {
+    let dir = stages.join(id);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let meta = crate::stage::StageMeta {
+        stage_id: id.to_string(),
+        name: format!("vanity-{id}"),
+        label: label.to_string(),
+        parent: None,
+        chain: vec![id.to_string()],
+        base: base.to_string(),
+        base_sha256: Some("cd".repeat(32)),
+        created_unix: 1,
+        bytes_apparent: 4096,
+        bytes_allocated: 0,
+    };
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta).expect("serialize"),
+    )
+    .expect("write");
+}
+
+#[test]
+fn an_imported_base_a_stage_records_is_not_removed_without_force() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let images = t.path().join("images");
+    let stages = t.path().join("stages");
+    let path = imported_image(&images, "app", "ghcr.io/org/app:v1");
+
+    // Two stages on this base, and two that must not protect it: one on a
+    // built-in flavor, and one on an imported base whose name merely *starts*
+    // with this one's — a prefix test would have `oci:app-2` shielding
+    // `oci:app`, which is the kind of match a base name namespace invites.
+    stage_on(&stages, "st-aaa", "deps", "oci:app");
+    stage_on(&stages, "st-bbb", "build", "oci:app");
+    stage_on(&stages, "st-ccc", "other", "base-alpine");
+    stage_on(&stages, "st-ddd", "sibling", "oci:app-2");
+
+    let err = remove_imported_in(&images, &stages, "app", false)
+        .expect_err("a base a stage stands on must not be removed silently");
+    let msg = err.to_string();
+    assert!(msg.contains("refusing to remove oci:app"), "{msg}");
+    // The refusal names the stages, because "something uses it" is not a thing
+    // an operator can act on.
+    assert!(msg.contains("st-aaa (deps)"), "{msg}");
+    assert!(msg.contains("st-bbb (build)"), "{msg}");
+    assert!(
+        !msg.contains("st-ccc"),
+        "a built-in base is not this one: {msg}"
+    );
+    assert!(
+        !msg.contains("st-ddd"),
+        "oci:app-2 is a different base: {msg}"
+    );
+    assert!(msg.contains("--force"), "the way out is named: {msg}");
+    assert!(path.exists(), "a refused removal must remove nothing");
+
+    // --force says it anyway, and reports what it cost.
+    let out = remove_imported_in(&images, &stages, "app", true).expect("forced");
+    assert!(out.forced);
+    assert_eq!(out.removed, "oci:app");
+    assert_eq!(out.stages.len(), 2);
+    assert!(
+        out.notes.iter().any(|n| n.contains("cannot boot")),
+        "{:?}",
+        out.notes
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn an_unused_imported_base_is_removed_with_its_sidecar() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let images = t.path().join("images");
+    let stages = t.path().join("stages");
+    let path = imported_image(&images, "app", "ghcr.io/org/app:v1");
+    // A store with stages in it, none of them on this base.
+    stage_on(&stages, "st-ccc", "other", "base-alpine");
+
+    let out = remove_imported_in(&images, &stages, "app", false).expect("removes");
+    assert!(out.ok && !out.forced && out.stages.is_empty());
+    assert!(!path.exists());
+    let mut sidecar = path.clone().into_os_string();
+    sidecar.push(".meta.json");
+    assert!(
+        !PathBuf::from(sidecar).exists(),
+        "a stamp must not outlive its image"
+    );
+    assert!(out.bytes_freed > b"squashfs bytes".len() as u64);
+    // The blobs are NOT freed, and an operator chasing disk has to be told
+    // where they still are.
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("ghcr.io/org/app:v1") && n.contains("oci-blobs")),
+        "{:?}",
+        out.notes
+    );
+
+    // Neighbour: removing it again is a clear "there is nothing here", not a
+    // silent success or an io error about a missing file.
+    let err = remove_imported_in(&images, &stages, "app", false).expect_err("gone");
+    assert!(err.to_string().contains("no imported image named 'app'"));
+    assert!(err.to_string().contains("image ls"), "{err}");
+}
+
+#[test]
+fn a_built_in_flavor_is_not_addressable_as_an_imported_image() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let images = t.path().join("images");
+    let stages = t.path().join("stages");
+
+    // `isopod image rm base-alpine` means "delete the toolchain base" to
+    // whoever typed it. "No imported image named base-alpine" answers a
+    // different question.
+    let err = remove_imported_in(&images, &stages, "base-alpine", false).expect_err("refused");
+    let msg = err.to_string();
+    assert!(msg.contains("built-in flavor"), "{msg}");
+    assert!(msg.contains("build-rootfs"), "the way out is named: {msg}");
+
+    // Neighbour: `oci:base-alpine` is an imported image that happens to share
+    // the name, which is the entire reason the prefix exists. It must reach the
+    // imports directory rather than the flavor refusal.
+    let path = imported_image(&images, "base-alpine", "alpine:3.20");
+    let out = remove_imported_in(&images, &stages, "oci:base-alpine", false).expect("removes");
+    assert_eq!(out.removed, "oci:base-alpine");
+    assert!(!path.exists());
+
+    // And the prefix is optional for a name that is not a flavor.
+    let path = imported_image(&images, "app", "x");
+    remove_imported_in(&images, &stages, "oci:app", false).expect("removes");
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_name_that_could_address_a_file_is_refused_by_the_removal_too() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let images = t.path().join("images");
+    let stages = t.path().join("stages");
+    for bad in ["../escape", "a/b", "", ".hidden", "oci:../escape", "oci:"] {
+        assert!(
+            remove_imported_in(&images, &stages, bad, true).is_err(),
+            "{bad:?} was accepted as a removal target"
+        );
+    }
+}
+
+// --- the blob cache key --------------------------------------------------
+
+#[test]
+fn two_references_that_share_a_slug_do_not_share_a_cache() {
+    let images = Path::new("/x/images");
+    // The pairs the old key collapsed. A shared directory is a shared
+    // `index.json`, and that file names the manifest the import reads back.
+    for (a, b) in [
+        ("a/b:c", "a-b-c"),
+        ("ghcr.io/x/y", "ghcr.io-x-y"),
+        ("ghcr.io/org/app:v1", "ghcr.io/org/app/v1"),
+    ] {
+        assert_eq!(
+            slug_for(a),
+            slug_for(b),
+            "this pair is only interesting because the slug collapses it"
+        );
+        assert_ne!(
+            blob_cache_dir(images, a),
+            blob_cache_dir(images, b),
+            "{a} and {b} still share a cache directory"
+        );
+    }
+
+    // The control: a cache is only a cache if the same reference finds its own
+    // blobs again. A key that were merely unique would pass everything above.
+    assert_eq!(
+        blob_cache_dir(images, "alpine:3.20"),
+        blob_cache_dir(images, "alpine:3.20")
+    );
+
+    // Still browsable: the readable half survives, and the directory sits
+    // where it always did.
+    let dir = blob_cache_dir(images, "ghcr.io/org/app:v1");
+    assert!(dir.starts_with(images.join("oci-blobs")));
+    let name = dir.file_name().and_then(|n| n.to_str()).expect("a name");
+    assert!(name.starts_with("ghcr.io-org-app-v1-"), "{name}");
+
+    // A reference far longer than a directory name wants to be is truncated,
+    // and what is left is still a name (no trailing separator).
+    let long = format!("registry.example.com/{}/app:v1", "segment/".repeat(40));
+    let name = blob_cache_dir(images, &long)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a name")
+        .to_string();
+    assert!(name.len() <= CACHE_NAME_MAX + 17, "{name}");
+    assert!(!name.contains("--"), "{name}");
+    // And it is still distinct from a reference sharing that whole prefix.
+    assert_ne!(
+        blob_cache_dir(images, &long),
+        blob_cache_dir(images, &format!("{long}.2"))
+    );
+}
+
 // --- the three ways in --------------------------------------------------
 
 #[test]

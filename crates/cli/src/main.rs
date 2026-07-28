@@ -27,7 +27,7 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // one-shot dispatch value; variant size is irrelevant
 enum Command {
-    /// Guest image pipeline (fetch-kernel, build-rootfs, build-all, ls)
+    /// Guest image pipeline (fetch-kernel, build-rootfs, build-all, ls, import, rm)
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -266,7 +266,8 @@ enum ImageCommand {
     /// Force-rebuild EVERY guest image together (required after a PROTO_VERSION
     /// bump so no image is left speaking a stale protocol)
     BuildAll,
-    /// List every guest image with its stamped proto version and staleness
+    /// List every base image — built flavors and imported OCI images alike —
+    /// with its stamped proto version and staleness
     Ls,
     /// Import an OCI image as a bootable base
     ///
@@ -292,6 +293,19 @@ enum ImageCommand {
         #[arg(long)]
         name: Option<String>,
         /// Replace an imported image of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove an imported image (refused while a stage records it as its base)
+    ///
+    /// The cached layer blobs under ~/.isopod/images/oci-blobs are kept, so a
+    /// re-import stays local; the outcome names the directory to delete if you
+    /// want those bytes back too.
+    Rm {
+        /// Imported image name, with or without the `oci:` prefix.
+        name: String,
+        /// Remove it even though stages record it as their base. Those stages
+        /// stop booting until an image is imported under that name again.
         #[arg(long)]
         force: bool,
     },
@@ -424,6 +438,7 @@ fn run_image(cmd: ImageCommand) -> i32 {
             };
             emit(image::import(&source, name.as_deref(), force))
         }
+        ImageCommand::Rm { name, force } => emit(image::remove_imported(&name, force)),
     }
 }
 

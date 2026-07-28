@@ -4,7 +4,10 @@
 //! isopod. This module is the other half: it adds the few things the guest
 //! agent needs in order to be PID 1, packs the result with the same pinned
 //! `mksquashfs` invocation the built-in flavors use, and stamps a sidecar that
-//! records where the image came from.
+//! records where the image came from. It also owns the other end of an imported
+//! image's life: enumerating what has been imported (which is what lets
+//! `isopod image ls` answer for imported bases as well as built ones) and
+//! removing one, refused while a stage still stands on it.
 //!
 //! # What "adaptation" actually is
 //!
@@ -50,7 +53,8 @@ use isopod_oci_registry::Puller;
 use isopod_oci_unpack::layout::{Compression, Layout, Platform};
 use isopod_oci_unpack::{Limits, Unpacker};
 
-use super::rootfs::{self, ImageMeta};
+use super::base::IMPORTED_PREFIX;
+use super::rootfs::{self, ImageMeta, RootfsFlavor};
 use crate::paths;
 
 /// Directory mode for everything this module creates.
@@ -547,6 +551,182 @@ pub fn read_provenance(image: &Path) -> Result<Option<OciProvenance>> {
 }
 
 // ===========================================================================
+// Listing and removing imported bases
+// ===========================================================================
+
+/// Every imported base under `images`, as `(name, image path)`, sorted by name.
+///
+/// The directory **is** the index: the image file is the only record that an
+/// image was imported, so there is no second list to drift out of step with it.
+/// Everything else in there is skipped, and the cases worth naming are the ones
+/// that look like an image and are not — a directory called `x.sqfs`, a link
+/// that resolves to nothing, and the `.meta.json` sidecars, which live beside
+/// their images rather than under them. A name the import could not have
+/// produced is skipped too: listing it would offer a base that
+/// [`BaseRef::parse`](super::BaseRef::parse) then refuses.
+pub(crate) fn list_imported(images: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let dir = images.join("oci");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        // Nothing has ever been imported: an empty list, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", dir.display()))),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading an entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sqfs") {
+            continue;
+        }
+        // `metadata`, not `symlink_metadata`: a link to a real image is one, and
+        // a link to nothing is not, whatever it is called.
+        if !std::fs::metadata(&path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if validate_slug(name).is_err() {
+            continue;
+        }
+        out.push((name.to_string(), path));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Result of `isopod image rm`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveImportOutcome {
+    /// Always `true` on the success path.
+    pub ok: bool,
+    /// The base that is gone, spelled the way it was booted: `oci:<name>`.
+    pub removed: String,
+    /// Where the image was.
+    pub image_path: PathBuf,
+    /// Bytes freed — the image and its sidecar, not the cached layer blobs.
+    pub bytes_freed: u64,
+    /// `true` when stages recording this base were overridden with `--force`.
+    pub forced: bool,
+    /// Stages that record this base. Non-empty only on a forced removal, which
+    /// is the one case where the operator has to be handed what they broke.
+    pub stages: Vec<String>,
+    /// Notices an operator has to see: what a forced removal cost, and where
+    /// the bytes that were *not* freed still are.
+    pub notes: Vec<String>,
+}
+
+/// Remove an imported base, refusing while a stage records it.
+///
+/// # Errors
+/// If no image of that name is imported, or stages record it and `force` is
+/// not set.
+pub fn remove_imported(name: &str, force: bool) -> Result<RemoveImportOutcome> {
+    remove_imported_in(&paths::images_dir()?, &paths::stages_dir()?, name, force)
+}
+
+/// [`remove_imported`] against explicit directories — the seam the tests drive,
+/// since `$ISOPOD_HOME` is process-global.
+pub(crate) fn remove_imported_in(
+    images: &Path,
+    stages: &Path,
+    name: &str,
+    force: bool,
+) -> Result<RemoveImportOutcome> {
+    let name = imported_name(name)?;
+    let path = imported_image_path(images, name)?;
+    if !path.exists() {
+        bail!(
+            "no imported image named '{name}' at {}; `isopod image ls` lists what is here",
+            path.display()
+        );
+    }
+    let base = format!("{IMPORTED_PREFIX}{name}");
+
+    // A stage's layers are overlay upperdirs over one specific root, so a stage
+    // that recorded this base is a stage that cannot boot without it. The check
+    // is an exact match on the recorded string and not a prefix one: `oci:app`
+    // and `oci:app-2` are different bases, and a prefix test would have the
+    // second protecting the first.
+    let holders: Vec<String> = crate::stage::list_in(stages)?
+        .into_iter()
+        .filter(|s| s.base == base)
+        .map(|s| format!("{} ({})", s.stage_id, s.label))
+        .collect();
+    if !holders.is_empty() && !force {
+        bail!(
+            "refusing to remove {base}: still the base of: {}. Those layers were made \
+             over that root and mean nothing without it, so they stop booting until \
+             the same image is imported under the same name; pass --force to remove \
+             it anyway",
+            holders.join(", ")
+        );
+    }
+
+    // Read the provenance before the image it lives beside is deleted — the
+    // cached blobs outlive the image, and an operator who wants those bytes
+    // back has to be told where they are.
+    let source_ref = read_provenance(&path)?.map(|p| p.source_ref);
+    let bytes_freed = rootfs::remove_image_and_meta(&path)?;
+
+    let mut notes = Vec::new();
+    if force && !holders.is_empty() {
+        notes.push(format!(
+            "{} stage(s) still record {base} and cannot boot until an image is \
+             imported under that name again",
+            holders.len()
+        ));
+    }
+    if let Some(reference) = &source_ref {
+        notes.push(format!(
+            "the cached layer blobs for {reference} are kept at {}, so a re-import is \
+             local; delete that directory to reclaim them",
+            blob_cache_dir(images, reference).display()
+        ));
+    }
+    Ok(RemoveImportOutcome {
+        ok: true,
+        removed: base,
+        image_path: path,
+        bytes_freed,
+        forced: force && !holders.is_empty(),
+        stages: if force { holders } else { Vec::new() },
+        notes,
+    })
+}
+
+/// The imported name an `image rm` argument addresses.
+///
+/// `oci:alpine-3.20` and `alpine-3.20` both name the same image, because
+/// `oci:` is how every other surface spells it and retyping it here is not a
+/// test worth setting. The prefix is stripped, never required.
+///
+/// A **bare** name that is a built-in flavor is refused rather than looked for
+/// under `oci/`: `isopod image rm base-alpine` means "delete the toolchain
+/// base" to whoever typed it, and "no imported image named base-alpine" answers
+/// a question they did not ask. `oci:base-alpine` still addresses an imported
+/// image of that name — which is the whole reason the prefix exists.
+fn imported_name(spelling: &str) -> Result<&str> {
+    if let Some(name) = spelling.strip_prefix(IMPORTED_PREFIX) {
+        return Ok(name);
+    }
+    if RootfsFlavor::from_slug(spelling).is_ok() {
+        bail!(
+            "'{spelling}' is a built-in flavor, not an imported image, and \
+             `isopod image rm` removes imported images only. Rebuild it with \
+             `isopod image build-rootfs --flavor {spelling} --force`, or pass \
+             `{IMPORTED_PREFIX}{spelling}` if you really did import an image of \
+             that name"
+        );
+    }
+    Ok(spelling)
+}
+
+// ===========================================================================
 // The whole import, end to end
 // ===========================================================================
 
@@ -594,6 +774,46 @@ pub fn slug_for(source: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// How much of a reference stays readable in its cache directory's name.
+const CACHE_NAME_MAX: usize = 48;
+
+/// Where a registry reference's layer blobs are cached.
+///
+/// Keyed by a digest of the **whole** reference rather than by its slug.
+/// [`slug_for`] maps every run of characters a name may not contain to a single
+/// dash, so `a/b:c` and `a-b-c` produce the same string, as do
+/// `ghcr.io/x/y` and `ghcr.io-x-y` — and that string used to be the whole key.
+///
+/// A shared cache directory is not merely untidy, because the directory is an
+/// **OCI image layout**: it holds content-addressed blobs, which two references
+/// can safely share, and one `index.json`, which they cannot. `index.json` is
+/// rewritten by every pull to name that pull's manifest, and the import reads
+/// it back immediately afterwards. Two imports of colliding references running
+/// at once therefore interleave into an image packed from the *other*
+/// reference's manifest and layers, while its sidecar records the reference
+/// that was asked for and that reference's manifest digest. Nothing detects it:
+/// every blob verifies against its own digest, because nothing was substituted
+/// at the blob level. Digests answer "are these the bytes that were named"; the
+/// key has to answer "whose layout is this", and a lossy one cannot.
+///
+/// The readable prefix is kept so the cache is still browsable, and truncated
+/// because a reference can be far longer than a directory name wants to be.
+fn blob_cache_dir(images: &Path, reference: &str) -> PathBuf {
+    images.join("oci-blobs").join(blob_cache_key(reference))
+}
+
+/// The directory name [`blob_cache_dir`] uses: a readable prefix, then enough
+/// of the reference's sha256 that two references cannot collide.
+fn blob_cache_key(reference: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(reference.as_bytes()));
+    let readable: String = slug_for(reference).chars().take(CACHE_NAME_MAX).collect();
+    // Truncation can land mid-separator; a trailing dash reads as a missing
+    // component rather than a cut one.
+    let readable = readable.trim_end_matches(['-', '.']);
+    format!("{readable}-{}", &digest[..16])
 }
 
 /// Pull, unpack, adapt, pack and stamp — the whole import.
@@ -772,7 +992,7 @@ fn materialise_layout(
             // Blobs are cached outside the workdir so a re-import after an
             // agent rebuild — which invalidates every imported base — does not
             // re-download a gigabyte it already has.
-            let cache = images.join("oci-blobs").join(slug_for(reference));
+            let cache = blob_cache_dir(images, reference);
             let mut puller =
                 Puller::new(reference).map_err(|e| anyhow::anyhow!("{reference}: {e}"))?;
             let pulled = puller

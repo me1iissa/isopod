@@ -7,7 +7,13 @@
 //! command over vsock, optionally commit the result as a content-addressed
 //! stage, and destroy the VM. The remaining tools inspect and prune the stage
 //! store ([`Isopod::stage_list`]/[`Isopod::stage_info`]/[`Isopod::stage_rm`]) and
-//! the recorded VM directories ([`Isopod::vm_list`]/[`Isopod::vm_gc`]).
+//! the recorded VM directories ([`Isopod::vm_list`]/[`Isopod::vm_gc`]), and list
+//! the base images a run can boot ([`Isopod::image_list`]).
+//!
+//! Every result type here is a **hand-written projection** of a core one, not a
+//! re-export: a field core gains does not reach a model until this file names
+//! it. That is deliberate — the tool schemas are read by a model rather than by
+//! a program, and their prose is written for one.
 //!
 //! Each tool is a thin async shim over a synchronous `isopod_core` function.
 //! Because [`isopod_core::vm::run_ephemeral`] builds its own tokio runtime
@@ -59,8 +65,9 @@ mutated, so you can branch freely. Omit `stage` to start from the fresh toolchai
 fork+run+commit again.\n\n\
 Networking is on by default (NAT egress); pass `network: false` for untrusted code. Inspect \
 and prune stages with `stage_list`/`stage_info`/`stage_rm`, and review or clean recent VM \
-records with `vm_list`/`vm_gc`. Prefer ephemeral `sandbox_run`; commit a stage only when \
-state must survive the call.";
+records with `vm_list`/`vm_gc`. `image_list` shows which base images `base` accepts, including \
+container images imported as `oci:<name>`. Prefer ephemeral `sandbox_run`; commit a stage only \
+when state must survive the call.";
 
 /// Inline output-size hint advertised on `sandbox_run` via the tool's `_meta`
 /// (`anthropic/maxResultSizeChars`): `stdout`/`stderr` are each head-capped at
@@ -166,9 +173,9 @@ struct SandboxRunParams {
     stage: Option<String>,
     /// Base image for a fresh (`stage: "base"`) run: `base-alpine`
     /// (Python/Node/git/gcc toolchain, the default), `base-sqfs` (busybox), or
-    /// an imported OCI image as `oci:<name>` (see `isopod image import`). An
-    /// imported image's `Env` and `WorkingDir` become defaults for the run,
-    /// applied under whatever this call sets itself.
+    /// an imported OCI image as `oci:<name>` — `image_list` shows which ones
+    /// this host has. An imported image's `Env` and `WorkingDir` become
+    /// defaults for the run, applied under whatever this call sets itself.
     /// Ignored when forking an existing stage (it reuses the recorded base).
     #[serde(default)]
     base: Option<String>,
@@ -663,6 +670,44 @@ struct VmListResult {
     vms: Vec<VmEntry>,
 }
 
+/// One base image, as surfaced by `image_list`.
+///
+/// A projection of `isopod_core::image::ImageEntry` that drops what only a
+/// human operator can act on — the on-disk path, the build timestamp — and
+/// leads with the one field a model needs: the string to put in `base`.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ImageEntryResult {
+    /// What to pass as `sandbox_run`'s `base`: a built-in flavor slug
+    /// (`base-alpine`, `base-sqfs`) or `oci:<name>` for an imported image.
+    base: String,
+    /// `builtin` for an image isopod builds itself, `imported` for one brought
+    /// in from a container registry with `isopod image import`.
+    kind: String,
+    /// Whether the image is on disk. Naming a base that is not present fails
+    /// the run with a "build it first" / "import it first" error.
+    present: bool,
+    /// Image size in bytes (present images only).
+    bytes: Option<u64>,
+    /// The image is present but disagrees with this isopod build, and a run
+    /// naming it is refused before it boots. The operator has to rebuild it
+    /// (`isopod image build-all`) or re-import it — there is nothing a caller
+    /// can do about it from here.
+    stale: bool,
+    /// Why it is stale: `proto` (the guest RPC version moved) or `agent` (the
+    /// guest agent was rebuilt). Absent on a fresh image.
+    stale_reason: Option<String>,
+    /// The registry reference an imported image was built from, e.g.
+    /// `alpine:3.20`. Absent for the built-in flavors.
+    source_ref: Option<String>,
+}
+
+/// Result of [`Isopod::image_list`].
+#[derive(Debug, Serialize, JsonSchema)]
+struct ImageListResult {
+    /// Built-in flavors first, then imported images by name.
+    images: Vec<ImageEntryResult>,
+}
+
 /// Result of [`Isopod::vm_gc`].
 #[derive(Debug, Serialize, JsonSchema)]
 struct VmGcResult {
@@ -1062,6 +1107,44 @@ exec logs. `vm_gc` never collects a live one."
         }))
     }
 
+    /// List the base images a run can boot: the flavors isopod builds itself
+    /// and every OCI image imported on this host.
+    ///
+    /// The discovery half of `sandbox_run`'s `base`. Without it a model is told
+    /// that an imported image is spelled `oci:<name>` and has no way to learn a
+    /// single name — the CLI's own refusal for an unknown base sends an
+    /// operator to `isopod image ls`, and this is that list.
+    #[tool(
+        name = "image_list",
+        description = "List the base images `sandbox_run`'s `base` accepts: the built-in flavors \
+(`base-alpine`, `base-sqfs`) and every OCI image imported on this host, spelled `oci:<name>`. \
+Shows whether each is on disk and whether it is stale (the operator must rebuild or re-import \
+it before a run can name it). Importing and removing images is a CLI operation."
+    )]
+    async fn image_list(&self) -> Result<Json<ImageListResult>, ErrorData> {
+        let list = tokio::task::spawn_blocking(image::list_images)
+            .await
+            .map_err(|join| {
+                ErrorData::internal_error(format!("image_list task panicked: {join}"), None)
+            })?
+            .map_err(|e| ErrorData::internal_error(format!("image_list failed: {e:#}"), None))?;
+        Ok(Json(ImageListResult {
+            images: list
+                .images
+                .into_iter()
+                .map(|e| ImageEntryResult {
+                    base: e.flavor,
+                    kind: e.kind.to_string(),
+                    present: e.present,
+                    bytes: e.bytes_apparent,
+                    stale: e.stale,
+                    stale_reason: e.stale_reason.map(str::to_string),
+                    source_ref: e.source_ref,
+                })
+                .collect(),
+        }))
+    }
+
     /// Garbage-collect old VM directories: reap any orphaned firecracker
     /// processes, then keep the newest `keep_last` records (and anything younger
     /// than a minute) and prune the rest.
@@ -1182,9 +1265,9 @@ mod tests {
         );
     }
 
-    /// The router exposes exactly the six agreed tools, by name.
+    /// The router exposes exactly the agreed tools, by name.
     #[test]
-    fn exposes_the_six_tools() {
+    fn exposes_the_agreed_tools() {
         let server = Isopod::new();
         let mut names: Vec<String> = server
             .tool_router
@@ -1196,6 +1279,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "image_list".to_string(),
                 "sandbox_run".to_string(),
                 "stage_info".to_string(),
                 "stage_list".to_string(),
@@ -1204,6 +1288,27 @@ mod tests {
                 "vm_list".to_string(),
             ]
         );
+    }
+
+    /// `base` names a spelling (`oci:<name>`) that only one tool can enumerate,
+    /// so the schema that mentions it and the tool that lists it have to ship
+    /// together — a model told about a spelling it cannot discover is worse off
+    /// than one told nothing.
+    #[test]
+    fn the_base_parameter_points_at_a_tool_that_can_enumerate_it() {
+        let server = Isopod::new();
+        let tools = server.tool_router.list_all();
+        let run = tools
+            .iter()
+            .find(|t| t.name == "sandbox_run")
+            .expect("sandbox_run present");
+        let schema = serde_json::to_string(&run.input_schema).expect("schema serializes");
+        assert!(schema.contains("oci:"), "{schema}");
+        assert!(
+            schema.contains("image_list"),
+            "the `base` description must name the tool that lists imported images: {schema}"
+        );
+        assert!(tools.iter().any(|t| t.name == "image_list"));
     }
 
     /// `sandbox_run` carries the Anthropic max-result-size hint in its `_meta`,

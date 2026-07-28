@@ -166,6 +166,7 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 | `stage_rm` | Remove a stage. Refuses if another stage's chain still forks from it. |
 | `vm_list` | Recent VM records (id, vanity name, flavor, created, directory size) — useful for finding a vanity name after the fact. |
 | `vm_gc` | Reap orphaned Firecracker processes and prune old VM record directories, keeping the newest `keep_last` (default 20). |
+| `image_list` | Every base a run can boot: the built flavors and any imported OCI image, with staleness. Read-only — importing and removing images are CLI-only, so nothing a model asks for can pull bytes onto the host or take a base out from under a stage. |
 
 ### `sandbox_run` params (the one worth knowing in detail)
 

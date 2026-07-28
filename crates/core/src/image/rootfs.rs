@@ -141,8 +141,9 @@ pub enum RootfsFlavor {
 }
 
 impl RootfsFlavor {
-    /// Every flavor, in build order — the working set of `isopod image build-all`
-    /// and `isopod image ls`. A `PROTO_VERSION` bump must rebuild all of these
+    /// Every flavor, in build order — the working set of `isopod image build-all`,
+    /// and the first rows of `isopod image ls` (which goes on to list the
+    /// imported bases too). A `PROTO_VERSION` bump must rebuild all of these
     /// together (finding #17).
     pub const ALL: [RootfsFlavor; 4] = [
         RootfsFlavor::DevBusybox,
@@ -560,8 +561,18 @@ pub fn base_content_id(flavor: RootfsFlavor) -> Result<String> {
 /// One row of `isopod image ls`.
 #[derive(Debug, Serialize)]
 pub struct ImageEntry {
-    /// Flavor slug.
+    /// The name this image is booted by: a flavor slug for one isopod builds
+    /// itself, `oci:<name>` for an imported one.
+    ///
+    /// The field keeps the name it had when only flavors existed because the
+    /// value is unchanged for them, and because an imported image's own sidecar
+    /// has always spelled itself `oci:<name>` in [`ImageMeta::flavor`] — one
+    /// namespace, which is also the one `--base` takes and a stage records.
     pub flavor: String,
+    /// `"builtin"` for a flavor `isopod image build-rootfs` produces,
+    /// `"imported"` for an image `isopod image import` produced. Both are listed
+    /// together, so this is how a caller tells them apart.
+    pub kind: &'static str,
     /// On-disk image path.
     pub path: PathBuf,
     /// Whether the image file exists.
@@ -584,68 +595,155 @@ pub struct ImageEntry {
     /// Unix build time from the sidecar.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_unix: Option<u64>,
+    /// The reference an imported image was built from (`alpine:3.20`, a layout
+    /// path). Absent for a built-in flavor, which came from nowhere, and for an
+    /// imported image whose sidecar predates the provenance field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
 }
 
-/// Result of `isopod image ls`: every flavor with its stamp status.
+/// Result of `isopod image ls`: every bootable base with its stamp status.
 #[derive(Debug, Serialize)]
 pub struct ImageList {
     /// Always `true` on the success path.
     pub ok: bool,
     /// The protocol version this host build speaks.
     pub host_proto: u32,
-    /// One entry per flavor ([`RootfsFlavor::ALL`] order).
+    /// Every flavor ([`RootfsFlavor::ALL`] order) followed by every imported
+    /// image, by name.
     pub images: Vec<ImageEntry>,
 }
 
-/// Enumerate every flavor's image with its sidecar stamp status (`image ls`).
+/// Enumerate every base image with its sidecar stamp status (`image ls`):
+/// the built-in flavors **and** the images `isopod image import` produced.
+///
+/// One list rather than two, because the question it answers is "what can I
+/// pass to `--base`?" and that is a single namespace: `BaseRef::parse` accepts
+/// a flavor slug or `oci:<name>`, a stage records whichever it booted in one
+/// string, and an unknown base is refused with a message pointing here. A
+/// separate array would leave that refusal pointing at a list the name it
+/// refused could not be in.
 pub fn list_images() -> Result<ImageList> {
-    let images_dir = paths::images_dir()?;
+    list_images_in(&paths::images_dir()?, host_agent_sha256())
+}
+
+/// [`list_images`] against an explicit images directory, with the host's agent
+/// hash injected.
+///
+/// Both are seams for the tests: `$ISOPOD_HOME` is process-global, and
+/// [`host_agent_sha256`] is a process-wide `OnceLock` computed from whatever
+/// this machine happens to have built — so a staleness assertion driven through
+/// either of them passes or fails for the whole run rather than for the case it
+/// names.
+pub(crate) fn list_images_in(images_dir: &Path, host_agent: Option<&str>) -> Result<ImageList> {
     let mut images = Vec::with_capacity(RootfsFlavor::ALL.len());
     for flavor in RootfsFlavor::ALL {
-        let path = image_dest(&images_dir, flavor);
-        let present = path.exists();
-        let meta = if present {
-            read_image_meta(&path)?
-        } else {
-            None
-        };
-        let bytes_apparent = present
-            .then(|| std::fs::metadata(&path).map(|m| m.len()).ok())
-            .flatten();
-        let proto_version = meta.as_ref().and_then(|m| m.proto_version);
-        let proto_stale = matches!(proto_version, Some(v) if v != isopod_proto::PROTO_VERSION);
-        let agent_stale = match (
-            meta.as_ref().and_then(|m| m.agent_sha256.as_deref()),
-            host_agent_sha256(),
-        ) {
-            (Some(stamped), Some(host)) => stamped != host,
-            // No stamp or no local agent to compare against: not a mismatch.
-            _ => false,
-        };
-        let stale_reason = if proto_stale {
-            Some("proto")
-        } else if agent_stale {
-            Some("agent")
-        } else {
-            None
-        };
-        images.push(ImageEntry {
-            stale_reason,
-            flavor: flavor.slug().to_string(),
+        images.push(image_entry(
+            image_dest(images_dir, flavor),
+            flavor.slug().to_string(),
+            "builtin",
+            host_agent,
+        )?);
+    }
+    for (name, path) in super::import::list_imported(images_dir)? {
+        images.push(image_entry(
             path,
-            present,
-            bytes_apparent,
-            proto_version,
-            unstamped: present && meta.is_none(),
-            stale: proto_stale || agent_stale,
-            built_unix: meta.as_ref().map(|m| m.built_unix),
-        });
+            format!("{}{name}", super::base::IMPORTED_PREFIX),
+            "imported",
+            host_agent,
+        )?);
     }
     Ok(ImageList {
         ok: true,
         host_proto: isopod_proto::PROTO_VERSION,
         images,
     })
+}
+
+/// Build one `image ls` row for the image at `path`, named `flavor`.
+///
+/// An imported image gets the identical freshness treatment a built one gets,
+/// and it needs it more: its sidecar records the agent hash it was packed
+/// against, and every guest-agent rebuild invalidates every imported base. An
+/// entry that reported only "present" would say a base is usable right up to
+/// the moment the run refuses to boot it.
+fn image_entry(
+    path: PathBuf,
+    flavor: String,
+    kind: &'static str,
+    host_agent: Option<&str>,
+) -> Result<ImageEntry> {
+    let present = path.exists();
+    let meta = if present {
+        read_image_meta(&path)?
+    } else {
+        None
+    };
+    let bytes_apparent = present
+        .then(|| std::fs::metadata(&path).map(|m| m.len()).ok())
+        .flatten();
+    let proto_version = meta.as_ref().and_then(|m| m.proto_version);
+    let proto_stale = matches!(proto_version, Some(v) if v != isopod_proto::PROTO_VERSION);
+    let agent_stale = match (
+        meta.as_ref().and_then(|m| m.agent_sha256.as_deref()),
+        host_agent,
+    ) {
+        (Some(stamped), Some(host)) => stamped != host,
+        // No stamp or no local agent to compare against: not a mismatch.
+        _ => false,
+    };
+    let stale_reason = if proto_stale {
+        Some("proto")
+    } else if agent_stale {
+        Some("agent")
+    } else {
+        None
+    };
+    Ok(ImageEntry {
+        stale_reason,
+        flavor,
+        kind,
+        path,
+        present,
+        bytes_apparent,
+        proto_version,
+        unstamped: present && meta.is_none(),
+        stale: proto_stale || agent_stale,
+        built_unix: meta.as_ref().map(|m| m.built_unix),
+        source_ref: meta.and_then(|m| m.oci).map(|o| o.source_ref),
+    })
+}
+
+/// Delete an image and the sidecar that vouches for it, returning the bytes
+/// freed.
+///
+/// The image goes **first**, which is the opposite order to [`publish_image`]
+/// and for the same reason. Publishing clears the stamp first so a failure
+/// cannot leave an old sidecar vouching for new bytes; here the bytes never
+/// change, so the dangerous half is stripping the stamp off an image that is
+/// still there — that reads as "unstamped", which downgrades every stage
+/// stamped against it from "does not match" to "cannot be compared". Removing
+/// the image first leaves the harmless residue instead: a sidecar for a file
+/// that is gone, which the listing skips and the next publish clears.
+pub(crate) fn remove_image_and_meta(image: &Path) -> Result<u64> {
+    let mut freed = std::fs::metadata(image).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(image).with_context(|| format!("removing {}", image.display()))?;
+    let sidecar = image_meta_path(image);
+    freed += std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
+    remove_if_present(&sidecar)?;
+    // A `.partial` is what a crash mid-stamp leaves; it belongs to an image
+    // that no longer exists either.
+    remove_if_present(&image_meta_tmp_path(image))?;
+    Ok(freed)
+}
+
+/// Remove `path`, treating an already-absent file as done.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("removing {}", path.display()))),
+    }
 }
 
 /// Pseudo-filesystem mountpoints every flavor needs. `/dev` is auto-mounted by
@@ -1739,6 +1837,256 @@ mod tests {
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&busybox).unwrap()).unwrap();
         check_image_freshness(&img, None).unwrap();
+    }
+
+    // ---- `image ls` --------------------------------------------------------
+
+    /// The agent hash a fixture image is stamped with, standing in for the one
+    /// this host's `isopod-guest-agent` would hash to.
+    const STAMPED_AGENT: &str = "aa";
+
+    /// Lay an image down the way a publish leaves one: the file, then a sidecar
+    /// written by the production writer. Passing `None` for `meta` produces the
+    /// unstamped case (an image from before stamping, or a crash mid-publish).
+    fn lay_down(path: &Path, meta: Option<ImageMeta>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"squashfs bytes").unwrap();
+        if let Some(meta) = meta {
+            write_meta(path, &meta).unwrap();
+        }
+    }
+
+    /// A sidecar for an imported base, shaped exactly as
+    /// [`publish_imported_image`] writes one.
+    fn imported_meta(name: &str, source_ref: &str, agent: &str) -> ImageMeta {
+        ImageMeta {
+            flavor: format!("oci:{name}"),
+            proto_version: Some(isopod_proto::PROTO_VERSION),
+            agent_sha256: Some(agent.to_string()),
+            sha256: "cd".repeat(32),
+            built_unix: 7,
+            oci: Some(super::super::import::OciProvenance {
+                source_ref: source_ref.to_string(),
+                platform: "linux/amd64".into(),
+                manifest_digest: "sha256:aa".into(),
+                config_digest: "sha256:bb".into(),
+                layer_digests: vec!["sha256:cc".into()],
+                env: vec![],
+                working_dir: None,
+                entrypoint: vec![],
+                cmd: vec![],
+                user: None,
+                replaced_init: false,
+                setuid_paths: vec![],
+            }),
+        }
+    }
+
+    /// `image ls` is where `BaseRef::parse` sends an operator when it refuses a
+    /// base it does not know. Listing only the flavors made that advice
+    /// unfollowable: the imported name they typed could not appear in the list
+    /// the message pointed them at.
+    #[test]
+    fn image_ls_lists_imported_bases_beside_the_built_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path();
+        lay_down(
+            &images.join("base-alpine.sqfs"),
+            Some(ImageMeta {
+                flavor: "base-alpine".into(),
+                proto_version: Some(isopod_proto::PROTO_VERSION),
+                agent_sha256: Some(STAMPED_AGENT.into()),
+                sha256: "ab".repeat(32),
+                built_unix: 5,
+                oci: None,
+            }),
+        );
+        lay_down(
+            &images.join("oci/alpine-3.20.sqfs"),
+            Some(imported_meta("alpine-3.20", "alpine:3.20", STAMPED_AGENT)),
+        );
+
+        let list = list_images_in(images, Some(STAMPED_AGENT)).unwrap();
+
+        // Every flavor still appears, in build order, and none of them acquired
+        // a source they never had.
+        let builtin: Vec<&str> = list
+            .images
+            .iter()
+            .filter(|e| e.kind == "builtin")
+            .map(|e| e.flavor.as_str())
+            .collect();
+        assert_eq!(
+            builtin,
+            RootfsFlavor::ALL
+                .iter()
+                .map(|f| f.slug())
+                .collect::<Vec<_>>()
+        );
+        assert!(list
+            .images
+            .iter()
+            .filter(|e| e.kind == "builtin")
+            .all(|e| e.source_ref.is_none()));
+
+        let imported: Vec<&ImageEntry> = list
+            .images
+            .iter()
+            .filter(|e| e.kind == "imported")
+            .collect();
+        assert_eq!(imported.len(), 1, "the imported base is missing from ls");
+        let entry = imported[0];
+        // Named as `--base` takes it, which is the only spelling that makes the
+        // row actionable.
+        assert_eq!(entry.flavor, "oci:alpine-3.20");
+        assert!(
+            crate::image::BaseRef::parse(&entry.flavor).is_ok(),
+            "every name `image ls` prints must be one `--base` accepts"
+        );
+        assert!(entry.present && !entry.stale && !entry.unstamped);
+        assert_eq!(entry.stale_reason, None);
+        assert_eq!(entry.source_ref.as_deref(), Some("alpine:3.20"));
+        assert_eq!(entry.bytes_apparent, Some(b"squashfs bytes".len() as u64));
+        assert_eq!(entry.built_unix, Some(7));
+    }
+
+    /// An imported base gets the same freshness verdict a built one does, and
+    /// needs it more: its sidecar records the agent it was packed against, and
+    /// every agent rebuild invalidates every imported base. An entry that only
+    /// said "present" would call a base usable right up to the run refusing it.
+    #[test]
+    fn an_imported_base_reports_staleness_the_way_a_built_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path();
+        let img = images.join("oci/app.sqfs");
+        lay_down(
+            &img,
+            Some(imported_meta("app", "ghcr.io/org/app:v1", STAMPED_AGENT)),
+        );
+
+        let entry_for = |host: Option<&str>| {
+            list_images_in(images, host)
+                .unwrap()
+                .images
+                .into_iter()
+                .find(|e| e.flavor == "oci:app")
+                .expect("the imported base is listed")
+        };
+
+        // The host runs the agent it was packed against.
+        let fresh = entry_for(Some(STAMPED_AGENT));
+        assert!(!fresh.stale && fresh.stale_reason.is_none());
+
+        // The agent was rebuilt. The protocol version has not moved — which is
+        // the case the agent hash exists for.
+        let stale = entry_for(Some("bb"));
+        assert!(stale.stale, "a rebuilt agent must retire an imported base");
+        assert_eq!(stale.stale_reason, Some("agent"));
+
+        // A protocol bump is reported as itself, not as an agent mismatch.
+        let mut bumped = imported_meta("app", "ghcr.io/org/app:v1", STAMPED_AGENT);
+        bumped.proto_version = Some(isopod_proto::PROTO_VERSION + 1);
+        write_meta(&img, &bumped).unwrap();
+        let stale = entry_for(Some(STAMPED_AGENT));
+        assert_eq!(stale.stale_reason, Some("proto"));
+
+        // Neighbour: no sidecar at all. Nothing to compare, so it is reported
+        // as uncomparable rather than as stale — the same reading the pre-boot
+        // check takes.
+        std::fs::remove_file(image_meta_path(&img)).unwrap();
+        let bare = entry_for(Some("bb"));
+        assert!(bare.present && bare.unstamped && !bare.stale);
+        assert_eq!(bare.source_ref, None);
+        assert_eq!(bare.proto_version, None);
+    }
+
+    /// The imports directory is enumerated, so everything else that lives in it
+    /// — and everything that merely looks like an image — has to be skipped.
+    #[test]
+    fn the_imports_listing_skips_what_is_not_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path();
+        let oci = images.join("oci");
+        lay_down(
+            &oci.join("real.sqfs"),
+            Some(imported_meta("real", "x", "aa")),
+        );
+        // The sidecar of a real image, which lives beside it rather than under it.
+        assert!(oci.join("real.sqfs.meta.json").is_file());
+        // A directory that ends in .sqfs, and a link that resolves to nothing.
+        std::fs::create_dir_all(oci.join("adirectory.sqfs")).unwrap();
+        std::os::unix::fs::symlink("gone.sqfs", oci.join("dangling.sqfs")).unwrap();
+        // Something else entirely, and a name the import could never produce —
+        // listing it would offer a base that `BaseRef::parse` then refuses.
+        std::fs::write(oci.join("notes.txt"), b"x").unwrap();
+        std::fs::write(oci.join(".hidden.sqfs"), b"x").unwrap();
+
+        let listed: Vec<String> = list_images_in(images, None)
+            .unwrap()
+            .images
+            .into_iter()
+            .filter(|e| e.kind == "imported")
+            .map(|e| e.flavor)
+            .collect();
+        assert_eq!(listed, vec!["oci:real".to_string()]);
+
+        // Neighbour: a link that DOES resolve to an image is an image.
+        std::fs::write(oci.join("target.bin"), b"squashfs bytes").unwrap();
+        std::os::unix::fs::symlink("target.bin", oci.join("live.sqfs")).unwrap();
+        let listed: Vec<String> = list_images_in(images, None)
+            .unwrap()
+            .images
+            .into_iter()
+            .filter(|e| e.kind == "imported")
+            .map(|e| e.flavor)
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["oci:live".to_string(), "oci:real".to_string()],
+            "imported bases are listed by name"
+        );
+    }
+
+    /// A host that has imported nothing has no imports directory at all, and
+    /// `image ls` is the command an operator runs *before* the first import.
+    #[test]
+    fn image_ls_works_before_anything_has_been_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = list_images_in(dir.path(), None).unwrap();
+        assert_eq!(list.images.len(), RootfsFlavor::ALL.len());
+        assert!(list
+            .images
+            .iter()
+            .all(|e| e.kind == "builtin" && !e.present));
+        assert_eq!(list.host_proto, isopod_proto::PROTO_VERSION);
+    }
+
+    /// The image and the stamp that vouches for it are removed together. A
+    /// sidecar left behind describes a file that is gone; worse, a sidecar
+    /// removed while the image survived would read as "unstamped" and quietly
+    /// downgrade every stage stamped against it to "cannot be compared".
+    #[test]
+    fn removing_an_image_takes_its_stamp_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("oci/app.sqfs");
+        lay_down(&img, Some(imported_meta("app", "x", "aa")));
+        let sidecar_bytes = std::fs::metadata(image_meta_path(&img)).unwrap().len();
+        // A crash mid-stamp leaves this; it belongs to the image being removed.
+        std::fs::write(image_meta_tmp_path(&img), b"half a stamp").unwrap();
+
+        let freed = remove_image_and_meta(&img).unwrap();
+
+        assert!(!img.exists(), "the image must be gone");
+        assert!(
+            !image_meta_path(&img).exists(),
+            "a stamp must not outlive the image it describes"
+        );
+        assert!(!image_meta_tmp_path(&img).exists());
+        assert_eq!(
+            freed,
+            b"squashfs bytes".len() as u64 + sidecar_bytes,
+            "the freed byte count covers the sidecar too"
+        );
     }
 
     #[test]

@@ -8,6 +8,9 @@ tarball — all three land in the same place.
 isopod image import alpine:3.20
 isopod image import --oci-layout ./layout --name my-base
 isopod image import --docker-save ./saved.tar --name my-base
+
+isopod image ls                      # built flavors and imported images, one list
+isopod image rm alpine-3.20          # or `oci:alpine-3.20`; both spell the same image
 ```
 
 ## What you get, and what you do not
@@ -74,6 +77,32 @@ boots the base, **including a fork**, taken from the base the run actually
 resolved rather than from what was typed. Without that a `python:3.12` base does
 not find `python` on `PATH`.
 
+## Listing and removing
+
+`isopod image ls` lists imported images beside the built-in flavors, in **one**
+list, because "what can I pass to `--base`?" is one question: a flavor slug and
+an `oci:<name>` are the same namespace, a stage records whichever it booted in
+one string, and the refusal for an unknown base points here. Each row carries
+its `kind` (`builtin` or `imported`), whether it is on disk, its size, its
+`source_ref`, and the same freshness verdict a built flavor gets — which matters
+more for an imported base, since an agent rebuild retires every one of them.
+
+Over MCP the same list is the `image_list` tool. That is the only image surface a
+model gets: importing and removing are CLI operations, so nothing a model asks
+for can bring bytes onto the host or take a base away from a stage.
+
+```bash
+isopod image rm alpine-3.20            # refused while a stage records it
+isopod image rm alpine-3.20 --force    # removed anyway; those stages stop booting
+```
+
+A stage's layers are overlay upperdirs over one specific root, so a stage that
+recorded this base is a stage that cannot boot without it. The refusal names the
+stages rather than saying "in use", and `--force` reports which ones it broke.
+The image and its sidecar go together; the **cached layer blobs stay**, so a
+re-import is still local — the outcome names the directory to delete if you want
+those bytes back.
+
 ## What the import actually changes
 
 Deliberately little. Every byte of it is a difference between the image you
@@ -127,8 +156,19 @@ ran `chmod -s` on a binary, or deleted it in a later layer, does not get it back
 
 The sidecar records the reference, the resolved platform, the manifest and
 config digests and every layer digest, and layer blobs are cached under
-`~/.isopod/images/oci-blobs/`. A re-import of the same reference is a local
-operation.
+`~/.isopod/images/oci-blobs/<readable-prefix>-<hash of the reference>`. A
+re-import of the same reference is a local operation.
+
+The key is a hash of the whole reference, not of its readable form, and the
+distinction is load-bearing. A cache directory is an OCI image layout: the blobs
+in it are content-addressed and two references may safely share them, but its
+one `index.json` is rewritten by every pull and read straight back. Keyed by the
+shell-safe name alone, `a/b:c` and `a-b-c` — or `ghcr.io/org/app:v1` and
+`ghcr.io/org/app/v1` — name the same directory, so two imports running at once
+can each read the other's index and pack an image from the wrong manifest, with
+every blob verifying and the sidecar recording the reference that was asked for.
+Digests answer "are these the bytes that were named"; the key has to answer
+"whose layout is this".
 
 That matters more than it sounds. An imported base is stamped with the
 guest-agent hash it was built against, and **every guest-agent rebuild
