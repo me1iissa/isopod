@@ -1,0 +1,546 @@
+//! Turn an unpacked OCI rootfs into a base image isopod can boot.
+//!
+//! [`isopod_oci_unpack`] produces a directory tree and knows nothing about
+//! isopod. This module is the other half: it adds the few things the guest
+//! agent needs in order to be PID 1, packs the result with the same pinned
+//! `mksquashfs` invocation the built-in flavors use, and stamps a sidecar that
+//! records where the image came from.
+//!
+//! # What "adaptation" actually is
+//!
+//! A normal Debian- or Alpine-derived image already ships `/bin/sh`, the
+//! pseudo-filesystem mountpoints and a sticky `/tmp`. What it does not ship is
+//! an init that speaks isopod's vsock RPC, or the three empty directories the
+//! agent pivots through. So the adaptation is **three empty directories, one
+//! binary, one symbolic link and one sidecar** — deliberately small, because
+//! every byte of it is a difference between the image the operator asked for
+//! and the image they get.
+//!
+//! The image's own `/sbin/init` is left alone. On a Debian-derived image that
+//! is systemd, and replacing it would be a silent content mutation with no
+//! purpose: the kernel is booted with `init=/init`, so `/init` is the only path
+//! that has to be isopod's.
+//!
+//! # The promise, stated correctly
+//!
+//! **isopod runs your image's filesystem, with isopod's init.** Not "isopod
+//! runs your container". An imported image's `ENTRYPOINT` can never be PID 1,
+//! because PID 1 is the agent that does the overlay mounts, the pivot and the
+//! RPC. The entrypoint and command are recorded so an operator can see what the
+//! image was for, and never executed.
+//!
+//! # setuid, and why it is applied here and nowhere else
+//!
+//! The extractor never writes a setuid, setgid or sticky bit to the host tree —
+//! those bits would sit in the operator's home directory, on files an attacker
+//! authored, before any VM exists. It records them instead. This module turns
+//! that record into a `mksquashfs` pseudo-file, so the bits exist **inside the
+//! image** and nowhere else. Stripping them outright is not an option: it
+//! breaks `ping`, `sudo` and `newgrp`, and inside the guest everything is
+//! already root, so they grant nothing there anyway.
+
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use super::rootfs::{self, ImageMeta};
+use crate::paths;
+
+/// Directory mode for everything this module creates.
+///
+/// Explicit, never left to `create_dir`'s umask masking. The image's content id
+/// is its identity, so a mode that varies with the operator's shell means the
+/// same source image imports to two different base images on two hosts — and a
+/// stage stamped against one cannot be forked on the other. The extractor
+/// learned this the expensive way; the adaptation must not reintroduce it.
+const DIR_MODE: u32 = 0o755;
+
+/// Mode for `/tmp` when the image does not ship one.
+const TMP_MODE: u32 = 0o1777;
+
+/// Where the guest agent is installed inside an imported image.
+///
+/// Not `/sbin/init`: see the module documentation. A dotted directory keeps it
+/// out of the way of the image's own layout.
+const AGENT_DIR: &str = ".isopod";
+/// Path of the agent binary within the image, relative to its root.
+const AGENT_PATH: &str = ".isopod/init";
+
+/// Empty mountpoints an isopod base must ship, created if the image lacks them.
+///
+/// `/overlay` is where the writable scratch is mounted, `/mnt` is the pivot
+/// staging point, and `/layers` is where the guest mounts a tmpfs and creates
+/// one mountpoint per committed stage layer.
+///
+/// `/layers` must exist and must be **empty**: a tmpfs needs something to mount
+/// over, and preallocating numbered subdirectories is what once capped a chain
+/// at nine layers. `/rom` is deliberately absent — it was created by every
+/// built-in flavor, read by nothing, and removed in 0.12.0.
+const OVERLAY_DIRS: &[&str] = &["overlay", "mnt", "layers"];
+
+/// Pseudo-filesystem mountpoints. The kernel mounts devtmpfs over `/dev`, but
+/// the directory has to exist first.
+const PSEUDO_DIRS: &[&str] = &["proc", "sys", "dev", "etc", "var"];
+
+/// Where an imported base lands, and the shell-safe name it is addressed by.
+///
+/// Imported bases live under their own directory so that `images/` stays
+/// enumerable by flavor: nothing here is a [`rootfs::RootfsFlavor`], and the
+/// design deliberately does not add a variant for one.
+pub fn imported_image_path(images: &Path, slug: &str) -> Result<PathBuf> {
+    validate_slug(slug)?;
+    Ok(images.join("oci").join(format!("{slug}.sqfs")))
+}
+
+/// Refuse a slug that could name anything other than a file in the imports
+/// directory.
+///
+/// This is the string that becomes a path, so it gets the treatment a path
+/// component gets rather than the treatment a label gets: an allow-list, not a
+/// scan for the bad cases someone thought of.
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        bail!("an imported image needs a name");
+    }
+    if slug.len() > 128 {
+        bail!("image name '{slug}' is longer than 128 characters");
+    }
+    if slug.starts_with('.') || slug.starts_with('-') {
+        bail!("image name '{slug}' may not start with '.' or '-'");
+    }
+    if let Some(bad) = slug
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        bail!(
+            "image name '{slug}' contains {bad:?}; \
+             names may use letters, digits, '.', '_' and '-' only"
+        );
+    }
+    Ok(())
+}
+
+/// Where an imported image came from, recorded in its sidecar.
+///
+/// Enough to re-derive the image: the reference that was asked for, the
+/// manifest that reference resolved to, and every blob that went into it. A
+/// re-import from cached blobs is then a local operation, which matters because
+/// **every guest-agent rebuild invalidates every imported base** — the
+/// freshness check compares the agent hash, and agent hashes change far more
+/// often than the protocol version does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OciProvenance {
+    /// The reference as the operator wrote it, e.g. `alpine:3.20`.
+    pub source_ref: String,
+    /// The platform the index resolved to, e.g. `linux/amd64`.
+    pub platform: String,
+    /// Digest of the single-platform manifest this image was built from.
+    pub manifest_digest: String,
+    /// Digest of the config blob.
+    pub config_digest: String,
+    /// Layer blob digests, in application order.
+    pub layer_digests: Vec<String>,
+    /// The image config's environment, merged **under** a run's own env.
+    pub env: Vec<String>,
+    /// The image config's working directory: a run's default cwd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Recorded, never executed. See the module documentation.
+    pub entrypoint: Vec<String>,
+    /// Recorded, never executed.
+    pub cmd: Vec<String>,
+    /// Recorded and **ignored**: the guest agent execs as root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The image shipped its own `/init` and it was replaced by isopod's.
+    pub replaced_init: bool,
+    /// Paths carrying setuid, setgid or sticky bits inside the image.
+    pub setuid_paths: Vec<String>,
+}
+
+/// What the adaptation did, for the command's output.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdaptReport {
+    /// Directories created because the image did not ship them.
+    pub dirs_created: Vec<String>,
+    /// The image shipped an `/init` and it was replaced.
+    pub replaced_init: bool,
+    /// `/tmp` was created (the image did not ship one).
+    pub created_tmp: bool,
+    /// Special-mode paths carried into the image via the pseudo-file.
+    pub special_modes: usize,
+}
+
+/// Result of a completed import.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportOutcome {
+    /// Always `true` on the success path.
+    pub ok: bool,
+    /// Absolute path to the packed image.
+    pub image_path: PathBuf,
+    /// The name the image is addressed by.
+    pub slug: String,
+    /// Image size in bytes.
+    pub bytes: u64,
+    /// The image's content id — what a stage records and the warm pool keys on.
+    pub sha256: String,
+    /// What the adaptation changed.
+    pub adapt: AdaptReport,
+    /// Where the image came from.
+    pub provenance: OciProvenance,
+    /// Notices an operator has to see, because they describe something the
+    /// import decided **not** to do. These belong in the command's output and
+    /// not only in the documentation: nobody reads the documentation for the
+    /// thing that silently did not happen.
+    pub notes: Vec<String>,
+}
+
+// ===========================================================================
+// Adaptation
+// ===========================================================================
+
+/// Add what the guest agent needs to be PID 1 in `tree`.
+///
+/// `tree` is an unpacked rootfs, still on the host and still owned by the
+/// operator. `agent` is the static musl guest-agent binary.
+///
+/// # Errors
+/// Refuses an image with no `/bin/sh`, since the MCP surface sends
+/// `["/bin/sh", "-c", …]` and a run would otherwise fail with a bare exit 127
+/// long after the import looked like it worked.
+pub fn adapt(tree: &Path, agent: &Path) -> Result<AdaptReport> {
+    if resolve_in_tree(tree, "bin/sh").is_none() {
+        bail!(
+            "this image has no /bin/sh, so isopod cannot run a command in it. \
+             Distroless and scratch-based images are not importable: the exec \
+             surface is `/bin/sh -c <command>`. Import a base with a shell \
+             (alpine, debian, ubuntu) and add your application to it."
+        );
+    }
+
+    let mut report = AdaptReport {
+        dirs_created: Vec::new(),
+        replaced_init: false,
+        created_tmp: false,
+        special_modes: 0,
+    };
+
+    for dir in PSEUDO_DIRS.iter().chain(OVERLAY_DIRS.iter()) {
+        if ensure_dir(tree, dir)? {
+            report.dirs_created.push(format!("/{dir}"));
+        }
+    }
+
+    // `/tmp` is created only if the image lacks one; an image that ships its own
+    // keeps whatever mode it chose. The sticky bit is not written here — it goes
+    // into the pseudo-file with every other special mode, so nothing setuid,
+    // setgid or sticky is ever materialised on the host.
+    if ensure_dir(tree, "tmp")? {
+        report.dirs_created.push("/tmp".into());
+        report.created_tmp = true;
+    }
+
+    // The agent, and the one path the kernel actually boots.
+    ensure_dir(tree, AGENT_DIR)?;
+    let dest = tree.join(AGENT_PATH);
+    std::fs::copy(agent, &dest)
+        .with_context(|| format!("installing the guest agent at /{AGENT_PATH}"))?;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 /{AGENT_PATH}"))?;
+
+    let init = tree.join("init");
+    if std::fs::symlink_metadata(&init).is_ok() {
+        report.replaced_init = true;
+        remove_any(&init).context("removing the image's own /init")?;
+    }
+    // Relative, so it resolves against the image's root rather than the host's
+    // at any point where something other than the kernel reads it.
+    std::os::unix::fs::symlink(AGENT_PATH, &init)
+        .with_context(|| format!("symlink /init -> /{AGENT_PATH}"))?;
+
+    Ok(report)
+}
+
+/// Create `tree/rel` if it is not already a directory, with an explicit mode.
+/// Returns whether it was created.
+fn ensure_dir(tree: &Path, rel: &str) -> Result<bool> {
+    let path = tree.join(rel);
+    match std::fs::symlink_metadata(&path) {
+        // Already a directory, or a symbolic link to one — a usrmerge image
+        // points `/var/run` and friends at other places, and replacing those
+        // would be exactly the silent content mutation this module avoids.
+        Ok(md) if md.is_dir() || md.file_type().is_symlink() => return Ok(false),
+        Ok(_) => bail!(
+            "the image has a non-directory at /{rel}, which isopod needs as a \
+             directory; this image cannot be adapted"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("stat /{rel}")));
+        }
+    }
+    std::fs::create_dir_all(&path).with_context(|| format!("mkdir /{rel}"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(DIR_MODE))
+        .with_context(|| format!("chmod {DIR_MODE:o} /{rel}"))?;
+    Ok(true)
+}
+
+/// Remove a file, symbolic link or directory at `path`.
+fn remove_any(path: &Path) -> Result<()> {
+    let md = std::fs::symlink_metadata(path)?;
+    if md.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Resolve `rel` **within** `tree`, following symbolic links against the
+/// tree's own root, and return the resolved host path if something is there.
+///
+/// `Path::exists()` is the wrong tool and quietly gives the wrong answer: an
+/// image's `/bin/sh -> /bin/busybox` is an absolute link, and `exists()`
+/// resolves it against the **host's** root. On any ordinary machine
+/// `/bin/busybox` may well be present, so a distroless image with a dangling
+/// `/bin/sh` link would pass the shell check and fail much later, inside a VM,
+/// as exit 127.
+///
+/// Loops are bounded rather than detected: a self-referential link costs
+/// [`MAX_HOPS`] `readlink` calls and then reports absent, which is the right
+/// answer for a link that resolves to nothing.
+fn resolve_in_tree(tree: &Path, rel: &str) -> Option<PathBuf> {
+    /// `SYMLOOP_MAX`, which is what the kernel would give up after too.
+    const MAX_HOPS: usize = 40;
+
+    let mut pending: Vec<String> = split(rel);
+    let mut resolved: Vec<String> = Vec::new();
+    let mut hops = 0usize;
+
+    while let Some(component) = pending.first().cloned() {
+        pending.remove(0);
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                // Clamped at the root: an image's own path cannot address the
+                // host, exactly as it could not once the image is mounted.
+                resolved.pop();
+                continue;
+            }
+            _ => {}
+        }
+        resolved.push(component);
+        let here = tree.join(resolved.join("/"));
+        let md = std::fs::symlink_metadata(&here).ok()?;
+        if md.file_type().is_symlink() {
+            hops += 1;
+            if hops > MAX_HOPS {
+                return None;
+            }
+            let target = std::fs::read_link(&here).ok()?;
+            let target = target.to_str()?;
+            resolved.pop();
+            if target.starts_with('/') {
+                resolved.clear();
+            }
+            let mut rest = split(target);
+            rest.append(&mut pending);
+            pending = rest;
+        }
+    }
+    let out = tree.join(resolved.join("/"));
+    std::fs::symlink_metadata(&out).ok().map(|_| out)
+}
+
+fn split(p: &str) -> Vec<String> {
+    p.split('/').map(str::to_string).collect()
+}
+
+// ===========================================================================
+// The pseudo-file: special modes, applied inside the image only
+// ===========================================================================
+
+/// Render one `mksquashfs` pseudo-file line modifying `path`'s mode.
+///
+/// The path is **always quoted and escaped**, never interpolated raw. Every one
+/// of these paths came out of an attacker-authored tar, and the pseudo-file
+/// format is line- and space-delimited with a type field in the second
+/// position: an entry named `evil c 0666 0 0 1 3` would otherwise render a line
+/// that reads as "create a character device". Measured, that particular payload
+/// makes `mksquashfs` exit 1 rather than build the node — but only because `m`
+/// is not a valid octal mode, which is not a property worth depending on.
+///
+/// Control characters cannot reach here: the extractor refuses any name
+/// containing one, so a newline cannot forge a whole line. Quoting covers the
+/// rest — spaces, `#`, quotes and backslashes are all legal in a tar name.
+fn pseudo_line(path: &str, mode: u32) -> String {
+    let escaped = path.replace('\\', r"\\").replace('"', "\\\"");
+    format!("\"{escaped}\" m {mode:o} 0 0\n")
+}
+
+/// Write the pseudo-file for `modes` and return its path.
+fn write_pseudo_file(dir: &Path, modes: &[(String, u32)]) -> Result<PathBuf> {
+    let path = dir.join("pseudo");
+    let mut f =
+        std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    for (p, mode) in modes {
+        f.write_all(pseudo_line(p, *mode).as_bytes())
+            .with_context(|| format!("writing a pseudo-file entry for {p}"))?;
+    }
+    f.sync_all().context("fsync pseudo-file")?;
+    Ok(path)
+}
+
+/// How many entries in `image` carry a setuid, setgid or sticky bit.
+///
+/// Counted rather than matched per path, and that is the point: `mksquashfs`
+/// **silently ignores** a pseudo-file line naming a path it cannot find, and
+/// exits 0 while doing it. So a mis-encoded path does not fail the pack — it
+/// produces an image quietly missing the bit, which for `/bin/su` or `ping` is
+/// a broken image that looks fine. A count is also immune to the thing that
+/// makes per-path matching fragile here: the names may contain spaces, quotes
+/// and `#`, so parsing them back out of a listing is its own source of error.
+fn count_special_modes(image: &Path) -> Result<usize> {
+    let out = std::process::Command::new("unsquashfs")
+        .arg("-ll")
+        .arg(image)
+        .output()
+        .context("spawning unsquashfs (is squashfs-tools installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "unsquashfs -ll failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| {
+            // The mode string is the first field: `-rwsr-xr-x`, `drwxrwxrwt`.
+            let Some(mode) = line.split_whitespace().next() else {
+                return false;
+            };
+            mode.len() == 10
+                && mode
+                    .chars()
+                    .skip(1)
+                    .any(|c| matches!(c, 's' | 'S' | 't' | 'T'))
+        })
+        .count())
+}
+
+// ===========================================================================
+// Pack and stamp
+// ===========================================================================
+
+/// Everything the caller has to supply that this module cannot work out.
+pub struct ImportSpec<'a> {
+    /// The name the image will be addressed by.
+    pub slug: &'a str,
+    /// Special modes recorded by the extractor, applied inside the image only.
+    pub special_modes: &'a [(String, u32)],
+    /// Where the image came from.
+    pub provenance: OciProvenance,
+}
+
+/// Pack an adapted tree into a base image and stamp its sidecar.
+///
+/// The pack is the same pinned invocation the built-in flavors use, so an
+/// imported base gets the same guarantee: the content id follows the tree and
+/// not the clock, and re-importing the same source image on the same host with
+/// the same squashfs-tools yields the same id — which is what lets a stage
+/// stamped against an imported base survive a re-import.
+pub fn pack_and_stamp(
+    tree: &Path,
+    images: &Path,
+    spec: &ImportSpec<'_>,
+    adapt: AdaptReport,
+) -> Result<ImportOutcome> {
+    let dest = imported_image_path(images, spec.slug)?;
+    let parent = dest.parent().expect("the imports path has a parent");
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+
+    let work = tempfile::tempdir_in(parent).context("creating a pack workdir")?;
+
+    // `/tmp` created by the adaptation needs its sticky bit inside the image,
+    // and it is applied here with everything else rather than written to the
+    // host tree.
+    let mut modes: Vec<(String, u32)> = spec.special_modes.to_vec();
+    if adapt.created_tmp {
+        modes.push(("tmp".to_string(), TMP_MODE));
+    }
+    modes.sort();
+    modes.dedup_by(|a, b| a.0 == b.0);
+
+    let pseudo = write_pseudo_file(work.path(), &modes)?;
+    let tmp_img = work.path().join("image.sqfs");
+    rootfs::pack_squashfs_with_pseudo(tree, &tmp_img, &pseudo)?;
+
+    // `mksquashfs` ignores a pseudo-file line it cannot place, silently and
+    // with exit 0, so "it packed" is not evidence the bits landed.
+    let applied = count_special_modes(&tmp_img)?;
+    if applied != modes.len() {
+        bail!(
+            "the packed image carries {applied} setuid/setgid/sticky entries but \
+             {} were recorded — the pack step did not apply every mode it was \
+             given, and an image missing them is one where `ping` and `sudo` \
+             silently do not work",
+            modes.len()
+        );
+    }
+
+    std::fs::File::open(&tmp_img)
+        .and_then(|f| f.sync_all())
+        .context("fsync the packed image")?;
+
+    let provenance = spec.provenance.clone();
+    rootfs::publish_imported_image(&tmp_img, &dest, spec.slug, provenance.clone())?;
+
+    let bytes = std::fs::metadata(&dest)
+        .with_context(|| format!("stat {}", dest.display()))?
+        .len();
+    let sha256 = paths::sha256_file(&dest)?;
+
+    let mut notes = Vec::new();
+    if provenance.user.is_some() {
+        notes.push(format!(
+            "the image's USER ({}) is ignored: isopod's guest agent execs as root",
+            provenance.user.as_deref().unwrap_or_default()
+        ));
+    }
+    if !provenance.entrypoint.is_empty() || !provenance.cmd.is_empty() {
+        notes.push(
+            "the image's ENTRYPOINT and CMD are recorded but never executed: PID 1 \
+             is isopod's guest agent, which does the overlay mounts and the pivot"
+                .to_string(),
+        );
+    }
+    if adapt.replaced_init {
+        notes.push("the image shipped its own /init and it was replaced".to_string());
+    }
+
+    Ok(ImportOutcome {
+        ok: true,
+        image_path: dest,
+        slug: spec.slug.to_string(),
+        bytes,
+        sha256,
+        adapt: AdaptReport {
+            special_modes: modes.len(),
+            ..adapt
+        },
+        provenance,
+        notes,
+    })
+}
+
+/// Read an imported image's sidecar, if it has one.
+pub fn read_provenance(image: &Path) -> Result<Option<OciProvenance>> {
+    Ok(rootfs::read_image_meta(image)?.and_then(|m: ImageMeta| m.oci))
+}
+
+#[cfg(test)]
+mod tests;

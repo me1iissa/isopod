@@ -20,6 +20,13 @@ isopod-fc = { workspace = true }
 tokio = { workspace = true }
 # Host<->guest RPC contract (M2 agent): async frame helpers behind the tokio feature.
 isopod-proto = { workspace = true, features = ["tokio"] }
+# The OCI extractor and layout reader. The import path adapts and packs what
+# that crate produces; it deliberately knows nothing about isopod, so the
+# adaptation (agent as PID 1, overlay mountpoints, the sidecar) lives here.
+isopod-oci-unpack = { path = "../oci-unpack" }
+# Layer blobs arrive gzipped in practice; the layout reader hands back the
+# verified compressed bytes and the decoder is the caller's choice.
+flate2 = { workspace = true }
 # Blocking HTTP: the image pipeline is a synchronous one-shot CLI path, so we
 # opt the workspace reqwest into its `blocking` client (keeps the CLI runtime-free).
 reqwest = { workspace = true, features = ["blocking", "query"] }

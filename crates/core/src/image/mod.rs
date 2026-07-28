@@ -6,10 +6,15 @@
 //! * [`build_rootfs`] — assemble a rootfs tree and lay it down as a sparse ext4
 //!   image via `mkfs.ext4 -d` (no root).
 
+mod import;
 mod kernel;
 mod rootfs;
 mod s3;
 
+pub use import::{
+    adapt, imported_image_path, pack_and_stamp, read_provenance, AdaptReport, ImportOutcome,
+    ImportSpec, OciProvenance,
+};
 pub use kernel::{fetch_kernel, FetchKernelOutcome};
 pub(crate) use rootfs::base_image_path_in;
 pub use rootfs::{

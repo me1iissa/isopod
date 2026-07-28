@@ -8,6 +8,53 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Added — an unpacked OCI tree becomes a base isopod can boot
+
+The adaptation half of an image import. It takes the directory tree the
+extractor produces and adds the few things the guest agent needs in order to be
+PID 1: the agent at `/.isopod/init` with `/init` pointing at it relatively, the
+three empty overlay mountpoints (`/overlay`, `/mnt`, and a `/layers` that must
+stay empty), the pseudo-filesystem mountpoints an image happens not to ship, and
+a `/tmp` if there is none. The image's own `/sbin/init` is left alone — on a
+Debian-derived image that is systemd, and the kernel boots `init=/init`, so
+`/init` is the only path isopod has to own. An image that ships its own `/init`
+has it replaced, and the sidecar records that it did.
+
+**isopod runs your image's filesystem, with isopod's init** — not "isopod runs
+your container". An imported image's `ENTRYPOINT` can never be PID 1, because
+PID 1 is the agent that does the overlay mounts, the pivot and the RPC. The
+entrypoint, command and `USER` are recorded and never acted on, and the ones
+that are *ignored* rather than merely unused say so in the command's own output.
+
+An image with no `/bin/sh` is refused by name at import time, with the shape of
+image that does work. Distroless and scratch images cannot be run by a surface
+whose exec is `/bin/sh -c`, and the alternative to refusing is an exit 127
+inside a VM, long after the import looked like it worked. The check resolves
+`/bin/sh` **within the image**: `Path::exists()` follows an absolute link like
+`/bin/sh -> /bin/busybox` against the *host's* root, so on an ordinary machine a
+distroless image would have passed.
+
+The pack is the built-in flavors' pinned `mksquashfs` invocation plus a
+pseudo-file carrying the setuid, setgid and sticky bits — which is the only
+place those bits are ever applied. They are never written to the host tree,
+where they would sit on attacker-authored files in the operator's home before
+any VM exists. Every path in that pseudo-file is quoted and escaped: the format
+is space-delimited with a type field in second position, so a tar entry named
+`evil c 0666 0 0 1 3` would otherwise render a line that reads "create a
+character device". And because `mksquashfs` *silently* ignores a pseudo-file
+line naming a path it cannot find — exit 0, no diagnostic — the pack verifies
+that as many special-mode entries came out of the image as went in, rather than
+treating a successful exit as evidence.
+
+The sidecar gains an `oci` section recording the reference, the resolved
+platform, the manifest and config digests and every layer digest, so a re-import
+is a local operation. That matters more than it sounds: the freshness check
+compares the *agent hash*, not only the protocol version, so every guest-agent
+rebuild invalidates every imported base.
+
+No CLI surface yet — `isopod image import` is the next step, and the
+documentation lands with the command rather than ahead of it.
+
 ### Fixed — a setuid bit does not survive its own removal
 
 `Report::setuid_paths` is what the pack step reapplies inside an imported

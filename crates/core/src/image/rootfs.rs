@@ -341,6 +341,15 @@ pub struct ImageMeta {
     pub sha256: String,
     /// Unix time the image was built.
     pub built_unix: u64,
+    /// Where an *imported* image came from: the reference, the manifest it
+    /// resolved to, every blob that went into it, and the config that becomes
+    /// a run's defaults. Absent for the built-in flavors, and absent from
+    /// sidecars written before imports existed — which is why it defaults
+    /// rather than failing the parse. A sidecar that will not parse reads as no
+    /// sidecar at all, and that silently downgrades every stage stamped against
+    /// the image to "cannot be compared".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci: Option<super::import::OciProvenance>,
 }
 
 /// The sha256 of this host's `isopod-guest-agent`, computed once per process.
@@ -418,13 +427,24 @@ fn write_image_meta(image: &Path, flavor: RootfsFlavor) -> Result<()> {
         proto_version,
         agent_sha256,
         sha256: paths::sha256_file(image)?,
-        built_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        built_unix: now_unix(),
+        oci: None,
     };
+    write_meta(image, &meta)
+}
+
+/// Unix time, or 0 on a clock that predates the epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Serialize `meta` next to its image, durably.
+fn write_meta(image: &Path, meta: &ImageMeta) -> Result<()> {
     let path = image_meta_path(image);
-    let json = serde_json::to_vec_pretty(&meta).context("serializing image meta")?;
+    let json = serde_json::to_vec_pretty(meta).context("serializing image meta")?;
     // Temp + fsync + rename, the same durability the image itself gets. A bare
     // write can be torn by a crash, and half a sidecar parses as no sidecar —
     // which silently downgrades every stage stamped against this image to
@@ -1344,6 +1364,64 @@ fn run_mksquashfs(root: &Path, img: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pack `root` into a squashfs image at `img`, applying `pseudo` — a
+/// `mksquashfs` pseudo-file carrying the setuid, setgid and sticky bits that
+/// belong **inside** the image and were never written to the host tree.
+///
+/// Everything else is the built-in flavors' invocation, unchanged and for the
+/// same reasons: `-all-root` because the build is unprivileged, and both halves
+/// of the clock pinned so the content id follows the tree rather than the
+/// moment it was packed. An imported base gets that guarantee too, which is
+/// what lets a stage stamped against one survive a re-import.
+///
+/// `-pseudo-override` is deliberately **not** passed. The pseudo-file's uid and
+/// gid fields are always `0 0` here, so it would change nothing — but it exists
+/// precisely to let a pseudo-file win over `-all-root`, and an import must
+/// never be able to place a non-root owner in the image.
+pub(crate) fn pack_squashfs_with_pseudo(root: &Path, img: &Path, pseudo: &Path) -> Result<()> {
+    let out = mksquashfs_command(root, img)
+        .arg("-pf")
+        .arg(pseudo)
+        .output()
+        .context("spawning mksquashfs (is squashfs-tools installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "mksquashfs failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Move a freshly packed imported image into place and stamp its sidecar with
+/// the agent hash, the protocol version and where the image came from.
+///
+/// Publishing order is [`publish_image`]'s, for [`publish_image`]'s reason: the
+/// stale stamp is cleared before the rename, so a failure in between lands on
+/// "unstamped" — a comparison the run path reports it could not make — rather
+/// than on a new image vouched for by an old sidecar.
+pub(crate) fn publish_imported_image(
+    tmp_path: &Path,
+    dest: &Path,
+    slug: &str,
+    provenance: super::import::OciProvenance,
+) -> Result<()> {
+    let agent = locate_checked_agent()?;
+    let agent_sha256 = paths::sha256_file(&agent)?;
+    publish_image(tmp_path, dest, |img| {
+        let meta = ImageMeta {
+            flavor: format!("oci:{slug}"),
+            proto_version: Some(isopod_proto::PROTO_VERSION),
+            agent_sha256: Some(agent_sha256.clone()),
+            sha256: paths::sha256_file(img)?,
+            built_unix: now_unix(),
+            oci: Some(provenance.clone()),
+        };
+        write_meta(img, &meta)
+    })
+}
+
 /// Create a fresh, empty, writable **sparse ext4** image at `path` sized
 /// `size_mib` mebibytes — the overlay *scratch* drive (and the prewarmed
 /// empty-image pool) that the stage machinery layers a writable upper on.
@@ -1568,6 +1646,7 @@ mod tests {
             agent_sha256: Some("aa".repeat(32)),
             sha256: "cd".repeat(32),
             built_unix: 1,
+            oci: None,
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
 
@@ -1604,6 +1683,7 @@ mod tests {
             agent_sha256: None,
             sha256: "cd".repeat(32),
             built_unix: 1,
+            oci: None,
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
         check_image_freshness(&img, Some(&"bb".repeat(32))).unwrap();
@@ -1626,6 +1706,7 @@ mod tests {
             agent_sha256: Some("ab".repeat(32)),
             sha256: "cd".repeat(32),
             built_unix: 1,
+            oci: None,
         };
         std::fs::write(image_meta_path(&img), serde_json::to_vec(&meta).unwrap()).unwrap();
         assert_eq!(
