@@ -18,9 +18,12 @@ and the test failed the first time it ran anywhere but the machine it was
 written on.
 
 It now asserts against the addresses the host actually resolved rather than
-against hardcoded spellings — which is strictly stronger than the literal it
-replaced, and stronger than a two-way disjunction would have been, since that
-is merely two host assumptions where there was one.
+against hardcoded spellings: it asserts the *property* instead of the host. That
+is not strictly stronger than the literal it replaced — it deliberately accepts
+one thing the old assertion rejected, namely a correct refusal naming `::1`,
+which was the false positive. It is unambiguously stronger than the two-way
+disjunction that would have been the lazy fix, since that is merely two host
+assumptions where there was one.
 
 The old assertion was worse than brittle: it was **inverted with respect to the
 v6 floor**. Had the IPv6 loopback branch of `address_is_allowed` been broken,
