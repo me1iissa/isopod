@@ -87,6 +87,8 @@ PAGES: list[Page] = [
 
     Page("CONTRIBUTING.md", "contributing", "Contributing", "Project",
          "How to build, test and version changes to isopod."),
+    Page("docs/preview-branch.md", "preview-branch", "The preview branch", "Project",
+         "Where experiments that cannot live on main are kept honest: what belongs there, the rebase rule, and exit criteria."),
     Page("CHANGELOG.md", "changelog", "Changelog", "Project",
          "Release history: what landed in each version and why."),
     Page("docs/dogfood-findings.md", "dogfood-findings", "Dogfood findings", "Project",

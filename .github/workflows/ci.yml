@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `preview` is the experimental line (see docs/preview-branch.md). It is
+    # covered here deliberately: a preview branch nobody tests is a branch that
+    # rots into a merge liability, which is the failure mode this project has
+    # to avoid given how fast `main` moves.
+    branches: [main, preview]
   pull_request:
-    branches: [main]
+    branches: [main, preview]
 
 permissions:
   contents: read
