@@ -35,15 +35,16 @@ unstamped link launder everything behind it. The same comparison runs in the
 store, so a stacked commit cannot record a chain that mixes *known-different*
 builds unless the operator opts in below.
 
-Three cases deliberately do **not** refuse:
+Two cases deliberately do **not** refuse:
 
 - **A stage with no stamp** — everything committed before this release. Nothing
   was recorded, so there is nothing to compare; it forks unchecked, as before.
 - **An image with no build sidecar.** The run warns that the check could not be
   made and points at `isopod image build-all`, rather than refusing to boot over
   a missing stamp.
-- **A flavor mismatch** is refused in every case, including under the override
-  below. Those layers are not stale, they belong to a different root.
+
+One case refuses in **every** case, including under the override below: a
+**flavor mismatch**. Those layers are not stale, they belong to a different root.
 
 `ISOPOD_ALLOW_BASE_SKEW=1` overrides the refusal, loudly. It covers the commit as
 well as the boot on purpose: rebuilding the guest images changes the base of
@@ -89,6 +90,19 @@ covered the policy and nothing covered the code that calls it.
   lands on "unstamped", which is reported) and written atomically.
 - **A non-ASCII content id panicked the pre-boot check**, because the id was
   truncated by bytes for the message. Ids come off disk unvalidated.
+
+### Changed — the base image ships one mountpoint, not ten
+
+Base images carried `/rom` and ten numbered `/layers/0..9` directories. Since the
+guest started mounting a **tmpfs** over `/layers` and creating `/layers/<i>` per
+layer at boot (0.11.x, dogfood finding #26), the baked directories have decided
+nothing — the off-by-one they caused is gone, and any depth the chain cap permits
+works without them. `/rom` had no reader at all. Both are dropped: a base image
+now ships `overlay`, `mnt`, and an empty `layers`.
+
+An image only picks this up when it is rebuilt, and an image still carrying the
+old directories is harmless — the tmpfs masks them. There is no need to rebuild
+for this reason alone.
 
 ### Included from the unreleased 0.11.1
 

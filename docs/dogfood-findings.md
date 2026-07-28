@@ -5,7 +5,7 @@
 > Oldest first — the sessions read as a chronology. Format:
 > `[status] severity — finding → decision`.
 
-Eight sessions over three days, each one a gauntlet thrown at whatever had just
+Nine sessions over four days, each one a gauntlet thrown at whatever had just
 landed:
 
 ```mermaid
@@ -22,6 +22,8 @@ timeline
         Proto-v3 verification : the next-gauntlet checklist, post-restart
     section 2026-07-23
         Fix wave : 26 and 27, built in-sandbox and verified live
+    section 2026-07-28
+        0.12.0 dogfood : self-build on HEAD : the base-skew feature under real use
 ```
 
 ## 2026-07-21 — M2 surface gauntlet (exit codes, streams, truncation, timeout, env/cwd, binary, errors, concurrency)
@@ -520,3 +522,245 @@ long-lived MCP server still runs the pre-fix host code: guest-side fixes are alr
 through it (images re-read per run); `validate_env`, `OverlayDegraded`, and the reworded
 contexts engage on its next restart (binaries at `target/release/{isopod-mcp,isopod-jail}` are
 already the fixed builds).
+
+## 2026-07-28 — 0.12.0 dogfood (self-build on HEAD, then the base-skew feature under real use)
+
+The first session against 0.12.0 after the base-skew wave and the adversarial
+review of it. Two halves: build isopod's own HEAD inside isopod, then use the new
+machinery the way an operator would — rebuild a base and find out what happens to
+the store.
+
+**The self-build still works, and the tree is green in a clean guest.** Forked
+`isopod-build/2026-07-23-fix26`, injected HEAD's source as a tar over
+`stdin_file`: `cargo build --workspace` 29.91 s; `cargo test --workspace`
+**502 passed, 0 failed, 11 ignored across 20 suites**, the same totals the host
+reports; `cargo build --release -p isopod-cli` 52.69 s with `copy_out` streaming
+11 466 472 bytes to the host, where the static-pie musl binary ran and read the
+real stage store. Both builds ran under default-deny egress: the ledger recorded
+exactly the two crates.io flows the build needed, `denied: []`, nothing else
+attempted.
+
+**The base-skew feature does what it claims.** A stamped two-deep chain, a base
+rebuild, and the fork was refused before boot on both surfaces with identical
+text, naming the stale *ancestor* rather than the stage asked for. A pre-0.12.0
+unstamped chain booted clean and silent on the rebuilt base — the legacy stages
+survive. The rebuilt image layout (no `/rom`, an empty `/layers`) mounts and
+stacks correctly at depth 2, and the guest builds its mountpoints on the tmpfs as
+designed.
+
+What the session found is what surrounds it. One image rebuild sets off a cascade
+that no command reports:
+
+```mermaid
+flowchart TB
+    R["isopod image build-rootfs --force<br/>or image build-all"] --> ID["new content id<br/>even when the tree did not change"]
+    ID --> S["every stamped stage on that flavor<br/>now refuses to fork"]
+    ID --> W["the warm-pool key changes<br/>a fresh 512 MiB snapshot is minted"]
+    S --> Q1["which stages?<br/>no command answers"]
+    W --> Q2["the old snapshot<br/>is never retired"]
+    Q1 --> D["found one refusal at a time"]
+    Q2 --> D2["3072 of 3584 MiB orphaned on this host"]
+```
+
+28. **[open] MEDIUM — no surface derives base staleness, and `stage info` on a
+    stacked tip is a false all-clear.** `stage list` and `stage info` serialize
+    `StageMeta` verbatim (`cli/src/main.rs:527`, `mcp/src/main.rs:958`); neither
+    reads an image sidecar, so no listing output can change when an image is
+    rebuilt. Replaying `check_base_chain_in` over this host's store found 3
+    `RebuiltBase` among 41 rows — all 41 printed identically. Worse for a stacked
+    stage: its own `base_sha256` is the current image's while an ancestor's is
+    not, so the record reads clean and the chain does not. The `pub`
+    `check_base_chain` wrapper (`stage.rs:357`) that would serve a listing has
+    zero callers. → FIX: a derived `StageEntry` beside `StageMeta` (mirroring
+    `image::ImageEntry`) carrying `base_state` / `base_stale` / `base_reason`,
+    computed once from an in-memory index of the listing rather than re-reading
+    each ancestor. Derived, never persisted — a stamped verdict would be a stale
+    on-disk lie at the next rebuild.
+
+29. **[open] MEDIUM — the rebuild that invalidates stages never looks at the
+    stage store.** `build_rootfs` (`image/rootfs.rs:195`) publishes and returns;
+    nothing warns before or after. `image build-all` is documented as *required*
+    after a `PROTO_VERSION` bump, so the mandatory operation silently makes every
+    stamped stage on the host unforkable. → FIX: after a successful publish,
+    count the stages whose chain references the outgoing id and report them in
+    the result JSON and on stderr. It must never fail the rebuild.
+
+30. **[open] MEDIUM — the squashfs pack is not timestamp-pinned, so a rebuild
+    over an unchanged tree mints a new base identity.** Measured: two
+    `build-rootfs --force` runs 4 s apart over an identical tree gave
+    `86f20abd…` and `6398c829…`. (Three runs inside the same second gave one id —
+    the stamp has one-second granularity, which is what made this look
+    reproducible at first.) This is the root cause of #28 and #29: most
+    invalidation is spurious. `run_mksquashfs` (`image/rootfs.rs:1280`) passes
+    `-all-root -noappend -quiet -no-progress`; squashfs-tools 4.6.1 already
+    defaults to `-reproducible` and accepts `-mkfs-time` / `-all-time`. Measured
+    with those pinned: byte-identical output across a 3 s gap with the tree
+    touched in between, and a genuine content change still moved the id. → FIX:
+    pin both. Verify first that epoch-0 mtimes on base files upset nothing that
+    reads them (everything a run writes lands in the overlay upper, not the
+    base), and note that `base-alpine` pulls packages, so its inputs can vary for
+    real — pinning removes the spurious churn, not the genuine kind.
+
+31. **[open] MEDIUM — warm-pool snapshots accumulate and nothing retires an
+    orphan.** The key embeds `base_sha256`, so a rebuilt base can never resume a
+    stale snapshot — that part is right, and `ensure` self-heals by minting a new
+    one on the first eligible run (measured: 3.87 s to build, 220 ms to resume
+    after). But the one it replaces stays. This host: **7 snapshots, 3.6 GiB,
+    3072 MiB of it orphaned**. The memfile is non-sparse by construction —
+    Firecracker's Full-snapshot dump `set_len`s to the full guest RAM and writes
+    every byte, zero pages included. `warmpool list` cannot tell you which are
+    orphaned, `warmpool rm` takes a keyhash or `--all`, `vm gc` resolves only
+    `paths::vms_dir()`, and the MCP surface exposes no warm-pool tool at all. →
+    FIX: sweep orphans where the new id is already known — `publish_image` runs on
+    every rebuild — or add `warmpool rm --orphaned`; and surface an `orphaned`
+    flag in `warmpool list`.
+
+32. **[open] HIGH — two concurrent runs of the same warm shape build into one
+    directory on fixed `.partial` names, with no lock.** `snapshot::ensure`
+    creates `artifacts.dir` and writes `vmstate.partial` / `memfile.partial`
+    (`snapshot.rs:551`); there is no `flock` anywhere in the module (the one at
+    `:429` claims a *network slot*). Two racers both see `is_complete()` false,
+    both dump into the same two paths, both rename. The window is the
+    several-second memory dump, and it opens on exactly the shape the product
+    invites — default `sandbox_run`s right after any rebuild empties the pool for
+    every shape, while the tool description tells the model to issue concurrent
+    sandboxes from separate agents. → FIX: an exclusive `flock` per keyhash
+    around `ensure`, in the shape `net::claim_lock` already uses; second arrival
+    waits and then finds the snapshot complete. Failing that, per-process unique
+    staging names so a loser can only lose its own bytes.
+
+33. **[open] MEDIUM — a warm resume that fails never retires the snapshot.** The
+    run falls back to a cold boot (`vm/mod.rs:2392`) and reports `path: "cold"`
+    with nothing to say why. One bad snapshot — from #32, a full disk, a killed
+    builder — poisons that shape permanently: every later run of it pays a failed
+    resume before its cold boot. → FIX: on resume failure, unlink the snapshot's
+    `meta.json`, which is the file `is_complete()` reads; the next run rebuilds
+    it. Surface the reason in the report.
+
+34. **[open] MEDIUM — the stage store's label uniqueness is a TOCTOU, and four
+    places say the state is file-locked.** `commit_in` reads the whole store to
+    check the label (`stage.rs:418`) and writes later; `stage.rs` contains no
+    lock of any kind. Meanwhile `README.md:120` and its architecture diagram,
+    `docs/getting-started.md:542`, and `mcp/src/main.rs:678` all describe
+    `~/.isopod` as file-locked for concurrent sessions — true of network slots
+    and the VM registry, not of this. Two agents committing the same label
+    produce two stages carrying it, after which every reference to that label is
+    ambiguous. → FIX: a blocking exclusive lock on a `.commit.lock` in the store
+    root around the read-decide-write window; and narrow the three prose claims
+    to the state that is actually locked.
+
+35. **[open] MEDIUM — `commit_as` is validated only after the run, and the
+    scratch is deleted either way.** Both refusals `commit_in` can raise — a
+    label already in use, and a chain at `MAX_CHAIN_DEPTH` — are computable
+    before boot, but the check runs at `vm/mod.rs:1615`, after the exec. The
+    failure is deliberately reported rather than thrown (so the exit code, output
+    and logs survive) but `cleanup_disk` still removes the scratch unless
+    `--keep`, and **`sandbox_run` has no `keep` parameter**, so on the MCP surface
+    a long build refused at commit time is unrecoverable. → FIX: a pure
+    `precheck_commit_in` called from the preflight block before
+    `resolve_stage_plan`, raising the same three bails while nothing has booted.
+
+36. **[open] MEDIUM — the depth-cap refusal prescribes `stage flatten`, which
+    does not exist.** `stage.rs:507` ends with "flatten the chain first"; there is
+    no such subcommand, MCP tool, or documented procedure anywhere in the repo.
+    An ordinary afternoon of use reached depth 7 of 10 in one lineage, and this
+    store already holds `gaunt-chain-10` at exactly the cap — a lineage that can
+    never accept another commit. → FIX: until a flatten operation exists, name a
+    remedy that does (rebuild the lineage from `--stage base`), in the shape of
+    the sibling refusals in that file.
+
+37. **[open] LOW — the skew override leaves no trace in the result payload.**
+    Both warnings are `eprintln!` (`vm/mod.rs:1424`, `stage.rs:496`); `RunReport`
+    and the MCP result carry no warning field, so a run that booted across a
+    rebuilt base returns an ordinary success to a program. The operator who set
+    the variable is the one reading stderr, which is why this is LOW rather than
+    MEDIUM. → FIX: a `warnings: Vec<String>` on the report, populated from the
+    same strings.
+
+38. **[open] LOW — the `WrongFlavor` remediation is CLI-shaped and cannot apply
+    where that verdict fires.** `stage.rs:199` advises re-running from
+    `--stage base --base <flavor>`, but a flavor mismatch means the layers belong
+    to a different root; rebuilding on *this* flavor is not the fix, and the
+    syntax is wrong for the MCP surface that receives the string verbatim. (The
+    `Unverifiable` arm's `isopod image build-rootfs --force` advice is correctly
+    CLI-shaped — that one is an operator action.) → FIX: reword to describe the
+    remedy rather than spell a command.
+
+39. **[fixed 2148e6c] MEDIUM — the documented way to "rebase" a stage does not
+    rebase.** Three files said forking with `ISOPOD_ALLOW_BASE_SKEW=1` and
+    committing is how a stage is moved onto a rebuilt image. The check ranks the
+    worst verdict across every link, and the commit stacks a child without
+    touching its ancestors, so the result refuses the next fork exactly as the
+    original did — verified live end to end. The getting-started diagram drew the
+    override landing on the same node as a clean fork; it now loops back to the
+    stage it started from.
+
+40. **[open] MEDIUM — "a failed setup command never silently produces a broken
+    stage" is false for a pipeline.** Happened this session:
+    `cargo build … | tail -25` failed, the shell returned `tail`'s status, and
+    `commit_as` committed a stage from a broken build. The MCP surface forces
+    `/bin/sh -c` with no argv escape hatch, and the adjacent documentation sells
+    pipes. Nothing in `crates/core` or `crates/mcp` can detect this — the shell
+    reports what POSIX says it reports. → FIX (docs): say that a pipeline's status
+    is its last command's, and put `set -o pipefail` in the recipes that pipe.
+
+41. **[open] LOW — the refusal prints twelve hex digits and no documented command
+    prints them back.** `ImageEntry` (`image/rootfs.rs:519`) carries
+    `proto_version`/`unstamped`/`stale`/`built_unix` but drops `meta.sha256`,
+    which `list_images` has already read. (`build-rootfs` *without* `--force`
+    short-circuits and reports the sha, which is an undocumented route to it.)
+    → FIX: add `sha256` to `ImageEntry`.
+
+42. **[open] LOW — docs that undersell the blast radius.** The troubleshooting
+    table prescribes `isopod image build-all` for three symptoms without saying
+    it invalidates every stamped stage; `sandbox-build.md`'s stage-chain table
+    omits the base rebuild from its "rebuild trigger" column; and it calls label
+    reuse "untested" when the store refuses it outright with two distinct errors.
+    Its everyday check/test loop also never says the crates.io cache only
+    survives if you `commit_as` — a fresh fork needed the network twice this
+    session for dependencies a previous uncommitted run had already fetched.
+
+43. **[fixed] LOW — the changelog's "three cases deliberately do not refuse"
+    lists one that always refuses.** The third bullet is the flavor mismatch,
+    which is refused in every case including under the override. The 0.12.0 entry
+    also omits the base-image layout change (`/rom` dropped, ten baked mountpoints
+    replaced by one) that shipped in the same release.
+
+44. **[open] LOW — `~/.isopod/m0/` holds 891 MiB that no command lists or
+    cleans.** The M0 spike scratch — logs, spike images, a Firecracker binary. It
+    is not dead: `resolve_fc_bin` still falls back to `~/.isopod/m0/bin/firecracker`
+    as a last resort, so an operator chasing disk pressure who guesses and deletes
+    it removes that fallback. → FIX: a row in the layout table naming it and the
+    condition under which it is safe to delete.
+
+45. **[open] LOW — an interrupted commit strands a full-size
+    `layer.ext4.partial`.** `commit_in` stages the layer beside its destination
+    and renames (`stage.rs:526`); a kill in between leaves up to a full scratch
+    (1 GiB by default) in the largest store on the host, which `list_in` skips
+    silently and `stage rm` cannot name. → FIX: report the residue from
+    `list_in`'s skip branch instead of continuing past it.
+
+**Checked and found sound** (recorded because each was a live suspicion this
+session, and the answer is load-bearing): the warm pool self-heals after a
+rebuild rather than going permanently cold — the first probe's cold path was
+caused by `--no-network`, which disqualifies a run from the warm shape, not by
+the rebuild. A stale snapshot can never be resumed onto a new base, because
+`base_sha256` is a keyed field. `publish_image` deliberately clears the old
+sidecar *before* the rename, so a failed stamp never leaves an old sidecar
+vouching for new bytes. `stage rm` of a mid-chain stage leaves nothing behind
+because it refuses, naming every dependent — removing this session's three probe
+stages took a leaf-first walk, which is the documented behaviour and not a gap.
+The unstamped-stage exemption and the whole-chain check both behave exactly as
+`getting-started.md` describes. `sandbox_run`'s `env` is guest environment and
+cannot reach the host override. `dns_queries: []` is correct in filtered mode:
+the guest resolves nothing, because it is handed a proxy and the broker resolves
+host-side. And the MCP host-I/O root confining `stdin_file`/`copy_out` to the
+server's working directory is deliberate and documented — payloads went under
+`target/`, which is gitignored.
+
+**Store state at the end**: 38 stages (3 stamped, all the `isopod-build/0.12.0*`
+chain on `base-alpine`), 6.9 GiB allocated; `base.sqfs` rebuilt several times in
+the course of the measurements and now `6398c829…`; `base-alpine.sqfs` untouched,
+so it still ships the pre-0.12.0 `/rom` + `/layers/0..9` layout — harmless, since
+the guest mounts a tmpfs over `/layers`, but it should be rebuilt for consistency
+once #30 lands, so the rebuild costs nothing.
