@@ -1,0 +1,29 @@
+[package]
+name = "isopod-oci-registry"
+description = "Pulls OCI images from a registry into a local image layout: reference parsing, the bearer-token dance, and blob fetches that verify every digest and never carry a credential across a redirect."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `Digest` is the type that decides whether a registry-supplied string may
+# become a path, and the layout writer here produces exactly what that crate's
+# reader consumes. Depending on it rather than restating it means one parser.
+isopod-oci-unpack = { path = "../oci-unpack" }
+# Blocking, like `isopod-core`'s fetches: an import is a host-side command, and
+# a blocking client keeps the CLI free of a runtime.
+reqwest = { workspace = true, features = ["blocking"] }
+# The same URL parser that will dial the address, so a check and a request
+# cannot disagree about what the string meant.
+url = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The fake registry builds a real tar to serve, and the live test decompresses
+# what Docker Hub actually sends.
+tar = { workspace = true }
+flate2 = { workspace = true }

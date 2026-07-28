@@ -9,6 +9,7 @@ members = [
     "crates/mcp",
     "crates/jail",
     "crates/oci-unpack",
+    "crates/oci-registry",
 ]
 
 [workspace.package]

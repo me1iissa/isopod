@@ -508,6 +508,61 @@ MUTATIONS = [
         ),
         package="isopod-oci-unpack",
     ),
+    # --- isopod-oci-registry ----------------------------------------------
+    # The network half of an import. Its guards are not about tar at all: they
+    # are about where a credential may travel and where a request may be aimed.
+    Mutation(
+        name="oci-registry-token-crosses-an-origin",
+        file="crates/oci-registry/src/auth.rs",
+        old="    from.scheme() == to.scheme()\n        && from.host_str() == to.host_str()\n        && from.port_or_known_default() == to.port_or_known_default()",
+        new="    let _ = (from, to);\n    true",
+        defect=(
+            "The Authorization header follows a redirect to another origin. "
+            "Registries redirect blob downloads to object storage as the "
+            "ordinary path, so this hands the operator's registry token to "
+            "whatever host the registry named — on every single pull, not in "
+            "some edge case."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-redirect-is-unfloored",
+        file="crates/oci-registry/src/auth.rs",
+        old="pub fn redirect_target_is_allowed(to: &Url, allow_local: bool) -> bool {",
+        new="pub fn redirect_target_is_allowed(to: &Url, allow_local: bool) -> bool {\n    if true {\n        let _ = (to, allow_local);\n        return true;\n    }",
+        defect=(
+            "A registry can aim a blob fetch anywhere, including "
+            "169.254.169.254 and the operator's own loopback. Digest "
+            "verification stops content being injected that way; it does not "
+            "stop the request, and the request is what an SSRF is."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-blob-written-unverified",
+        file="crates/oci-registry/src/lib.rs",
+        old="    if actual != expect.encoded() {",
+        new="    if false {",
+        defect=(
+            "A downloaded blob is renamed to its content-addressed name without "
+            "being hashed, so the blob store can contain a file that is not the "
+            "blob it is named for — which every later reader assumes it cannot."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-port-read-as-a-tag",
+        file="crates/oci-registry/src/reference.rs",
+        old="        let (registry, rest) = match head.split_once('/') {",
+        new="        let (registry, rest) = match Some((head, head)).filter(|_| false) {",
+        defect=(
+            "The registry is no longer split off before the tag, so "
+            "`localhost:5000/nginx` parses as the repository `localhost` at tag "
+            "`5000/nginx` — and the request goes to Docker Hub instead of the "
+            "registry the operator named."
+        ),
+        package="isopod-oci-registry",
+    ),
     Mutation(
         name="oci-digest-becomes-a-path-unchecked",
         file="crates/oci-unpack/src/digest.rs",

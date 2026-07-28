@@ -966,6 +966,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "isopod-oci-registry"
+version = "0.12.0"
+dependencies = [
+ "flate2",
+ "hex",
+ "isopod-oci-unpack",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "isopod-oci-unpack"
 version = "0.12.0"
 dependencies = [
