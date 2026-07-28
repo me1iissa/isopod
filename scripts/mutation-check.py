@@ -749,12 +749,32 @@ def apply(mut: Mutation, tree: Path) -> None:
     path.write_text(text.replace(mut.old, mut.new))
 
 
+# Progress narration. Under `--json` it goes to stderr, because stdout then
+# carries exactly one thing — the JSON document — and a caller that pipes it to
+# a parser must not have to strip a preamble out of the way first. This was a
+# dogfood finding in its own right: `--json` output did not parse.
+_NARRATE = sys.stdout
+
+
+def narrate(msg: str = "") -> None:
+    """Emit progress to whichever stream is not carrying the result."""
+    print(msg, file=_NARRATE, flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--list", action="store_true", help="print mutation names and exit")
     ap.add_argument("--only", default="", help="comma-separated subset to run")
-    ap.add_argument("--json", action="store_true", help="emit a JSON summary")
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a JSON summary on stdout (progress moves to stderr)",
+    )
     args = ap.parse_args()
+
+    if args.json:
+        global _NARRATE
+        _NARRATE = sys.stderr
 
     if args.list:
         for m in MUTATIONS:
@@ -774,11 +794,11 @@ def main() -> int:
     results = []
     try:
         tree = root / "tree"
-        print(f"exporting HEAD to {tree}", flush=True)
+        narrate(f"exporting HEAD to {tree}")
         worktree(tree)
 
         # Warm the build once so each mutation pays only for what it changed.
-        print("warming the build cache (cold build, this is the slow part)", flush=True)
+        narrate("warming the build cache (cold build, this is the slow part)")
         rc, out = run(["cargo", "test", "--workspace", "--no-run"], tree, BUILD_TIMEOUT_S)
         if rc != 0:
             print(out[-4000:], file=sys.stderr)
@@ -790,18 +810,18 @@ def main() -> int:
             print(out[-4000:], file=sys.stderr)
             print("FAIL: the unmutated tree does not pass its own tests", file=sys.stderr)
             return 1
-        print("baseline green\n", flush=True)
+        narrate("baseline green\n")
 
         pristine = {}
         for m in selected:
             pristine.setdefault(m.file, (tree / m.file).read_text())
 
         for m in selected:
-            print(f"--- {m.name}", flush=True)
+            narrate(f"--- {m.name}")
             try:
                 apply(m, tree)
             except LookupError as e:
-                print(f"    STALE: {e}", flush=True)
+                narrate(f"    STALE: {e}")
                 results.append({"name": m.name, "outcome": "stale", "detail": str(e)})
                 continue
 
@@ -815,14 +835,14 @@ def main() -> int:
 
             if rc == 124:
                 # A mutant that hangs is not caught: CI wedges instead of failing.
-                print("    NOT CAUGHT (the suite hung rather than failing)", flush=True)
+                narrate("    NOT CAUGHT (the suite hung rather than failing)")
                 results.append({"name": m.name, "outcome": "hung"})
             elif rc == 0:
-                print("    NOT CAUGHT (suite still green)", flush=True)
+                narrate("    NOT CAUGHT (suite still green)")
                 results.append({"name": m.name, "outcome": "survived"})
             elif "error[E" in out or "error: could not compile" in out:
                 # A mutation that stops compiling proves nothing about the tests.
-                print("    STALE (mutated tree does not compile)", flush=True)
+                narrate("    STALE (mutated tree does not compile)")
                 results.append({"name": m.name, "outcome": "stale", "detail": "no compile"})
             else:
                 killers = sorted(set(re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M)))
@@ -833,19 +853,19 @@ def main() -> int:
                 shown = ", ".join(killers[:3]) or "(suite failed)"
                 if len(killers) > 3:
                     shown += f" (+{len(killers) - 3} more)"
-                print(f"    caught by {shown}", flush=True)
+                narrate(f"    caught by {shown}")
                 results.append({"name": m.name, "outcome": "caught", "by": killers})
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
     bad = [r for r in results if r["outcome"] != "caught"]
-    print()
+    narrate()
     if args.json:
         print(json.dumps({"results": results, "ok": not bad}, indent=2))
     caught = len(results) - len(bad)
-    print(f"{caught}/{len(results)} mutations caught")
+    narrate(f"{caught}/{len(results)} mutations caught")
     for r in bad:
-        print(f"  {r['outcome'].upper():9} {r['name']}")
+        narrate(f"  {r['outcome'].upper():9} {r['name']}")
     if bad:
         print(
             "\nA surviving mutation means the guard it breaks is not defended by any "
