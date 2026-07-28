@@ -664,6 +664,14 @@ mod tests {
             .collect()
     }
 
+    /// The address as a refusal will spell it: parsed, then printed back the
+    /// way the code prints it. Searching for the literal this test typed would
+    /// pin the spelling instead of the address, and the two differ — `std`
+    /// prints an IPv4-mapped address in mixed notation and a NAT64 one in hex.
+    fn named(ip: &str) -> String {
+        ip.parse::<IpAddr>().expect("an address").to_string()
+    }
+
     #[test]
     fn a_name_is_judged_by_every_address_it_answers_with() {
         // The control first, and it has to be first: a floor that refuses
@@ -695,9 +703,12 @@ mod tests {
             "64:ff9b::a9fe:a9fe",     // and via the NAT64 prefix
             "::a9fe:a9fe",            // and IPv4-compatible
         ] {
+            let err = screen_resolved("blob.evil.example", resolved(&[ip]), false)
+                .err()
+                .unwrap_or_else(|| panic!("a name resolving to {ip} must not be dialled"));
             assert!(
-                screen_resolved("blob.evil.example", resolved(&[ip]), false).is_err(),
-                "a name resolving to {ip} must not be dialled"
+                err.contains(&named(ip)),
+                "the refusal must say {ip} was the address; got: {err}"
             );
         }
 
@@ -705,16 +716,39 @@ mod tests {
         // AND a bad one, in both orders. A check of `addrs[0]` alone accepts
         // the first of these and refuses the second — a floor whose answer
         // depends on which record the resolver happened to list first.
-        for pair in [
-            ["93.184.216.34", "169.254.169.254"],
-            ["169.254.169.254", "93.184.216.34"],
-            ["93.184.216.34", "10.0.0.5"],
-            ["2606:4700::6810:85e5", "fd00::1"],
+        //
+        // Refusing is half of it. The refusal has to name the record that
+        // caused it, and the pairs below are the only place that can be
+        // tested: with one address, the offender and `addrs[0]` are the same
+        // address, and a message built from either reads correctly. Naming
+        // `addrs[0]` here would tell an operator holding a split-horizon DNS
+        // problem to go and look at the one record that is fine.
+        for (pair, offender) in [
+            (["93.184.216.34", "169.254.169.254"], "169.254.169.254"),
+            (["169.254.169.254", "93.184.216.34"], "169.254.169.254"),
+            (["93.184.216.34", "10.0.0.5"], "10.0.0.5"),
+            (["2606:4700::6810:85e5", "fd00::1"], "fd00::1"),
         ] {
+            let innocent = pair
+                .iter()
+                .find(|ip| **ip != offender)
+                .expect("each pair has one record that passes");
+            let err = screen_resolved("blob.evil.example", resolved(&pair), false)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{pair:?}: one floored record refuses the name, it does \
+                         not leave a usable half"
+                    )
+                });
             assert!(
-                screen_resolved("blob.evil.example", resolved(&pair), false).is_err(),
-                "{pair:?}: one floored record refuses the name, it does not \
-                 leave a usable half"
+                err.contains(&named(offender)),
+                "{pair:?}: the refusal must name {offender}; got: {err}"
+            );
+            assert!(
+                !err.contains(&named(innocent)),
+                "{pair:?}: {innocent} is not why this name was refused, and an \
+                 operator sent to it is sent to the wrong record; got: {err}"
             );
         }
 

@@ -700,6 +700,24 @@ MUTATIONS = [
         package="isopod-oci-registry",
     ),
     Mutation(
+        name="oci-registry-refusal-names-the-wrong-address",
+        file="crates/oci-registry/src/auth.rs",
+        old="            bad.ip()\n        ));",
+        new="            addrs[0].ip()\n        ));",
+        defect=(
+            "A name answering with a public record and a floored one is "
+            "refused — correctly — but the refusal names the first record "
+            "rather than the one that caused it. The floor still holds, so "
+            "every assertion about dialling passes; what breaks is the only "
+            "thing that tells an operator whether they hit DNS rebinding or "
+            "their own split-horizon resolver, and it sends them to the record "
+            "that is fine. This shipped: the suite asserted `is_err()` alone, "
+            "and the message the function's own doc calls load-bearing was "
+            "pinned by nothing."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
         name="oci-registry-redirect-is-unfloored",
         file="crates/oci-registry/src/auth.rs",
         old="pub fn destination_is_allowed(to: &Url, allow_local: bool) -> bool {",
