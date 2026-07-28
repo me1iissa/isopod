@@ -689,8 +689,8 @@ MUTATIONS = [
     Mutation(
         name="oci-registry-ipv6-spelling-bypasses-the-floor",
         file="crates/oci-registry/src/auth.rs",
-        old="            if let Some(v4) = embedded_ipv4(ip) {\n                return ipv4_is_allowed(v4, allow_local);\n            }",
-        new="            if let Some(v4) = embedded_ipv4(ip) {\n                let _ = v4;\n            }",
+        old="            if let Some(v4) = embedded_ipv4(v6) {\n                return ipv4_is_allowed(v4, allow_local);\n            }",
+        new="            if let Some(v4) = embedded_ipv4(v6) {\n                let _ = v4;\n            }",
         defect=(
             "The floor judges an IPv6 literal's spelling rather than the IPv4 "
             "address it names, so `[::ffff:169.254.169.254]` — the cloud "
