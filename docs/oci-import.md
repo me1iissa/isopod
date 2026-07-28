@@ -141,6 +141,22 @@ explicitly rather than letting your umask choose them. Across squashfs-tools
 versions that is not guaranteed, so re-derivability is the promise and
 byte-identity is a property.
 
+## What it costs
+
+Measured, not estimated — the full table is in
+[BENCHMARKS.md](../BENCHMARKS.md#built-base-vs-imported-oci-image).
+
+| | |
+|---|---|
+| Import `alpine:3.20` (1 layer) | 1.7 s cold, 1.0 s with blobs cached |
+| Import `python:3.12-alpine` (4 layers) | 3.5 s cold, 2.4 s cached |
+| Boot, imported vs built | indistinguishable at 30 samples |
+| Warm resume | 43–50 ms regardless of base or image size |
+
+The snapshot restore does not care what the base is. What does move boot time is
+what is *in* the image: a 150 MB toolchain base costs ~80 ms more on a warm run
+than a 4 MB one, nearly all of it in the exec rather than the resume.
+
 ## Limits
 
 | | |

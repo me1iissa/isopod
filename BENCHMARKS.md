@@ -91,6 +91,67 @@ tap-reuse race at full slot saturation. A host with more cores, RAM, and slots w
 scale further. *(This race was found by this benchmark and is a real bug in 0.8.0, not
 a tuning artifact.)*
 
+### Built base vs imported OCI image
+
+Asked directly: is an image imported with `isopod image import` slower to boot
+than one isopod builds itself? **No — and image *size* barely moves the boot
+either.** 30 samples per cell, same host, same guest agent, same 1 vCPU /
+512 MiB, same warm/cold path, in one shadow `$ISOPOD_HOME` so nothing else was
+competing for slots.
+
+| Base | Origin | On disk | warm **p50** | cold **p50** | `resume_ms` p50 | `exec_ms` p50 (warm) |
+|---|---|--:|--:|--:|--:|--:|
+| `base-sqfs` | built (busybox) | 1.54 MB | **238–254** | 414 | 43–50 | 40 |
+| `oci:alpine-3.20` | imported | 3.82 MB | **230–235** | 426 | 43–45 | 34 |
+| `oci:python-3.12-alpine` | imported | 17.11 MB | **238** | 426 | 43 | 41 |
+| `base-alpine` | built (py/node/gcc) | 150.72 MB | **318** | 453 | 48 | 106 |
+
+The two small bases are given as ranges because they were measured twice: the
+first `base-sqfs` sample came out at 254 ms with a fat tail (p90 320), the
+second at 238 ms (p90 262), while `oci:alpine-3.20` held at 230 and 235. **At
+this sample size they are indistinguishable**, and the honest reading is that
+importing costs nothing at boot — not that it is faster.
+
+What *does* move is content. `base-alpine` is 40× the size of the imported
+Alpine and pays ~80 ms more on a warm run, most of it in `exec_ms` (106 ms vs
+34): a bigger root filesystem means more to fault in and a longer `PATH` to walk
+for the trivial command. That cost belongs to what is *in* the image, not to how
+the image arrived.
+
+**`resume_ms` is flat at 43–50 ms across all four.** The snapshot restore itself
+does not care what the base is or how big it is — which is the mechanism behind
+the whole table, and is why the differences that do exist show up in `exec_ms`
+rather than in the resume.
+
+### Import cost — the number an operator feels first
+
+Importing is a one-off, but it is the first thing that happens.
+
+| Image | Layers | Result | Cold import | Re-import (blobs cached) |
+|---|--:|--:|--:|--:|
+| `alpine:3.20` | 1 | 3.82 MB | 1.7 s | 1.0 s |
+| `python:3.12-alpine` | 4 | 17.11 MB | 3.5 s | 2.4 s |
+
+Cold includes the registry pull; the cached figure is the same import re-run
+with the blob cache warm, which is what an operator pays after a guest-agent
+rebuild invalidates their imported bases. Both include unpack, adapt and
+`mksquashfs`.
+
+**The control.** A benchmark where everything comes out the same is a benchmark
+measuring nothing, so: warm and cold differ by ~180 ms in every row, and
+`base-alpine` is clearly separated from the three small bases. Both hold. The
+flat `resume_ms` is therefore a result rather than a stuck instrument — the
+totals move while it does not.
+
+**What this comparison is not.** `base-alpine` ships a Python/Node/git/gcc
+toolchain and the imported Alpine ships busybox, so the last row is *not*
+like-for-like with the others and must not be read as "built is slower than
+imported". The like-for-like pair is `base-sqfs` against `oci:alpine-3.20` —
+both minimal, both about the same size — and they tie. `python:3.12-alpine` is
+included as the closest available toolchain image, and it is still 9× smaller
+than `base-alpine`, so it does not settle the toolchain-vs-toolchain question
+either.
+
 ## What the numbers mean
 
 - **Sub-second, every time.** Even a cold boot — a fresh kernel, a fresh root
@@ -101,6 +162,10 @@ a tuning artifact.)*
 - **~49 ms warm resume.** For the common case (repeated calls with the same base,
   network on, default scratch) the VM is resumed from a snapshot in tens of
   milliseconds, not cold-booted.
+- **An imported container image is a first-class base.** `isopod image import`
+  costs 1.7–3.5 s once, and after that boots indistinguishably from a base
+  isopod built itself. What affects boot is what is *in* the image, not where it
+  came from.
 - **~150 disposable VMs a minute sequentially — ~850 at 6-way concurrency, on a
   laptop.** Single-threaded it sustains ~150 boot→exec→destroy cycles a minute; with
   parallelism it scales to ~5.8× (~850/min) before the host's 4 cores and a slot-reuse
@@ -124,6 +189,16 @@ a tuning artifact.)*
   and methodology; the only container runtime available here was Docker Desktop inside
   its own WSL2 VM, which would measure that plumbing rather than the boundary. Left as
   future work rather than shipped as a misleading chart.
+- **The OCI comparison used 30 samples per cell, not 50.** Enough to separate
+  `base-alpine` from the small bases (a ~80 ms gap), *not* enough to separate the
+  small bases from each other — which is why those are reported as ranges from
+  two independent runs rather than as single figures. Do not read a 5 ms
+  difference in that table as real.
+- **The OCI numbers were taken in a shadow `$ISOPOD_HOME`** (`~/.isopod-bench`,
+  its own images, snapshots and stage store, the host's real taps) so the
+  measurements could not be perturbed by — or perturb — the working store. Slot
+  locks are `$ISOPOD_HOME`-scoped while taps are host-global, so nothing else was
+  run against isopod during the sweep.
 - **Security is unchanged by speed.** These runs use the default public-only egress;
   private-network/metadata destinations are dropped regardless of how fast the VM boots
   (see [SECURITY.md](SECURITY.md)).
@@ -137,8 +212,8 @@ a tuning artifact.)*
 | Host kernel | 6.6.114.1-microsoft-standard-WSL2 |
 | Guest kernel | vmlinux-6.18.36 (pinned, digest-verified) |
 | VMM | Firecracker v1.16.1 (vendored build) |
-| isopod | 0.8.0 |
-| Base image | base-alpine (squashfs, read-only) |
+| isopod | 0.8.0 (latency/concurrency tables) · 0.12.0 (OCI comparison) |
+| Base image | base-alpine (squashfs, read-only); OCI comparison as tabulated |
 
 ## Reproduce
 
@@ -151,6 +226,12 @@ python3 scripts/bench.py --iters 50 --warmup 5 --json latency.json
 
 # concurrency sweep (throughput + latency under parallel load)
 python3 scripts/bench-concurrency.py --batch 48 --levels 1,2,4,6,8 --json concurrency.json
+
+# built base vs imported image (--base takes `oci:<name>` too)
+isopod image import alpine:3.20
+for b in base-sqfs oci:alpine-3.20 base-alpine; do
+  python3 scripts/bench.py --iters 30 --warmup 5 --base "$b" --json "bench-$b.json"
+done
 ```
 
 Both harnesses print a JSON summary to stdout and a human table to stderr.

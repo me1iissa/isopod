@@ -6,18 +6,23 @@ a trivial command over vsock -> capture output -> destroy the VM). We read the
 timings straight out of isopod's own JSON result (total_ms, resume_ms, exec_ms),
 so a sample is the genuine end-to-end wall time of one disposable sandbox.
 
-Categories (all on the same host, base-alpine, 1 vCPU / 512 MiB):
+Categories (all on the same host, one base, 1 vCPU / 512 MiB):
   warm    default networked run  -> warm-pool snapshot resume   (the repeat-call path)
   cold    --scratch-mib 1024     -> forced cold ext4 boot, networked (first-call / cache miss)
   nonet   --no-network           -> cold boot, no NIC attached   (the untrusted-code mode)
 
-Usage:  python3 scripts/bench.py [--iters N] [--warmup W] [--json out.json]
+Usage:  python3 scripts/bench.py [--iters N] [--warmup W] [--base B] [--json out.json]
+
+`--base` takes anything `isopod run --base` takes, including an imported image
+spelled `oci:<name>` — which is what makes a built base and an imported one
+comparable on one harness rather than two.
+
 Prints a human table to stderr and a JSON summary to stdout.
 """
-import argparse, json, statistics as st, subprocess, sys, time
+import argparse, json, os, statistics as st, subprocess, sys, time
 
-ISOPOD = "isopod"
-BASE = ["--stage", "base", "--base", "base-alpine"]
+ISOPOD = os.environ.get("ISOPOD_BIN", "isopod")
+DEFAULT_BASE = "base-alpine"
 CATS = {
     "warm":  [],                         # default: networked, warm-pool eligible
     "cold":  ["--scratch-mib", "1024"],  # forces the cold ext4 path, still networked
@@ -25,8 +30,8 @@ CATS = {
 }
 CMD = ["--", "echo", "isopod-bench"]
 
-def one_run(extra):
-    p = subprocess.run([ISOPOD, "run"] + BASE + extra + CMD,
+def one_run(extra, base=DEFAULT_BASE):
+    p = subprocess.run([ISOPOD, "run", "--stage", "base", "--base", base] + extra + CMD,
                        capture_output=True, text=True, timeout=120)
     try:
         d = json.loads(p.stdout)
@@ -69,10 +74,16 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--json")
+    ap.add_argument(
+        "--base",
+        default=DEFAULT_BASE,
+        help="base to boot: a built flavor (base-alpine, base-sqfs) or an "
+             "imported image as oci:<name>",
+    )
     a = ap.parse_args()
 
     # environment / provenance (pulled from a real run + /proc)
-    probe = one_run([])
+    probe = one_run([], a.base)
     def readfile(p, pat=None):
         try:
             for line in open(p):
@@ -86,17 +97,21 @@ def main():
         "fc_binary": probe.get("fc_binary"),
         "guest_kernel": "vmlinux-6.18.36",
         "vcpus": probe.get("vcpus"), "mem_mib": probe.get("mem_mib"),
+        # The base is provenance, not a footnote: a table that does not say
+        # which root it booted is a table two runs cannot be compared across.
+        "base": a.base,
+        "base_reported": probe.get("rootfs_flavor"),
     }
 
     results = []
     for name, extra in CATS.items():
         print(f"[{name}] warmup x{a.warmup} ...", file=sys.stderr, flush=True)
         for _ in range(a.warmup):
-            one_run(extra)
+            one_run(extra, a.base)
         samples = []
         t0 = time.monotonic()
         for i in range(a.iters):
-            samples.append(one_run(extra))
+            samples.append(one_run(extra, a.base))
             if (i + 1) % 10 == 0:
                 print(f"[{name}] {i+1}/{a.iters}", file=sys.stderr, flush=True)
         wall = time.monotonic() - t0
@@ -104,7 +119,7 @@ def main():
         row["wall_s"] = round(wall, 1)
         results.append(row)
 
-    out = {"env": env, "iters": a.iters, "warmup": a.warmup, "results": results}
+    out = {"env": env, "base": a.base, "iters": a.iters, "warmup": a.warmup, "results": results}
     js = json.dumps(out, indent=2)
     if a.json:
         open(a.json, "w").write(js)

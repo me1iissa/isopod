@@ -8,6 +8,38 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Measured — an imported image boots like a base isopod built itself
+
+The wave-2 exit benchmark, in `BENCHMARKS.md`. 30 samples per cell, one shadow
+`$ISOPOD_HOME`, same host, same guest agent, same 1 vCPU / 512 MiB, same
+warm/cold path.
+
+| Base | Origin | On disk | warm p50 | `resume_ms` p50 |
+|---|---|--:|--:|--:|
+| `base-sqfs` | built (busybox) | 1.54 MB | 238–254 ms | 43–50 ms |
+| `oci:alpine-3.20` | imported | 3.82 MB | 230–235 ms | 43–45 ms |
+| `oci:python-3.12-alpine` | imported | 17.11 MB | 238 ms | 43 ms |
+| `base-alpine` | built (py/node/gcc) | 150.72 MB | 318 ms | 48 ms |
+
+The like-for-like pair — the two minimal bases — **tie**. They are reported as
+ranges because they were measured twice and the first `base-sqfs` sample was an
+outlier with a fat tail (254 ms, p90 320) that did not reproduce (238 ms, p90
+262). At this sample size importing costs nothing at boot; it is not faster, and
+the changelog does not claim it is.
+
+What moves is content, not origin: the 150 MB toolchain base pays ~80 ms more on
+a warm run, and nearly all of it is `exec_ms` (106 ms vs 34) rather than resume.
+**`resume_ms` is flat at 43–50 ms across all four** — the snapshot restore does
+not care what the base is or how big it is.
+
+Import cost, which is the number an operator feels first: `alpine:3.20` 1.7 s
+cold and 1.0 s with blobs cached; `python:3.12-alpine` (4 layers) 3.5 s and
+2.4 s. The cached figure is what a re-import costs after a guest-agent rebuild
+invalidates every imported base.
+
+`scripts/bench.py` gains `--base`, so a built base and an imported one are
+measured by one harness rather than two.
+
 ### Fixed — five credential and SSRF defects in the registry client
 
 An adversarial pass scoped to `isopod-oci-registry`, the wave-2 exit criterion.

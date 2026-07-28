@@ -330,6 +330,8 @@ The adaptation is deliberately small: the agent at `/.isopod/init` with `/init` 
 
 setuid, setgid and sticky bits are applied *inside* the squashfs and are never written to the host tree, where they would land on attacker-authored files in your home directory before any VM exists. See [Importing OCI images](docs/oci-import.md) for the whole contract, including what a re-import costs and why you will need one after every guest-agent rebuild.
 
+An imported base boots indistinguishably from one isopod built itself — measured, [with the numbers](BENCHMARKS.md#built-base-vs-imported-oci-image). Importing `alpine:3.20` costs 1.7 s once; what moves boot time afterwards is what is *in* the image, not where it came from.
+
 ---
 
 ## Stage model
