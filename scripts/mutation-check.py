@@ -598,6 +598,20 @@ MUTATIONS = [
         package="isopod-oci-registry",
     ),
     Mutation(
+        name="oci-registry-pinned-digest-unverified-when-cached",
+        file="crates/oci-registry/src/lib.rs",
+        old="        if let Want::Digest(want) = &self.reference.want {",
+        new="        if let Want::Digest(want) = &self.reference.want { if false {",
+        defect=(
+            "A pinned `repo@sha256:X` reference stops being verified against "
+            "the bytes that came back. It only shows when the blob is already "
+            "cached — the write path skips a blob that is present and correct, "
+            "so the substituted body is never hashed while the descriptors "
+            "driving the rest of the pull are parsed out of it."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
         name="oci-registry-realm-is-unfloored",
         file="crates/oci-registry/src/auth.rs",
         old="        if !destination_is_allowed(&realm, allow_local) {",
@@ -639,7 +653,7 @@ MUTATIONS = [
         name="oci-registry-ipv6-spelling-bypasses-the-floor",
         file="crates/oci-registry/src/auth.rs",
         old="            if let Some(v4) = embedded_ipv4(ip) {\n                return ipv4_is_allowed(v4, allow_local);\n            }",
-        new="            if false {\n                return ipv4_is_allowed(Ipv4Addr::UNSPECIFIED, allow_local);\n            }",
+        new="            if let Some(v4) = embedded_ipv4(ip) {\n                let _ = v4;\n            }",
         defect=(
             "The floor judges an IPv6 literal's spelling rather than the IPv4 "
             "address it names, so `[::ffff:169.254.169.254]` — the cloud "

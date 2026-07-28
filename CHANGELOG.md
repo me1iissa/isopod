@@ -62,6 +62,14 @@ had claimed this was "the same destination floor the guest egress broker
 applies"; the broker handles mapped spellings and this did not, so the claim was
 false as well as the code being wrong.
 
+**A pinned digest went unverified when the blob was already cached.**
+`repo@sha256:X` is a promise about exact bytes, and the by-digest fetch *inside*
+the index branch checked it — the top-level one did not. It only showed on a
+re-pull: the write path skips a blob that is already present and correct, so a
+substituted body was never hashed, while the config and layer descriptors
+driving the rest of the pull were parsed straight out of it. The same rule now
+applies to both, before anything reads the bytes.
+
 `SECURITY.md` gains an import section stating what holds and what is not
 claimed — in particular that this floor judges the URL, not the resolved
 address, so it is not equivalent to the broker's resolved-address gate.

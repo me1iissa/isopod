@@ -341,6 +341,24 @@ impl Puller {
         // 1. The manifest the reference names, which may be an index.
         let (mut body, mut media_type) = self.fetch_manifest(&self.reference.manifest_path())?;
         let mut digest = manifest_digest(&self.reference, &body);
+        // A pinned reference is a promise about these exact bytes, so it is
+        // checked here rather than left to whoever writes them out. The
+        // by-digest fetch *inside* the index branch below already does this; the
+        // top-level one did not, and the difference only showed when the blob
+        // was already cached — `write_blob_bytes` skips a blob that is present
+        // and correct, so the substituted body was never hashed, while the
+        // descriptors driving the rest of the pull were parsed straight out of
+        // it. Verifying here makes it one rule for both, before anything reads
+        // the bytes.
+        if let Want::Digest(want) = &self.reference.want {
+            let actual = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
+            if actual != want.encoded() {
+                return Err(PullError::DigestMismatch {
+                    expected: want.to_string(),
+                    actual,
+                });
+            }
+        }
 
         let mut doc: WireDoc = serde_json::from_slice(&body).map_err(|e| PullError::Status {
             what: "the manifest".into(),

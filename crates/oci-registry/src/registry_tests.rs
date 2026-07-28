@@ -518,3 +518,155 @@ fn a_credential_dropped_at_one_hop_does_not_come_back_at_the_next() {
     let _ = registry_thread.join();
     let _ = storage_thread.join();
 }
+
+/// A pinned digest is a promise about exact bytes, and a cached blob must not
+/// excuse the registry from keeping it.
+///
+/// `write_blob_bytes` skips a blob that is already present and correct — which
+/// is right — so on a re-pull the substituted body was never hashed, while the
+/// config and layer descriptors driving the rest of the pull were parsed
+/// straight out of it. The by-digest fetch inside the index branch always
+/// checked; the top-level one did not.
+#[test]
+fn a_pinned_digest_is_verified_even_when_the_blob_is_already_cached() {
+    let real = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":2},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":2}]}"#.to_vec();
+    let pinned = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&real));
+
+    // The registry answers the by-digest request with something else entirely.
+    let substituted = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","size":2},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","size":2}]}"#.to_vec();
+
+    let registry = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = registry.local_addr().expect("addr").port();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_thread = Arc::clone(&done);
+    let t = thread::spawn(move || loop {
+        let Ok((mut s, _)) = registry.accept() else {
+            return;
+        };
+        if done_for_thread.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = read_request(&mut s);
+        respond(
+            &mut s,
+            "200 OK",
+            &[("content-type", "application/vnd.oci.image.manifest.v1+json")],
+            &substituted,
+        );
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("layout");
+    // Pre-seed the cache with the REAL manifest under the pinned name, which is
+    // the state a previous successful pull leaves behind.
+    std::fs::create_dir_all(root.join("blobs/sha256")).expect("mkdir");
+    std::fs::write(root.join("blobs/sha256").join(&pinned), &real).expect("seed");
+
+    let mut puller =
+        Puller::new(&format!("localhost:{port}/fake/image@sha256:{pinned}")).expect("client");
+    let err = puller
+        .pull_into(&root)
+        .expect_err("a substituted manifest must be refused");
+    // It must be refused for the RIGHT reason. Without the check the pull still
+    // fails — the substituted manifest names blob digests the registry then
+    // fails to serve — so `matches!(err, DigestMismatch)` alone passes either
+    // way and proves nothing. The mismatch has to name the *pinned manifest*.
+    match &err {
+        PullError::DigestMismatch { expected, .. } => assert!(
+            expected.contains(&pinned),
+            "refused, but for the wrong thing: expected {expected}, wanted the \
+             pinned manifest sha256:{pinned}"
+        ),
+        other => panic!("expected a digest mismatch on the pinned manifest, got: {other}"),
+    }
+
+    done.store(true, Ordering::SeqCst);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    let _ = t.join();
+}
+
+/// A host reached by redirect does not get to start the token dance.
+///
+/// The `401` branch used to fire wherever the client happened to be, so a CDN
+/// the registry named could challenge us, choose the realm, and be paid in the
+/// operator's `~/.docker/config.json` credential. The realm here is a loopback
+/// address the destination floor *allows* (the reference is local), so nothing
+/// but the origin gate can stop it — which is what makes this test
+/// discriminate rather than pass for some second reason.
+///
+/// Driven through `get` directly. The manifest/config/layer scaffold is beside
+/// the point, and each server answers one request and returns; nothing is
+/// joined, because a thread parked on an `accept` that the fix guarantees will
+/// never come is exactly the thread a join would wait on forever.
+#[test]
+fn a_redirected_to_host_cannot_challenge_us_into_fetching_a_token() {
+    // The realm. Reports whether it was ever asked for a token.
+    let realm = TcpListener::bind("127.0.0.1:0").expect("bind realm");
+    let realm_port = realm.local_addr().expect("addr").port();
+    let (realm_tx, realm_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = realm.accept() {
+            let req = read_request(&mut s);
+            if req.line.contains("/token") {
+                let _ = realm_tx.send(());
+            }
+            respond(&mut s, "200 OK", &[], br#"{"token":"stolen"}"#);
+        }
+    });
+
+    // The host the blob is redirected to, challenging like a hostile CDN.
+    let storage = TcpListener::bind("127.0.0.1:0").expect("bind storage");
+    let storage_port = storage.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = storage.accept() {
+            let _ = read_request(&mut s);
+            respond(
+                &mut s,
+                "401 Unauthorized",
+                &[(
+                    "www-authenticate",
+                    &format!(r#"Bearer realm="http://127.0.0.1:{realm_port}/token",service="x""#),
+                )],
+                b"",
+            );
+        }
+    });
+
+    // The registry: one cross-origin redirect and nothing else.
+    let registry = TcpListener::bind("127.0.0.1:0").expect("bind registry");
+    let registry_port = registry.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = registry.accept() {
+            let _ = read_request(&mut s);
+            respond(
+                &mut s,
+                "307 Temporary Redirect",
+                &[("location", &format!("http://127.0.0.1:{storage_port}/blob"))],
+                b"",
+            );
+        }
+    });
+
+    let mut puller =
+        Puller::new(&format!("localhost:{registry_port}/fake/image:v1")).expect("client");
+    let url = Url::parse(&format!(
+        "http://localhost:{registry_port}/v2/fake/image/blobs/sha256:aa"
+    ))
+    .expect("url");
+    let err = puller
+        .get(&url, "a layer blob")
+        .expect_err("the CDN's 401 must end the request, not start a token fetch");
+    assert!(
+        matches!(err, PullError::Status { status: 401, .. }),
+        "expected the CDN's own 401 to surface, got: {err}"
+    );
+    // Give a token fetch, if the gate is gone, time to actually happen —
+    // otherwise this races the bug and passes for the wrong reason.
+    assert!(
+        realm_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_err(),
+        "the realm a redirected-to host named was contacted — the client was \
+         talked into a credentialed conversation with a stranger"
+    );
+}
