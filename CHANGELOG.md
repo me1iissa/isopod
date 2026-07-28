@@ -8,6 +8,38 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Fixed — a setuid bit does not survive its own removal
+
+`Report::setuid_paths` is what the pack step reapplies inside an imported
+image, and it was the *union* of what every layer set rather than a description
+of the finished tree. Three ways an image could get back a privilege it had
+given up:
+
+- A layer that rewrites a path **without** the bit left the earlier layer's
+  recording in place, so `RUN chmod -s /bin/su` in a Dockerfile became a no-op
+  the moment isopod imported the image. This is the one that matters: it re-arms
+  setuid on a binary whose author disarmed it.
+- A path a later layer replaced with a **directory or a symbolic link** kept the
+  old file's mode, so the pack step would have applied a vanished file's `04755`
+  to whatever now occupied the path.
+- A path deleted by a **whiteout**, or hidden by an **opaque marker**, stayed in
+  the list. `mksquashfs` ignores a pseudo-file line naming a path it cannot
+  find — silently, and with exit 0 — so the image was unharmed, but the report
+  an operator reads named files the image does not contain.
+
+The set is now resolved as the layers are applied: a bit is recorded when an
+entry carries it and dropped when an entry replaces that path without it, and
+the deletions are reconciled at `finish()` by *asking the tree* rather than by
+reimplementing the whiteout and opaque rules a second time — a second
+implementation of a deletion rule is a second chance to disagree with the first.
+`setuid_paths` is now documented as a snapshot rather than a per-layer delta,
+sorted by path, and both the per-layer report and the running total carry the
+same resolved answer instead of two different meanings for one field.
+
+Found while building the pack step that consumes it, which is the first code to
+ever read the field for its stated purpose. Two of the suite's own assertions
+had encoded the defect — one expected a whited-out file to stay in the list.
+
 Stages now record which *build* of the base image their layers were made over,
 and a fork refuses a base that has been rebuilt since. Existing stages are
 unaffected: they carry no stamp, so there is nothing to disagree with, and they

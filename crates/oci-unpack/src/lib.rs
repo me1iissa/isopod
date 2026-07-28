@@ -173,9 +173,20 @@ pub struct Report {
     pub opaque_dirs_applied: u64,
     /// Character/block device and FIFO entries, skipped rather than created.
     pub devices_skipped: Vec<String>,
-    /// `(path, mode & 0o7777)` for every entry carrying setuid, setgid or the
-    /// sticky bit. The host tree has the permission bits only; these are for
-    /// the pack step to reapply inside the image.
+    /// `(path, mode & 0o7777)` for every path in the **accumulated tree as it
+    /// now stands** that carries setuid, setgid or the sticky bit, sorted by
+    /// path. The host tree has the permission bits only; these are for the pack
+    /// step to reapply inside the image.
+    ///
+    /// Unlike the counters above, this is a snapshot rather than a per-layer
+    /// delta, and that is deliberate. A union of "what each layer set" is the
+    /// wrong answer for the only caller there is: an image whose first layer
+    /// ships a setuid `/bin/su` and whose second layer rewrites it without the
+    /// bit would have the bit restored by the pack step — re-arming a privilege
+    /// the image's author took away. The same goes for a path a later layer
+    /// deletes or replaces with a directory. So the set is resolved as the
+    /// layers are applied, and every entry in it describes the tree that is
+    /// actually about to be packed.
     pub setuid_paths: Vec<(String, u32)>,
     /// Extended-attribute PAX records seen and dropped.
     pub xattrs_dropped: u64,
@@ -183,6 +194,12 @@ pub struct Report {
 
 impl Report {
     /// Fold one layer's report into a running total.
+    ///
+    /// `setuid_paths` is deliberately absent: it is a snapshot of the resolved
+    /// tree, not a delta, so it is written by
+    /// [`Unpacker::refresh_setuid_paths`] rather than accumulated here. Adding
+    /// it back to this function is what the field's documentation describes as
+    /// the wrong answer.
     fn merge(&mut self, other: &Report) {
         self.entries_written += other.entries_written;
         self.bytes_written += other.bytes_written;
@@ -191,7 +208,6 @@ impl Report {
         self.xattrs_dropped += other.xattrs_dropped;
         self.devices_skipped
             .extend(other.devices_skipped.iter().cloned());
-        self.setuid_paths.extend(other.setuid_paths.iter().cloned());
     }
 }
 
@@ -377,6 +393,11 @@ pub struct Unpacker {
     /// process write access to a tree it is still building. Keyed by components
     /// so that reverse iteration yields children before parents.
     deferred_modes: BTreeMap<Vec<String>, u32>,
+    /// setuid/setgid/sticky bits of the tree **as it currently stands**, keyed
+    /// by path. Maintained as layers are applied rather than accumulated,
+    /// because a later layer can take a bit away as easily as it can add one.
+    /// See [`Report::setuid_paths`], which this materialises.
+    special_modes: BTreeMap<String, u32>,
     promoted: bool,
 }
 
@@ -440,6 +461,7 @@ impl Unpacker {
             total: Report::default(),
             entries_seen: 0,
             deferred_modes: BTreeMap::new(),
+            special_modes: BTreeMap::new(),
             promoted: false,
         })
     }
@@ -507,6 +529,11 @@ impl Unpacker {
             }
         }
         self.total.merge(&rep);
+        // Both the running total and this layer's report carry the resolved
+        // snapshot, so there is exactly one meaning for the field rather than a
+        // delta on one path and a snapshot on the other.
+        self.refresh_setuid_paths();
+        rep.setuid_paths.clone_from(&self.total.setuid_paths);
         Ok(rep)
     }
 
@@ -548,12 +575,56 @@ impl Unpacker {
                 detail: e.to_string(),
             })?;
         }
+        self.drop_vanished_special_modes()?;
+        self.refresh_setuid_paths();
         std::fs::rename(&self.staging, &self.dest).map_err(|e| Refusal::Io {
             path: self.dest.display().to_string(),
             detail: e.to_string(),
         })?;
         self.promoted = true;
         Ok(std::mem::take(&mut self.total))
+    }
+
+    /// Drop recordings for paths the finished tree no longer has.
+    ///
+    /// A whiteout or an opaque marker deletes by walking the tree, and the
+    /// opaque rule in particular ("keep only what this layer wrote, at every
+    /// level") is not something this bookkeeping should try to reproduce — a
+    /// second implementation of a deletion rule is a second chance to disagree
+    /// with the first. So instead of predicting what those paths removed, this
+    /// asks the tree. Every recorded path is looked up through the same
+    /// `O_NOFOLLOW` walk everything else uses; the ones that are gone are
+    /// dropped.
+    ///
+    /// Left in, they would be harmless to the image — `mksquashfs` ignores a
+    /// pseudo-file line naming a path it cannot find, and does so silently —
+    /// but [`Report::setuid_paths`] is also what an operator reads to see what
+    /// the image carries, and a list naming files that are not in it is a claim
+    /// the image does not deliver.
+    fn drop_vanished_special_modes(&mut self) -> Result<(), Refusal> {
+        let recorded: Vec<String> = self.special_modes.keys().cloned().collect();
+        for path in recorded {
+            let components: Vec<String> = path.split('/').map(str::to_string).collect();
+            let (last, head) = components
+                .split_last()
+                .expect("a recorded path has at least one component");
+            let present = match self.dir_existing(head, &path) {
+                Ok(Some(dir)) => dir.lstat(OsStr::new(last.as_str())).is_ok(),
+                // The parent is gone, so the entry beneath it is too.
+                Ok(None) => false,
+                // A later layer replaced a parent with a symbolic link — the
+                // usrmerge shape. Whatever the link points at, nothing is left
+                // at this path in this tree. Same case as the deferred modes
+                // above, and refusing here would reject an ordinary image at
+                // the very end of its unpack.
+                Err(Refusal::SymlinkEscape { .. }) => false,
+                Err(e) => return Err(e),
+            };
+            if !present {
+                self.special_modes.remove(&path);
+            }
+        }
+        Ok(())
     }
 
     // --- entry handling -------------------------------------------------
@@ -667,11 +738,41 @@ impl Unpacker {
         // A symbolic link's mode is not stored on Linux (`lstat` always reports
         // 0o777), so recording one would be a claim the pack step cannot honour.
         if raw_mode & 0o7000 != 0 && kind != EntryType::Symlink {
-            rep.setuid_paths.push((path.clone(), raw_mode));
+            self.special_modes.insert(path.clone(), raw_mode);
+        } else {
+            // The neighbouring case, and the one that matters: this entry
+            // *replaces* whatever was at the path, so an earlier layer's
+            // recording for it is no longer true of the tree. Dropping it here
+            // is what stops the pack step from restoring a setuid bit the
+            // image's own author removed.
+            self.special_modes.remove(&path);
+        }
+        // Anything other than a directory landed on this path by first removing
+        // what was there, so a subtree an earlier layer recorded bits within is
+        // gone. A directory entry re-stating a directory keeps its children, so
+        // it must not prune them.
+        if kind != EntryType::Directory {
+            self.forget_subtree(&path);
         }
         rep.entries_written += 1;
         written.insert(path);
         Ok(())
+    }
+
+    /// Drop every recording strictly beneath `path`.
+    fn forget_subtree(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        self.special_modes.retain(|p, _| !p.starts_with(&prefix));
+    }
+
+    /// Rewrite [`Report::setuid_paths`] on the running total from the resolved
+    /// map, so the accessor never reports a bit the tree no longer carries.
+    fn refresh_setuid_paths(&mut self) {
+        self.total.setuid_paths = self
+            .special_modes
+            .iter()
+            .map(|(p, m)| (p.clone(), *m))
+            .collect();
     }
 
     /// Copy an entry's content, refusing **before** writing the byte that would

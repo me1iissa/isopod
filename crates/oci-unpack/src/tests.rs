@@ -442,9 +442,9 @@ fn setuid_setgid_and_sticky_are_recorded_and_never_written_to_the_host() {
     assert_eq!(
         rep.setuid_paths,
         vec![
+            ("tmp".to_string(), 0o1777),
             ("usr/bin/sudo".to_string(), 0o4755),
             ("usr/bin/wall".to_string(), 0o2755),
-            ("tmp".to_string(), 0o1777),
         ],
         "the pack step needs every one of these, or the image loses them"
     );
@@ -1055,7 +1055,10 @@ fn the_running_total_sums_the_layers() {
     assert_eq!(total.entries_written, 2);
     assert_eq!(total.bytes_written, 8);
     assert_eq!(total.whiteouts_applied, 1);
-    assert_eq!(total.setuid_paths, vec![("a".to_string(), 0o4755)]);
+    // `a` was setuid in layer 1 and whited out in layer 2, so the finished tree
+    // does not have it and neither does the list. This assertion used to expect
+    // it — the counters above sum, but `setuid_paths` resolves.
+    assert_eq!(total.setuid_paths, vec![]);
 }
 
 #[test]
@@ -1079,4 +1082,201 @@ fn the_teardown_can_remove_a_tree_the_image_locked() {
     remove_child(&root, std::ffi::OsStr::new("locked"), &Limits::default(), 0)
         .expect("the teardown must be able to remove what finish locked");
     assert!(!tmp.path().join("locked").exists());
+}
+
+// --- special-permission bits describe the FINAL tree ---------------------
+//
+// `setuid_paths` is what the pack step reapplies inside the image, so every
+// case here is really the question "does the packed image carry a bit the
+// finished tree does not?". The dangerous direction is a bit that survives its
+// own removal: an image whose author took setuid off a binary, or deleted it,
+// must not have it put back. Each case is paired with the neighbouring input
+// that must still keep the bit, so a fix that simply stops recording anything
+// fails the suite.
+
+/// Sorted `(path, mode)` pairs, so assertions read in one line.
+fn special(r: &Report) -> Vec<(&str, u32)> {
+    r.setuid_paths
+        .iter()
+        .map(|(p, m)| (p.as_str(), *m))
+        .collect()
+}
+
+#[test]
+fn a_later_layer_that_clears_the_bit_takes_it_away() {
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.file("bin/su", 0o0755, b"two");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![], "the author's chmod -s must survive");
+
+    // Neighbour: a later layer that rewrites the file and KEEPS the bit, with a
+    // different mode. The last word wins, and it is the later layer's.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.file("bin/su", 0o4711, b"two");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![("bin/su", 0o4711)]);
+}
+
+#[test]
+fn a_whiteout_takes_the_recording_with_the_file() {
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.whiteout("bin/.wh.su");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert!(!c.at("bin/su").exists());
+    assert_eq!(special(&r), vec![]);
+
+    // Neighbour: a whiteout for a DIFFERENT file in the same directory leaves
+    // the setuid one alone.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"one");
+    l1.file("bin/other", 0o0644, b"x");
+    let mut l2 = Layer::new();
+    l2.whiteout("bin/.wh.other");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![("bin/su", 0o4755)]);
+}
+
+#[test]
+fn a_whiteout_of_a_directory_takes_the_bits_inside_it() {
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.dir("opt", 0o0755);
+    l1.file("opt/deep/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.whiteout(".wh.opt");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert!(!c.at("opt").exists());
+    assert_eq!(special(&r), vec![], "a subtree's bits go with the subtree");
+}
+
+#[test]
+fn an_opaque_marker_takes_the_bits_it_hides() {
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("opt/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.whiteout("opt/.wh..wh..opq");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert!(!c.at("opt/su").exists());
+    assert_eq!(special(&r), vec![]);
+
+    // Neighbour: the same marker, but the opaque layer re-adds the setuid file.
+    // Opacity hides the lower layers, not this one's own content.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("opt/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.whiteout("opt/.wh..wh..opq");
+    l2.file("opt/su", 0o4755, b"two");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert!(c.at("opt/su").exists());
+    assert_eq!(special(&r), vec![("opt/su", 0o4755)]);
+}
+
+#[test]
+fn a_path_that_changes_type_does_not_keep_the_old_modes() {
+    // Replaced by a directory: a file's 04755 must not become a directory's.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("x", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.dir("x", 0o0755);
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![]);
+
+    // Replaced by a symbolic link, whose mode Linux does not store at all.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("y", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.symlink("y", "elsewhere");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![]);
+
+    // A directory of setuid binaries replaced by a plain file: the whole
+    // subtree's recordings go with it.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("d/su", 0o4755, b"one");
+    l1.file("d/nested/ping", 0o4711, b"two");
+    let mut l2 = Layer::new();
+    l2.file("d", 0o0644, b"now a file");
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![]);
+
+    // Neighbour, and the one a subtree-pruning fix gets wrong: a directory
+    // RE-STATED as a directory keeps everything under it.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("d/su", 0o4755, b"one");
+    let mut l2 = Layer::new();
+    l2.dir("d", 0o0700);
+    let r = c.run(&[l1.done(), l2.done()]).expect("unpacks");
+    assert_eq!(special(&r), vec![("d/su", 0o4755)]);
+}
+
+#[test]
+fn a_usrmerge_link_over_a_parent_drops_the_bits_without_refusing() {
+    // `/lib` is a real directory holding a setgid binary; a later layer
+    // replaces it with the usrmerge symbolic link. Nothing is left at
+    // `lib/thing`, and the image must still unpack.
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("lib/thing", 0o2755, b"one");
+    let mut l2 = Layer::new();
+    l2.symlink("lib", "usr/lib");
+    let r = c.run(&[l1.done(), l2.done()]).expect("must not refuse");
+    assert_eq!(special(&r), vec![]);
+}
+
+#[test]
+fn setgid_and_sticky_are_recorded_like_setuid() {
+    let c = Case::new();
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"u");
+    l1.file("bin/wall", 0o2755, b"g");
+    l1.dir("tmp", 0o1777);
+    l1.file("plain", 0o0644, b"p");
+    let r = c.run(&[l1.done()]).expect("unpacks");
+    assert_eq!(
+        special(&r),
+        vec![("bin/su", 0o4755), ("bin/wall", 0o2755), ("tmp", 0o1777)],
+        "sorted by path, and a plain file is not in it"
+    );
+    // Invariant 6: none of it reached the host tree.
+    for (rel, _) in &r.setuid_paths {
+        let mode = std::fs::symlink_metadata(c.at(rel))
+            .expect("present")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "{rel} carries special bits on the host");
+    }
+}
+
+#[test]
+fn the_running_total_and_the_layer_report_agree() {
+    let c = Case::new();
+    let mut u = Unpacker::create(&c.dest(), Limits::default()).expect("staging");
+    let mut l1 = Layer::new();
+    l1.file("bin/su", 0o4755, b"one");
+    let first = u.apply_layer(&l1.done()[..]).expect("layer 1");
+    assert_eq!(special(&first), vec![("bin/su", 0o4755)]);
+    assert_eq!(special(u.report()), vec![("bin/su", 0o4755)]);
+
+    let mut l2 = Layer::new();
+    l2.file("bin/su", 0o0755, b"two");
+    let second = u.apply_layer(&l2.done()[..]).expect("layer 2");
+    assert_eq!(special(&second), vec![], "the snapshot, not this layer");
+    assert_eq!(special(u.report()), vec![]);
+    assert_eq!(special(&u.finish().expect("promotes")), vec![]);
 }

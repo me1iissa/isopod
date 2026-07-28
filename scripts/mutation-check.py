@@ -485,6 +485,43 @@ MUTATIONS = [
         package="isopod-oci-unpack",
     ),
     Mutation(
+        name="oci-setuid-survives-its-own-removal",
+        file="crates/oci-unpack/src/lib.rs",
+        old="            self.special_modes.remove(&path);",
+        new="            let _ = &path;",
+        defect=(
+            "A layer that rewrites a path WITHOUT the setuid bit no longer "
+            "clears the earlier layer's recording, so the pack step re-arms a "
+            "privilege the image's own author took away. `RUN chmod -s` in a "
+            "Dockerfile becomes a no-op the moment isopod imports the image."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-setuid-survives-a-type-change",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if kind != EntryType::Directory {\n            self.forget_subtree(&path);\n        }",
+        new="        if false {\n            self.forget_subtree(&path);\n        }",
+        defect=(
+            "A directory of setuid binaries replaced by a file or a symbolic "
+            "link keeps every recording inside it, so the pack step applies a "
+            "vanished subtree's modes to whatever now occupies those paths."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-setuid-outlives-a-whiteout",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        self.drop_vanished_special_modes()?;",
+        new="        if false {\n            self.drop_vanished_special_modes()?;\n        }",
+        defect=(
+            "Paths deleted by a whiteout or hidden by an opaque marker stay in "
+            "the report the pack step and the operator both read, so the image "
+            "is described as carrying setuid files it does not have."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
         name="oci-opaque-keeps-lower-content",
         file="crates/oci-unpack/src/lib.rs",
         old="        if !keep.contains(&key) {",
