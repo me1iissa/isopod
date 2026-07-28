@@ -46,6 +46,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use isopod_oci_registry::Puller;
+use isopod_oci_unpack::layout::{Compression, Layout, Platform};
+use isopod_oci_unpack::{Limits, Unpacker};
+
 use super::rootfs::{self, ImageMeta};
 use crate::paths;
 
@@ -540,6 +544,261 @@ pub fn pack_and_stamp(
 /// Read an imported image's sidecar, if it has one.
 pub fn read_provenance(image: &Path) -> Result<Option<OciProvenance>> {
     Ok(rootfs::read_image_meta(image)?.and_then(|m: ImageMeta| m.oci))
+}
+
+// ===========================================================================
+// The whole import, end to end
+// ===========================================================================
+
+/// Where the image comes from. All three end up in the same place — an OCI
+/// image layout on disk — and share every step after that.
+#[derive(Debug, Clone)]
+pub enum ImportSource {
+    /// A registry reference, e.g. `alpine:3.20`.
+    Registry(String),
+    /// A directory that already is an OCI image layout.
+    OciLayout(PathBuf),
+    /// A `docker save` tarball.
+    DockerSave(PathBuf),
+}
+
+impl ImportSource {
+    /// What the sidecar records as the source, and what a slug is derived from.
+    fn describe(&self) -> String {
+        match self {
+            Self::Registry(r) => r.clone(),
+            Self::OciLayout(p) | Self::DockerSave(p) => p.display().to_string(),
+        }
+    }
+}
+
+/// Turn a reference or a path into a name that may become a file.
+///
+/// `alpine:3.20` becomes `alpine-3.20`, `ghcr.io/org/app:v1` becomes
+/// `ghcr.io-org-app-v1`. Anything the name rules do not allow becomes `-`, and
+/// runs of `-` collapse so a path full of separators does not become a row of
+/// dashes. The result still goes through [`validate_slug`]: this is a
+/// convenience, not the guard.
+pub fn slug_for(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for c in source.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_') {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(|c| c == '-' || c == '.').to_string();
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Pull, unpack, adapt, pack and stamp — the whole import.
+///
+/// `slug` names the resulting base; when absent it is derived from the source.
+/// `force` overwrites an image of that name.
+pub fn import(source: &ImportSource, slug: Option<&str>, force: bool) -> Result<ImportOutcome> {
+    let images = paths::images_dir()?;
+    let slug = match slug {
+        Some(s) => s.to_string(),
+        None => slug_for(&source.describe()),
+    };
+    let dest = imported_image_path(&images, &slug)?;
+    if dest.exists() && !force {
+        bail!(
+            "an imported image named '{slug}' is already at {}; \
+             pass --force to replace it, or --name to import alongside it",
+            dest.display()
+        );
+    }
+
+    // The agent is resolved before any network or disk work, so a missing one
+    // fails in a second rather than after a gigabyte.
+    let agent = rootfs::locate_checked_agent_pub()?;
+
+    let work = tempfile::tempdir().context("creating an import workdir")?;
+    let (layout_dir, pulled) = materialise_layout(source, work.path(), &images)?;
+
+    let layout = open_layout(&layout_dir, source)?;
+    let platform = Platform::host();
+    let manifest = layout
+        .resolve(&platform)
+        .with_context(|| format!("resolving {platform} in the image index"))?;
+    let config = layout
+        .config(&manifest.config)
+        .context("reading the image config")?;
+
+    // Unpack every layer onto one tree. The blobs were verified as whole files
+    // before any of this: `tar` stops at the end-of-archive marker, so
+    // verifying while the caller reads would verify only part of a blob.
+    let tree = work.path().join("rootfs");
+    let mut unpacker = Unpacker::create(&tree, Limits::default())
+        .map_err(|e| anyhow::anyhow!("preparing the unpack destination: {e}"))?;
+    for layer in &manifest.layers {
+        let blob = layout
+            .blob(layer)
+            .with_context(|| format!("opening layer {}", layer.digest))?;
+        let compression = Compression::of(&layer.media_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "layer {} has media type '{}', which isopod cannot unpack. \
+                 Foreign (\"non-distributable\") layers are not in the image at \
+                 all — their bytes live somewhere the registry only points at.",
+                layer.digest,
+                layer.media_type
+            )
+        })?;
+        let applied = match compression {
+            Compression::None => unpacker.apply_layer(blob),
+            Compression::Gzip => unpacker.apply_layer(flate2::read::GzDecoder::new(blob)),
+            Compression::Zstd => bail!(
+                "layer {} is zstd-compressed, which this build cannot decompress. \
+                 Nearly every image in the wild is gzip; re-push the image with \
+                 gzip layers, or import it from a `docker save` tarball.",
+                layer.digest
+            ),
+        };
+        applied.map_err(|e| anyhow::anyhow!("layer {}: {e}", layer.digest))?;
+    }
+    let report = unpacker
+        .finish()
+        .map_err(|e| anyhow::anyhow!("promoting the unpacked tree: {e}"))?;
+
+    let adapted = adapt(&tree, &agent)?;
+
+    let provenance = OciProvenance {
+        source_ref: source.describe(),
+        platform: platform.to_string(),
+        manifest_digest: pulled.unwrap_or_else(|| manifest.config.digest.to_string()),
+        config_digest: manifest.config.digest.to_string(),
+        layer_digests: manifest
+            .layers
+            .iter()
+            .map(|l| l.digest.to_string())
+            .collect(),
+        env: config.env.clone(),
+        working_dir: config.working_dir.clone(),
+        entrypoint: config.entrypoint.clone(),
+        cmd: config.cmd.clone(),
+        user: config.user.clone(),
+        replaced_init: adapted.replaced_init,
+        setuid_paths: report.setuid_paths.iter().map(|(p, _)| p.clone()).collect(),
+    };
+
+    let spec = ImportSpec {
+        slug: &slug,
+        special_modes: &report.setuid_paths,
+        provenance,
+    };
+    let mut outcome = pack_and_stamp(&tree, &images, &spec, adapted)?;
+
+    // Things the extractor decided not to materialise. An operator wondering
+    // where a device node went has to be told, and the documentation is not
+    // where they will look.
+    if !report.devices_skipped.is_empty() {
+        outcome.notes.push(format!(
+            "{} device or FIFO entries were skipped rather than created; the guest \
+             gets its /dev from a devtmpfs the agent mounts",
+            report.devices_skipped.len()
+        ));
+    }
+    if report.xattrs_dropped > 0 {
+        outcome.notes.push(format!(
+            "{} extended attributes were dropped",
+            report.xattrs_dropped
+        ));
+    }
+    Ok(outcome)
+}
+
+/// Open `dir` as an OCI image layout, explaining a failure in terms of where
+/// the bytes came from.
+///
+/// The reader's own message is "no `oci-layout`", which is accurate and
+/// unhelpful: what an operator needs to know is *which* of the three ways in
+/// they used and what that failure means for it. A pull that was interrupted
+/// leaves exactly this, on purpose — `index.json` is written last, so an
+/// incomplete layout is one the reader refuses rather than one it half-believes.
+/// A tarball, on the other hand, is far more likely to be the **legacy**
+/// `docker save` format, which is not a layout at all.
+fn open_layout(dir: &Path, source: &ImportSource) -> Result<Layout> {
+    match Layout::open(dir) {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            // `manifest.json` with no `oci-layout` is the pre-OCI archive
+            // Docker has emitted for a decade: a top-level manifest naming
+            // `<hash>/layer.tar` directories. Refusing it by name beats
+            // refusing it as a corrupt layout, which is what it looks like.
+            if dir.join("manifest.json").is_file() && !dir.join("oci-layout").is_file() {
+                bail!(
+                    "{} is a legacy `docker save` archive (a top-level manifest.json \
+                     naming <hash>/layer.tar), not an OCI image layout, and isopod \
+                     reads the OCI layout only. Either re-export it with a Docker \
+                     that writes an OCI archive (`docker save` on 25+ with the \
+                     containerd image store), or `skopeo copy docker-archive:<tar> \
+                     oci:<dir>` and import that with --oci-layout.",
+                    source.describe()
+                );
+            }
+            let hint = match source {
+                ImportSource::Registry(_) => {
+                    " — an interrupted pull leaves exactly this, since index.json is \
+                     written last; re-run to resume it"
+                }
+                ImportSource::DockerSave(_) => {
+                    " — the tarball extracted, but its contents are not an image layout"
+                }
+                ImportSource::OciLayout(_) => "",
+            };
+            // Named as the operator wrote it: for a tarball the extraction
+            // directory is a temporary path they have never seen.
+            Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading the image layout in {}{hint}", source.describe()))
+        }
+    }
+}
+
+/// Get an OCI image layout on disk for `source`, returning it and the manifest
+/// digest when the source knew one.
+fn materialise_layout(
+    source: &ImportSource,
+    work: &Path,
+    images: &Path,
+) -> Result<(PathBuf, Option<String>)> {
+    match source {
+        ImportSource::Registry(reference) => {
+            // Blobs are cached outside the workdir so a re-import after an
+            // agent rebuild — which invalidates every imported base — does not
+            // re-download a gigabyte it already has.
+            let cache = images.join("oci-blobs").join(slug_for(reference));
+            let mut puller =
+                Puller::new(reference).map_err(|e| anyhow::anyhow!("{reference}: {e}"))?;
+            let pulled = puller
+                .pull_into(&cache)
+                .map_err(|e| anyhow::anyhow!("pulling {reference}: {e}"))?;
+            Ok((cache, Some(pulled.manifest_digest.to_string())))
+        }
+        ImportSource::OciLayout(dir) => Ok((dir.clone(), None)),
+        ImportSource::DockerSave(tar) => {
+            // A `docker save` tarball is attacker-authored too, so it is
+            // extracted by the same confined extractor the layers go through
+            // rather than by a second, laxer one. Whiteouts and special modes
+            // are meaningless in an archive of blobs, and costing nothing is
+            // the right price for not maintaining a second tar reader.
+            let dest = work.join("layout");
+            let file =
+                std::fs::File::open(tar).with_context(|| format!("opening {}", tar.display()))?;
+            let mut u = Unpacker::create(&dest, Limits::default())
+                .map_err(|e| anyhow::anyhow!("preparing to extract the tarball: {e}"))?;
+            u.apply_layer(file)
+                .map_err(|e| anyhow::anyhow!("extracting {}: {e}", tar.display()))?;
+            u.finish()
+                .map_err(|e| anyhow::anyhow!("extracting {}: {e}", tar.display()))?;
+            Ok((dest, None))
+        }
+    }
 }
 
 #[cfg(test)]

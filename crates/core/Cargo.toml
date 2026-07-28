@@ -27,6 +27,9 @@ isopod-oci-unpack = { path = "../oci-unpack" }
 # Layer blobs arrive gzipped in practice; the layout reader hands back the
 # verified compressed bytes and the decoder is the caller's choice.
 flate2 = { workspace = true }
+# The network half of an import. Kept out of `oci-unpack` on purpose: the
+# extractor is reviewable without any notion of where bytes came from.
+isopod-oci-registry = { path = "../oci-registry" }
 # Blocking HTTP: the image pipeline is a synchronous one-shot CLI path, so we
 # opt the workspace reqwest into its `blocking` client (keeps the CLI runtime-free).
 reqwest = { workspace = true, features = ["blocking", "query"] }

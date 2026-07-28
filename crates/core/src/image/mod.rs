@@ -12,8 +12,8 @@ mod rootfs;
 mod s3;
 
 pub use import::{
-    adapt, imported_image_path, pack_and_stamp, read_provenance, AdaptReport, ImportOutcome,
-    ImportSpec, OciProvenance,
+    adapt, import, imported_image_path, pack_and_stamp, read_provenance, slug_for, AdaptReport,
+    ImportOutcome, ImportSource, ImportSpec, OciProvenance,
 };
 pub use kernel::{fetch_kernel, FetchKernelOutcome};
 pub(crate) use rootfs::base_image_path_in;

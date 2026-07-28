@@ -68,6 +68,8 @@ PAGES: list[Page] = [
          "Register isopod as an MCP server for Claude Code and drive it with sandbox_run."),
     Page("docs/sandbox-build.md", "sandbox-build", "Building in isopod", "Start",
          "Building isopod inside its own sandboxes."),
+    Page("docs/oci-import.md", "oci-import", "Importing OCI images", "Start",
+         "Turn a container image into a bootable isopod base, and what isopod does and does not take from it."),
 
     Page("SECURITY.md", "security", "Security model", "Security",
          "isopod's threat model, isolation boundary, what holds, and what is explicitly not claimed."),

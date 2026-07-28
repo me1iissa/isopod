@@ -5,6 +5,7 @@
 //! persists any cross-invocation state under ~/.isopod so any caller
 //! (Claude Code, human shell, CI) can resume.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -267,6 +268,33 @@ enum ImageCommand {
     BuildAll,
     /// List every guest image with its stamped proto version and staleness
     Ls,
+    /// Import an OCI image as a bootable base
+    ///
+    /// isopod runs the image's FILESYSTEM, with isopod's init — not the
+    /// image's entrypoint. PID 1 is the guest agent, which does the overlay
+    /// mounts, the pivot and the RPC, so ENTRYPOINT and CMD are recorded and
+    /// never executed and USER is ignored. An image with no /bin/sh is
+    /// refused.
+    Import {
+        /// Registry reference to pull, e.g. `alpine:3.20`.
+        #[arg(
+            required_unless_present_any = ["oci_layout", "docker_save"],
+            conflicts_with_all = ["oci_layout", "docker_save"],
+        )]
+        reference: Option<String>,
+        /// Import from a directory that is already an OCI image layout.
+        #[arg(long, value_name = "DIR", conflicts_with = "docker_save")]
+        oci_layout: Option<PathBuf>,
+        /// Import from a `docker save` tarball.
+        #[arg(long, value_name = "TAR")]
+        docker_save: Option<PathBuf>,
+        /// Name the base is addressed by (derived from the source otherwise).
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace an imported image of the same name.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -379,6 +407,23 @@ fn run_image(cmd: ImageCommand) -> i32 {
             Ok(serde_json::json!({ "ok": true, "images": images }))
         })()),
         ImageCommand::Ls => emit(image::list_images()),
+        ImageCommand::Import {
+            reference,
+            oci_layout,
+            docker_save,
+            name,
+            force,
+        } => {
+            // clap's `required_unless_present_any` guarantees one of the three
+            // is set, and `conflicts_with` that no two are.
+            let source = match (reference, oci_layout, docker_save) {
+                (Some(r), _, _) => image::ImportSource::Registry(r),
+                (_, Some(d), _) => image::ImportSource::OciLayout(d),
+                (_, _, Some(t)) => image::ImportSource::DockerSave(t),
+                _ => unreachable!("clap requires exactly one source"),
+            };
+            emit(image::import(&source, name.as_deref(), force))
+        }
     }
 }
 

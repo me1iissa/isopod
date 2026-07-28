@@ -8,6 +8,38 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Added — `isopod image import`
+
+Three ways in, one path after that:
+
+```bash
+isopod image import alpine:3.20
+isopod image import --oci-layout ./layout --name my-base
+isopod image import --docker-save ./saved.tar --name my-base
+```
+
+Pull (or read) an image layout, verify every blob, unpack the layers through the
+confined extractor, adapt the tree, pack it and stamp it. Verified live against
+Docker Hub: `alpine:3.20` and `busybox:1.36` both import and pack, and the same
+image imported from a registry, from a local layout and from a tarball produces
+the **same content id** — three sources converging on one image, which is what
+makes the layout and tarball paths worth having rather than merely present.
+
+Blobs are cached under `~/.isopod/images/oci-blobs/`, so a re-import is local.
+That is not a nicety: an imported base is stamped with the guest-agent hash it
+was built against, and every agent rebuild invalidates every imported base.
+
+A legacy `docker save` archive — the pre-OCI format, a top-level `manifest.json`
+naming `<hash>/layer.tar` — is refused by name, with the `skopeo` command that
+converts it. It is not an image layout, and the layout reader's own "no
+`oci-layout`" is accurate and useless for the operator holding one. Failures
+name the path the operator actually typed, not the temporary directory a tarball
+was extracted into.
+
+Not yet wired: an imported base cannot be selected with `--base`. The run path
+resolves bases through the built-in flavor enum, and widening that is the next
+step, with the image config becoming run defaults at the same time.
+
 ### Added — an unpacked OCI tree becomes a base isopod can boot
 
 The adaptation half of an image import. It takes the directory tree the

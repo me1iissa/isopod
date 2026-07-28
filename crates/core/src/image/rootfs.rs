@@ -1158,6 +1158,12 @@ fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
         .context("building HTTP client")
 }
 
+/// [`locate_checked_agent`] for the import path, which resolves the agent up
+/// front so a missing one fails before the network work rather than after it.
+pub(crate) fn locate_checked_agent_pub() -> Result<PathBuf> {
+    locate_checked_agent()
+}
+
 /// Locate the guest-agent musl binary and verify it is a static x86_64 ELF (a
 /// dynamic binary would fail to run as PID 1 in the minimal guest).
 fn locate_checked_agent() -> Result<PathBuf> {

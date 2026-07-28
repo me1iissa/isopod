@@ -303,9 +303,31 @@ isopod vm gc --keep-last 20
 # Warm pool.
 isopod warmpool build
 isopod warmpool list
+
+# Import a container image as a bootable base.
+isopod image import alpine:3.20
+isopod image import --oci-layout ./layout --name my-base
+isopod image import --docker-save ./saved.tar --name my-base
 ```
 
 Every subcommand prints exactly one JSON object to stdout (human-readable logs go to stderr), so the CLI, the MCP server, humans, and CI all drive the same core.
+
+### Importing OCI images
+
+`isopod image import` turns a container image into an isopod base — pulled from a registry, read from a local OCI layout, or read from a `docker save` tarball. Every blob is digest-verified before its bytes are used, and layers are unpacked by a confined extractor that never follows a symbolic link an earlier layer planted.
+
+**isopod runs your image's filesystem, with isopod's init** — not "isopod runs your container". PID 1 is the guest agent, which does the overlay mounts, the pivot and the RPC, so an image's `ENTRYPOINT` can never be PID 1:
+
+| Image config | What isopod does with it |
+|---|---|
+| `Env` | merged **under** the run's own environment — the run wins |
+| `WorkingDir` | the run's default working directory |
+| `Entrypoint` / `Cmd` | recorded, **never executed** |
+| `User` | **ignored** — the agent execs as root |
+
+The adaptation is deliberately small: the agent at `/.isopod/init` with `/init` pointing at it, the three empty overlay mountpoints, and a `/tmp` if the image ships none. The image's own `/sbin/init` is left alone. An image with **no `/bin/sh` is refused by name at import time**, since the exec surface is `/bin/sh -c` and the alternative is an exit 127 inside a VM.
+
+setuid, setgid and sticky bits are applied *inside* the squashfs and are never written to the host tree, where they would land on attacker-authored files in your home directory before any VM exists. See [Importing OCI images](docs/oci-import.md) for the whole contract, including what a re-import costs and why you will need one after every guest-agent rebuild.
 
 ---
 
@@ -405,6 +427,7 @@ Backlog (v2+): jail-on-by-default, a concurrent-VM memory governor + I/O rate li
 | [CHANGELOG.md](CHANGELOG.md) | Release history. |
 | [PLAN.md](PLAN.md) | The original architecture plan and milestone log (kept as an engineering record). |
 | [docs/sandbox-build.md](docs/sandbox-build.md) | Building isopod inside its own sandboxes (dogfood recipe). |
+| [docs/oci-import.md](docs/oci-import.md) | Importing a container image as a base: what the adaptation changes, why the entrypoint is never PID 1, where setuid bits live, and what a re-import costs. |
 | [The docs site](https://me1iissa.github.io/isopod/) | Everything below, rendered and navigable. Built by `scripts/build-docs-site.py` from this repo's own Markdown. |
 | [docs/credentials.md](docs/credentials.md) | Host-declared credentials: aliases, a pinned host, and a mandatory per-credential request allowlist — with the red-team argument for why the allowlist is not optional. |
 | [docs/egress-ledger.md](docs/egress-ledger.md) | Filtered-egress bypass attempts run against a real VM: what was tried, which layer caught it, and what the flight recorder saw. |

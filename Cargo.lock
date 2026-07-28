@@ -903,6 +903,7 @@ dependencies = [
  "flate2",
  "hex",
  "isopod-fc",
+ "isopod-oci-registry",
  "isopod-oci-unpack",
  "isopod-proto",
  "libc",

@@ -509,3 +509,90 @@ fn a_mode_that_did_not_land_fails_the_pack() {
         "{err}"
     );
 }
+
+// --- the three ways in --------------------------------------------------
+
+#[test]
+fn a_slug_derived_from_a_reference_is_usable_as_a_name() {
+    assert_eq!(slug_for("alpine:3.20"), "alpine-3.20");
+    assert_eq!(slug_for("ghcr.io/org/app:v1.2.3"), "ghcr.io-org-app-v1.2.3");
+    assert_eq!(slug_for("python:3.12-slim"), "python-3.12-slim");
+    // A digest reference: the separators collapse rather than becoming a row
+    // of dashes.
+    assert_eq!(slug_for("alpine@sha256:aabb"), "alpine-sha256-aabb");
+    // A path, which is what --oci-layout and --docker-save describe.
+    assert_eq!(slug_for("/var/tmp/my image.tar"), "var-tmp-my-image.tar");
+    // Degenerate input still yields something the name rules accept.
+    assert_eq!(slug_for("///"), "image");
+    assert_eq!(slug_for(""), "image");
+
+    // Whatever comes out must pass the guard the derivation is a convenience
+    // for — otherwise a reference could produce a name the import then refuses.
+    let images = Path::new("/x");
+    for r in [
+        "alpine:3.20",
+        "ghcr.io/org/app:v1.2.3",
+        "alpine@sha256:aabb",
+        "/var/tmp/my image.tar",
+        "///",
+        "",
+        "-leading-dash",
+        "..",
+        "../../etc/passwd",
+    ] {
+        let s = slug_for(r);
+        assert!(
+            imported_image_path(images, &s).is_ok(),
+            "slug_for({r:?}) gave {s:?}, which the name rules refuse"
+        );
+    }
+}
+
+#[test]
+fn a_legacy_docker_save_archive_is_refused_by_name() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let dir = t.path().join("extracted");
+    std::fs::create_dir_all(dir.join("abc123")).expect("mkdir");
+    std::fs::write(
+        dir.join("manifest.json"),
+        br#"[{"Config":"c.json","Layers":["abc123/layer.tar"]}]"#,
+    )
+    .expect("write");
+
+    let source = ImportSource::DockerSave(PathBuf::from("/tmp/saved.tar"));
+    let err = open_layout(&dir, &source).expect_err("must refuse");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("legacy"), "{msg}");
+    // Named as the operator wrote it, not as the temporary directory it was
+    // extracted into — which they have never seen.
+    assert!(msg.contains("/tmp/saved.tar"), "{msg}");
+    // And it says what to do instead.
+    assert!(
+        msg.contains("skopeo") || msg.contains("containerd"),
+        "{msg}"
+    );
+
+    // Neighbour: the same directory once it IS an OCI layout is not caught by
+    // the legacy branch. (It still fails — there is no index.json — but with
+    // the layout reader's own message, not the legacy one.)
+    std::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).expect("write");
+    let err = open_layout(&dir, &source).expect_err("still not a layout");
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("legacy"), "{msg}");
+}
+
+#[test]
+fn a_failure_to_read_a_layout_is_explained_per_source() {
+    let t = tempfile::tempdir().expect("tempdir");
+    let dir = t.path().join("empty");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // A pull that stopped early leaves exactly this, and resuming is the fix.
+    let err =
+        open_layout(&dir, &ImportSource::Registry("alpine:3.20".into())).expect_err("not a layout");
+    assert!(format!("{err:#}").contains("interrupted pull"), "{err:#}");
+
+    // A directory the operator named is not an interrupted anything.
+    let err = open_layout(&dir, &ImportSource::OciLayout(dir.clone())).expect_err("not a layout");
+    assert!(!format!("{err:#}").contains("interrupted pull"), "{err:#}");
+}
