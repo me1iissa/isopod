@@ -70,7 +70,33 @@ what was written to reach it.
 
 | Experiment | Why it cannot be on `main` | Merges when | Dies if |
 |---|---|---|---|
-| *(none yet)* | | | |
+| **MCP `2026-07-28`** — `rmcp` 3.x, then the Tasks extension | `rmcp` 3.x is `3.0.0-beta.*`; a major bump cannot be dual-pinned against the 2.2 `main` depends on | `rmcp` 3.0 goes GA **and** a shipping Claude Code is confirmed to negotiate `2026-07-28` against this server | `rmcp` 3.0 has not shipped, or Claude Code has not implemented the Tasks extension, by **2026-10-31**. Nothing breaks meanwhile: isopod is a legacy-era stdio server and dual-era clients fall back to `initialize` |
+
+### MCP `2026-07-28` — what this is for, and what it is not
+
+**Nothing is broken today.** isopod exposes tools only, over stdio, logging to
+stderr, with standard error codes — so it sits outside nearly every breaking
+change in that revision, and the deprecations (Roots, Sampling, Logging) miss it
+entirely. This branch is not a repair.
+
+What it is for is **Tasks**. `sandbox_run` blocks for up to an hour and is kept
+alive by a progress-notification keepalive whose own comment concedes the client
+does not render them — a workaround for the problem Tasks exists to solve. With
+Tasks a long build returns a handle immediately and survives a client
+disconnect, which today loses the run outright.
+
+**Settle this before writing code:** does `rmcp` 3.x's *server* side serve both
+protocol eras, or only the new one? A server that stops answering `initialize`
+would strand every currently shipping client. That single fact decides whether
+the upgrade is a dependency bump or a real piece of work, and it is not
+answerable from the beta's documentation — read the 3.x source.
+
+Deliberately **not** on this branch: `Roots` and `MCP Apps`. Both invert
+controls isopod is built around — `Roots` would let the confined party widen a
+host-I/O boundary resolved once at startup precisely so it could not be widened,
+and MCP Apps would render guest-authored content the sanitiser exists to keep
+out of the model's context. They are not experiments, they are wrong for this
+product.
 
 ## When an experiment ends
 
