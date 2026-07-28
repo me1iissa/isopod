@@ -625,7 +625,7 @@ flowchart TB
     every rebuild — or add `warmpool rm --orphaned`; and surface an `orphaned`
     flag in `warmpool list`.
 
-32. **[open] HIGH — two concurrent runs of the same warm shape build into one
+32. **[fixed] HIGH — two concurrent runs of the same warm shape build into one
     directory on fixed `.partial` names, with no lock.** `snapshot::ensure`
     creates `artifacts.dir` and writes `vmstate.partial` / `memfile.partial`
     (`snapshot.rs:551`); there is no `flock` anywhere in the module (the one at
@@ -638,6 +638,17 @@ flowchart TB
     around `ensure`, in the shape `net::claim_lock` already uses; second arrival
     waits and then finds the snapshot complete. Failing that, per-process unique
     staging names so a loser can only lose its own bytes.
+    **FIXED:** both halves. An exclusive per-keyhash `flock` (`build.lock`,
+    *inside* the keyhash directory so `warmpool rm` — which removes directories
+    and skips plain files — reclaims it) is taken in `ensure` before any build.
+    A second arrival waits up to 90 s, notices the moment the winner publishes,
+    and **reuses** that snapshot instead of building a second one over the top;
+    if the wait expires the run cold-boots, which is what a cache miss does
+    anyway. Staging names carry the pid now, so even with the lock gone a loser
+    can only destroy its own bytes. Tested at the primitive **and** at the call
+    site: `ensure` grew an `ensure_at` seam so the wait-then-reuse path runs
+    without booting a VM or touching the process-global `$ISOPOD_HOME`, and all
+    three tests fail if the `flock` is removed. Three mutations.
 
 33. **[open] MEDIUM — a warm resume that fails never retires the snapshot.** The
     run falls back to a cold boot (`vm/mod.rs:2392`) and reports `path: "cold"`

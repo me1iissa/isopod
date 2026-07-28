@@ -8,6 +8,38 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Fixed — two concurrent warm-pool builds could publish each other's bytes
+
+Dogfood finding #32, the only open HIGH and the only one that could publish
+corrupt state rather than merely waste work. `snapshot::ensure` created the
+snapshot directory and wrote `vmstate.partial` / `memfile.partial` — **fixed
+names, no lock**. Two runs of the same warm shape both saw an incomplete
+snapshot, both dumped several hundred MiB into those two paths, and both
+renamed, so one could publish a memory file the other was still writing. Every
+later resume of that shape would then get it.
+
+This is not a contrived race. Any image rebuild empties the pool for *every*
+shape at once, and the MCP tool description actively invites concurrent
+sandboxes from separate agents — so two runs arriving together on a cold pool is
+the ordinary case, and the window is the several-second memory dump.
+
+An exclusive per-keyhash `flock` now guards the build, in the shape
+`net::claim_lock` already uses (`O_NOFOLLOW`, regular-file check, `LOCK_EX |
+LOCK_NB`, so a crashed owner's lock is simply gone and needs no staleness
+heuristic). A second arrival waits up to 90 s, **notices the moment the winner
+publishes, and reuses that snapshot** rather than building a second one; if the
+wait expires it cold-boots, which is what a cache miss does anyway. The lock
+lives inside the keyhash directory, because `warmpool rm` removes directories
+and skips plain files — a lock beside them would survive every prune forever.
+
+Staging names now carry the pid as well, which the finding named as the
+fallback: with the lock gone, a loser can still only destroy its own bytes.
+
+Tested at the primitive *and* at the call site. `ensure` grew an `ensure_at`
+seam so the wait-then-reuse path is exercised without booting a VM and without
+touching the process-global `$ISOPOD_HOME` — a trap this codebase has fallen
+into twice. All three tests fail if the `flock` is removed; three mutations.
+
 ### Measured — an imported image boots like a base isopod built itself
 
 The wave-2 exit benchmark, in `BENCHMARKS.md`. 30 samples per cell, one shadow

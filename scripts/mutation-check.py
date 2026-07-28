@@ -371,6 +371,43 @@ MUTATIONS = [
         ),
         filter="image::",
     ),
+    Mutation(
+        name="warmpool-build-unlocked",
+        file="crates/core/src/snapshot.rs",
+        old="    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {",
+        new="    if true {",
+        defect=(
+            "The build lock stops locking, so two runs of the same warm shape "
+            "both build into one directory and one can publish a memory file "
+            "the other is still writing — the only warm-pool defect that "
+            "publishes corrupt state rather than merely wasting work."
+        ),
+        filter="snapshot::",
+    ),
+    Mutation(
+        name="warmpool-waiter-ignores-a-published-snapshot",
+        file="crates/core/src/snapshot.rs",
+        old="        if artifacts.is_complete() {\n            return Ok(None);\n        }\n        if std::time::Instant::now() >= deadline {",
+        new="        if std::time::Instant::now() >= deadline {",
+        defect=(
+            "The waiter stops noticing that the winner published, so every "
+            "concurrent second call sits out the full 90 s timeout and then "
+            "cold-boots — turning the fix for a race into a stall."
+        ),
+        filter="snapshot::",
+    ),
+    Mutation(
+        name="warmpool-ensure-skips-the-lock",
+        file="crates/core/src/snapshot.rs",
+        old="    let _lock = match acquire_build_lock(&artifacts, wait).await? {",
+        new="    let _lock: Option<std::fs::File> = None;\n    match Some(()) {",
+        defect=(
+            "`ensure` stops taking the lock at all. The primitive still works "
+            "and its own tests still pass — which is the point: a policy "
+            "nothing calls holds in the test suite and nowhere else."
+        ),
+        filter="snapshot::",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

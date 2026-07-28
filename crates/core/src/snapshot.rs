@@ -66,6 +66,9 @@ const VMSTATE_FILE: &str = "vmstate";
 const MEMFILE_FILE: &str = "memfile";
 /// Basename of the human/machine-readable metadata inside a snapshot directory.
 const META_FILE: &str = "meta.json";
+/// Per-snapshot build lock, inside the keyhash directory so `warmpool rm`
+/// reclaims it with everything else.
+const BUILD_LOCK_FILE: &str = "build.lock";
 
 // ===========================================================================
 // Snapshot cache key (pure; host detection is factored out for testability).
@@ -349,12 +352,159 @@ pub struct BuildCtx<'a> {
 /// complete cached one) — callers surface it so a first-use run can explain why
 /// its `total_ms` includes seconds of one-time build cost (dogfood finding #20).
 pub async fn ensure(ctx: &BuildCtx<'_>) -> Result<(SnapshotArtifacts, bool)> {
-    let artifacts = artifacts_for(ctx.key)?;
+    ensure_at(artifacts_for(ctx.key)?, ctx, BUILD_LOCK_WAIT).await
+}
+
+/// [`ensure`] against explicit artifacts and an explicit wait.
+///
+/// The seam exists because the interesting behaviour — a second arrival waiting
+/// out the first and then *reusing* what it published — happens entirely before
+/// any VM is booted, and is therefore testable without one. `ensure` resolves
+/// its directory from `$ISOPOD_HOME`, which is process-global; a test that set
+/// it would steer every test beside it, which is a trap this codebase has
+/// already fallen into twice.
+async fn ensure_at(
+    artifacts: SnapshotArtifacts,
+    ctx: &BuildCtx<'_>,
+    wait: Duration,
+) -> Result<(SnapshotArtifacts, bool)> {
     if artifacts.is_complete() {
         return Ok((artifacts, false));
     }
+
+    // Two runs of the same warm shape reach here together as a matter of
+    // course: any rebuild empties the pool for every shape at once, and the
+    // MCP surface actively invites concurrent sandboxes. Unlocked, both saw an
+    // incomplete snapshot, both dumped several hundred MiB into the same two
+    // fixed `.partial` names, and both renamed — so one run could publish a
+    // file the other was still writing, and the pool would then hand that
+    // snapshot to every later resume. This is the one warm-pool defect that
+    // publishes corrupt state rather than merely wasting work.
+    std::fs::create_dir_all(&artifacts.dir)
+        .with_context(|| format!("creating snapshot dir {}", artifacts.dir.display()))?;
+    let _lock = match acquire_build_lock(&artifacts, wait).await? {
+        Some(lock) => lock,
+        None => {
+            // The lock was not taken, which is two different situations and
+            // only one of them is a failure. Usually the other process finished
+            // while we waited — that is the good case, and the whole point of
+            // waiting: this run gets the snapshot it would otherwise have built
+            // a second copy of.
+            if artifacts.is_complete() {
+                return Ok((artifacts, false));
+            }
+            // Otherwise somebody has been building for longer than the wait
+            // allows. Cold boot is always correct — it is what a cache miss
+            // does — so the caller gets a slower run rather than a race.
+            eprintln!(
+                "warmpool: another process has been building this snapshot for over {} s; \
+                 cold-booting instead",
+                wait.as_secs()
+            );
+            return Err(anyhow::anyhow!(
+                "timed out waiting for another process to finish building this snapshot"
+            ));
+        }
+    };
+
+    // The wait may have been spent watching the winner finish. Re-check under
+    // the lock: a second arrival should end up *using* the snapshot, not
+    // building a second one over the top of it.
+    if artifacts.is_complete() {
+        return Ok((artifacts, false));
+    }
+
     build(ctx, &artifacts).await?;
     Ok((artifacts, true))
+}
+
+/// How long a second arrival waits for whoever got here first.
+///
+/// Long enough to cover a real build — the several-second memory dump plus the
+/// builder VM's own boot — and bounded, because the fallback is a cold boot and
+/// a cold boot is never wrong. Waiting forever on a process that has wedged
+/// would turn one stuck builder into a stuck host.
+const BUILD_LOCK_WAIT: Duration = Duration::from_secs(90);
+/// How often the waiter retries the lock.
+const BUILD_LOCK_POLL: Duration = Duration::from_millis(200);
+
+/// Take the per-snapshot build lock, waiting up to `wait`.
+///
+/// `Ok(None)` means the lock was not taken — either because the holder finished
+/// (in which case the snapshot is now complete and the caller wants it) or
+/// because `wait` expired. The caller distinguishes them; both are handled and
+/// only the second is a failure.
+///
+/// `wait` is a parameter rather than the constant so a test can exercise the
+/// expiry without waiting [`BUILD_LOCK_WAIT`] for it.
+///
+/// The lock lives *inside* the keyhash directory rather than beside it so that
+/// `warmpool rm` — which removes whole directories and skips plain files —
+/// reclaims it along with everything else. A lock file the pruner cannot see is
+/// a lock file that accumulates forever.
+async fn acquire_build_lock(
+    artifacts: &SnapshotArtifacts,
+    wait: Duration,
+) -> Result<Option<std::fs::File>> {
+    let path = artifacts.dir.join(BUILD_LOCK_FILE);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match try_build_lock(&path) {
+            Ok(Some(file)) => return Ok(Some(file)),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("claiming the build lock {}", path.display())))
+            }
+        }
+        // Held by someone else. If they have finished, there is nothing left to
+        // wait for — return and let the caller find the completed snapshot.
+        if artifacts.is_complete() {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(BUILD_LOCK_POLL).await;
+    }
+}
+
+/// One non-blocking attempt at the build lock. Same shape as the network
+/// slot's claim: `O_NOFOLLOW`, a regular-file check, and `LOCK_EX | LOCK_NB`,
+/// so a crashed owner's lock is already gone and needs no staleness heuristic.
+fn try_build_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let kind = file.metadata()?.file_type();
+    if !kind.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file ({kind:?}); a build lock has to be one, so \
+                 isopod will not flock this and claim the build is held",
+                path.display()
+            ),
+        ));
+    }
+    // SAFETY: `flock` takes a raw fd and an operation, mutating no memory.
+    // `file` owns the descriptor and outlives the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let e = std::io::Error::last_os_error();
+    // EWOULDBLOCK (== EAGAIN) is the point of LOCK_NB: held, not broken.
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(e)
 }
 
 /// Generate a `dev-<8 hex>` VM id (shares the `dev-` prefix so the orphan reaper
@@ -548,8 +698,14 @@ async fn build(ctx: &BuildCtx<'_>, artifacts: &SnapshotArtifacts) -> Result<()> 
         std::fs::create_dir_all(&artifacts.dir)
             .with_context(|| format!("creating snapshot dir {}", artifacts.dir.display()))?;
         client.pause().await.context("PATCH /vm {Paused}")?;
-        let tmp_state = artifacts.dir.join("vmstate.partial");
-        let tmp_mem = artifacts.dir.join("memfile.partial");
+        // Staged under this process's own names. The build lock above is what
+        // makes concurrent builds safe; this is the belt to its braces, so that
+        // if the lock is ever lost — a refactor, a filesystem that does not
+        // honour `flock` — a loser can still only ever destroy its own bytes
+        // rather than publish half of somebody else's.
+        let stamp = std::process::id();
+        let tmp_state = artifacts.dir.join(format!("vmstate.{stamp}.partial"));
+        let tmp_mem = artifacts.dir.join(format!("memfile.{stamp}.partial"));
         client
             .create_snapshot(&SnapshotCreateParams::full(
                 tmp_state.to_string_lossy(),
@@ -610,7 +766,9 @@ fn write_meta(key: &SnapshotKey, artifacts: &SnapshotArtifacts) -> Result<()> {
         memfile_bytes,
     };
     let json = serde_json::to_string_pretty(&meta).context("serializing snapshot meta")?;
-    let tmp = artifacts.dir.join("meta.json.partial");
+    let tmp = artifacts
+        .dir
+        .join(format!("meta.json.{}.partial", std::process::id()));
     std::fs::write(&tmp, format!("{json}\n"))
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &artifacts.meta)
@@ -971,5 +1129,206 @@ mod tests {
         assert_eq!(back.keyhash, meta.keyhash);
         assert_eq!(back.memfile_bytes, 536_870_912);
         assert_eq!(back.key.base, "base-alpine");
+    }
+
+    // --- the build lock (dogfood finding #32) ---------------------------
+    //
+    // Unlocked, two runs of the same warm shape both saw an incomplete
+    // snapshot, both dumped hundreds of MiB into the same two fixed `.partial`
+    // names, and both renamed — one could publish a file the other was still
+    // writing, and every later resume would then get it. These exercise the
+    // lock itself; `ensure`'s use of it needs a real VM and is not unit-
+    // testable, so the mutation for this guard targets the call site.
+
+    fn artifacts_in(dir: &Path) -> SnapshotArtifacts {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        SnapshotArtifacts::in_dir(dir.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn one_builder_takes_the_lock_and_a_second_does_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = artifacts_in(&tmp.path().join("keyhash"));
+
+        let first = acquire_build_lock(&a, Duration::from_millis(50))
+            .await
+            .expect("no error")
+            .expect("the first builder must get the lock");
+
+        // The second arrival finds it held, and the snapshot never completes,
+        // so it gives up rather than building on top of the first.
+        let second = acquire_build_lock(&a, Duration::from_millis(50))
+            .await
+            .expect("no error");
+        assert!(second.is_none(), "two builders held the lock at once");
+
+        // And once the first is done, the lock is free again — flock releases
+        // on close, so a crashed builder needs no staleness heuristic.
+        drop(first);
+        assert!(
+            acquire_build_lock(&a, Duration::from_millis(50))
+                .await
+                .expect("no error")
+                .is_some(),
+            "the lock outlived its holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_waiter_stops_as_soon_as_the_snapshot_appears() {
+        // The case the wait exists for: the loser should end up *using* the
+        // winner's snapshot, and should not sit out the full timeout to learn
+        // that. A waiter that only ever expires would turn every concurrent
+        // second call into a 90-second stall.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = artifacts_in(&tmp.path().join("keyhash"));
+        let _held = acquire_build_lock(&a, Duration::from_millis(50))
+            .await
+            .expect("no error")
+            .expect("held");
+
+        // The winner publishes while the loser is waiting.
+        for f in [&a.vmstate, &a.memfile, &a.meta] {
+            std::fs::write(f, b"x").expect("publish");
+        }
+        assert!(a.is_complete());
+
+        let t0 = std::time::Instant::now();
+        let got = acquire_build_lock(&a, Duration::from_secs(30))
+            .await
+            .expect("no error");
+        assert!(got.is_none(), "the lock is still held by the winner");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the waiter sat out the timeout instead of noticing the snapshot \
+             was published: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_lock_is_inside_the_snapshot_directory_so_the_pruner_reclaims_it() {
+        // `warmpool rm` removes directories and skips plain files, so a lock
+        // beside the keyhash dir would survive every prune, forever.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("keyhash");
+        let a = artifacts_in(&dir);
+        let lock = try_build_lock(&dir.join(BUILD_LOCK_FILE))
+            .expect("no error")
+            .expect("locked");
+        assert!(dir.join(BUILD_LOCK_FILE).is_file());
+        drop(lock);
+        std::fs::remove_dir_all(&dir).expect("the pruner removes the whole dir");
+        assert!(!dir.exists());
+        // And it is not one of the three files completeness is judged on.
+        assert!(!a.is_complete());
+    }
+
+    #[test]
+    fn a_lock_path_that_is_not_a_regular_file_is_refused() {
+        // Same reasoning as the network slot's claim: flocking something that
+        // is not a file and reporting "held" would be a lie in the one
+        // direction that matters.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("keyhash");
+        std::fs::create_dir_all(dir.join(BUILD_LOCK_FILE)).expect("mkdir over the lock name");
+        let err = try_build_lock(&dir.join(BUILD_LOCK_FILE)).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("regular file")
+                || err.kind() == std::io::ErrorKind::IsADirectory,
+            "{err}"
+        );
+    }
+
+    /// A `BuildCtx` whose paths are never opened: every assertion below is
+    /// about what happens *before* a VM would be booted.
+    fn unusable_ctx(key: &SnapshotKey) -> BuildCtx<'_> {
+        BuildCtx {
+            fc_bin: Path::new("/nonexistent/firecracker"),
+            kernel: Path::new("/nonexistent/vmlinux"),
+            base_sqfs: Path::new("/nonexistent/base.sqfs"),
+            resources: Resources {
+                vcpus: key.vcpus,
+                mem_mib: key.mem_mib,
+            },
+            key,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_run_waits_for_the_first_and_then_reuses_what_it_published() {
+        // The finding, at the call site. Two runs of the same warm shape arrive
+        // together; the loser must end up USING the winner's snapshot. Before
+        // the lock it started its own build into the same fixed `.partial`
+        // names, which is how a half-written memory file got published.
+        //
+        // No VM is booted: the ctx's paths do not exist, so if this test ever
+        // reaches `build` it fails loudly rather than silently passing.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = artifacts_in(&tmp.path().join("keyhash"));
+        let key = sample_key();
+
+        let held = acquire_build_lock(&a, Duration::from_millis(50))
+            .await
+            .expect("no error")
+            .expect("the winner holds the lock");
+
+        // The winner finishes shortly after the loser starts waiting.
+        let publish = {
+            let a = SnapshotArtifacts::in_dir(a.dir.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                for f in [&a.vmstate, &a.memfile, &a.meta] {
+                    std::fs::write(f, b"x").expect("publish");
+                }
+                drop(held);
+            })
+        };
+
+        let ctx = unusable_ctx(&key);
+        let (got, built) = ensure_at(
+            SnapshotArtifacts::in_dir(a.dir.clone()),
+            &ctx,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the loser must succeed by reusing, not fail");
+        publish.await.expect("publisher");
+
+        assert!(!built, "the loser rebuilt a snapshot that already existed");
+        assert!(got.is_complete());
+        // And it left no staging file of its own behind.
+        let strays: Vec<_> = std::fs::read_dir(&a.dir)
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("partial"))
+            .collect();
+        assert!(strays.is_empty(), "the loser started writing: {strays:?}");
+    }
+
+    #[tokio::test]
+    async fn a_complete_snapshot_is_reused_without_taking_the_lock_at_all() {
+        // The control for the test above: the common path must not be made
+        // slower or lock-dependent by any of this.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = artifacts_in(&tmp.path().join("keyhash"));
+        for f in [&a.vmstate, &a.memfile, &a.meta] {
+            std::fs::write(f, b"x").expect("publish");
+        }
+        let key = sample_key();
+        let ctx = unusable_ctx(&key);
+        let (_, built) = ensure_at(
+            SnapshotArtifacts::in_dir(a.dir.clone()),
+            &ctx,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("reuse");
+        assert!(!built);
+        assert!(
+            !a.dir.join(BUILD_LOCK_FILE).exists(),
+            "the fast path took a lock it does not need"
+        );
     }
 }
