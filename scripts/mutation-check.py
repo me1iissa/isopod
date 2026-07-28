@@ -585,10 +585,74 @@ MUTATIONS = [
         package="isopod-oci-registry",
     ),
     Mutation(
+        name="oci-registry-hub-credential-goes-everywhere",
+        file="crates/oci-registry/src/lib.rs",
+        old="    if reference.is_default_registry() {\n        if key == HUB_LEGACY_KEY {\n            return true;\n        }\n    } else if key == HUB_LEGACY_KEY {\n        // Never a fallback for anyone else.\n        return false;\n    }",
+        new="    if key == HUB_LEGACY_KEY {\n        return true;\n    }",
+        defect=(
+            "The Docker Hub credential is offered to every registry again. Any "
+            "operator who has run `docker login` sends their Hub credential to "
+            "whatever registry they name next — on the first request, before "
+            "any challenge, and in the clear to a local one."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-realm-is-unfloored",
+        file="crates/oci-registry/src/auth.rs",
+        old="        if !destination_is_allowed(&realm, allow_local) {",
+        new="        if realm.scheme() != \"https\" && !is_loopback_url(&realm) {",
+        defect=(
+            "The token realm goes back to its own weaker check — https-or-"
+            "loopback with the loopback half ungated — so any registry can "
+            "point a credentialed request at the operator's loopback, their "
+            "private network, or the cloud metadata endpoint."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-credential-returns-after-a-hop",
+        file="crates/oci-registry/src/lib.rs",
+        old="                carry_credential &= auth::may_carry_credential(&current, &next);",
+        new="                carry_credential = auth::may_carry_credential(&current, &next);",
+        defect=(
+            "The credential flag is recomputed per hop instead of latching, so "
+            "a second redirect INSIDE the attacker's origin re-attaches the "
+            "token the first hop dropped. Two redirects instead of one defeat "
+            "the origin rule entirely."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-challenge-honoured-off-origin",
+        file="crates/oci-registry/src/lib.rs",
+        old="            if status == reqwest::StatusCode::UNAUTHORIZED && !challenged && carry_credential {",
+        new="            if status == reqwest::StatusCode::UNAUTHORIZED && !challenged {",
+        defect=(
+            "A host reached by redirect can challenge the client, so a CDN the "
+            "registry named gets to choose a token realm and be paid in the "
+            "operator's ~/.docker/config.json credential."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
+        name="oci-registry-ipv6-spelling-bypasses-the-floor",
+        file="crates/oci-registry/src/auth.rs",
+        old="            if let Some(v4) = embedded_ipv4(ip) {\n                return ipv4_is_allowed(v4, allow_local);\n            }",
+        new="            if false {\n                return ipv4_is_allowed(Ipv4Addr::UNSPECIFIED, allow_local);\n            }",
+        defect=(
+            "The floor judges an IPv6 literal's spelling rather than the IPv4 "
+            "address it names, so `[::ffff:169.254.169.254]` — the cloud "
+            "metadata endpoint — walks through a check written to block "
+            "`169.254.169.254`."
+        ),
+        package="isopod-oci-registry",
+    ),
+    Mutation(
         name="oci-registry-redirect-is-unfloored",
         file="crates/oci-registry/src/auth.rs",
-        old="pub fn redirect_target_is_allowed(to: &Url, allow_local: bool) -> bool {",
-        new="pub fn redirect_target_is_allowed(to: &Url, allow_local: bool) -> bool {\n    if true {\n        let _ = (to, allow_local);\n        return true;\n    }",
+        old="pub fn destination_is_allowed(to: &Url, allow_local: bool) -> bool {",
+        new="pub fn destination_is_allowed(to: &Url, allow_local: bool) -> bool {\n    if true {\n        let _ = (to, allow_local);\n        return true;\n    }",
         defect=(
             "A registry can aim a blob fetch anywhere, including "
             "169.254.169.254 and the operator's own loopback. Digest "

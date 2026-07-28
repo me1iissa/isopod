@@ -19,11 +19,15 @@
 //!   downloads to object storage as the ordinary path, so forwarding
 //!   `Authorization` through a redirect would hand a registry token to whatever
 //!   host the registry named. See [`auth::may_carry_credential`].
-//! - **A redirect cannot be aimed at the host's own network.** The publisher of
-//!   an image chooses where a blob fetch is redirected. Digest verification
-//!   stops them injecting content; it does not stop the request, and a request
-//!   to `169.254.169.254` is an SSRF from the operator's machine. See
-//!   [`auth::redirect_target_is_allowed`].
+//! - **Nothing the registry names can be aimed at the host's own network.** The
+//!   publisher of an image chooses where a blob fetch is redirected *and* which
+//!   token realm a challenge names. Digest verification stops them injecting
+//!   content; it does not stop the request, and a request to `169.254.169.254`
+//!   is an SSRF from the operator's machine — with a credential attached, in the
+//!   realm's case. One predicate governs both: [`auth::destination_is_allowed`].
+//! - **A credential belongs to the registry it was stored for.** The Docker Hub
+//!   entry in `~/.docker/config.json` authenticates to Docker Hub and to nothing
+//!   else, and no credential is sent to a host reached by redirect.
 //! - **Every blob is verified against the digest that named it, and nothing is
 //!   written under a name it does not hash to.** A blob is streamed to a
 //!   temporary file, hashed as it goes, and only then renamed to its
@@ -532,7 +536,14 @@ impl Puller {
             })?;
             let status = resp.status();
 
-            if status == reqwest::StatusCode::UNAUTHORIZED && !challenged {
+            // `carry_credential` gates the challenge too, not only the header.
+            // A 401 answered by a host this client was *redirected* to is that
+            // host asking for the registry's credential, and answering it means
+            // fetching a token from a realm that host chose and paying for it
+            // with the operator's `~/.docker/config.json` entry. A CDN has no
+            // business challenging us; if one does, the pull fails with its 401
+            // rather than starting a credentialed conversation with it.
+            if status == reqwest::StatusCode::UNAUTHORIZED && !challenged && carry_credential {
                 challenged = true;
                 let header = resp
                     .headers()
@@ -540,7 +551,7 @@ impl Puller {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                let challenge = Challenge::parse(&header)?;
+                let challenge = Challenge::parse(&header, self.reference.is_local())?;
                 self.token = Some(self.fetch_token(&challenge)?);
                 continue;
             }
@@ -559,7 +570,7 @@ impl Puller {
                     to: location.clone(),
                     detail: e.to_string(),
                 })?;
-                if !auth::redirect_target_is_allowed(&next, self.reference.is_local()) {
+                if !auth::destination_is_allowed(&next, self.reference.is_local()) {
                     return Err(PullError::Redirect {
                         to: next.to_string(),
                         detail: "it is not a public https address".into(),
@@ -567,7 +578,16 @@ impl Puller {
                 }
                 // The rule that matters most on this path: a blob redirect to
                 // object storage must not carry the registry's token.
-                carry_credential = auth::may_carry_credential(&current, &next);
+                //
+                // A **latch**, not a recomputation. `may_carry_credential`
+                // compares this hop's two ends, so once a redirect has taken us
+                // to the attacker's origin, every further hop *within* that
+                // origin compares their host to their host and says yes — and
+                // the credential the first hop correctly dropped comes back on
+                // the second. Two redirects instead of one defeated the whole
+                // rule. Once a credential has left its origin it does not
+                // return.
+                carry_credential &= auth::may_carry_credential(&current, &next);
                 current = next;
                 continue;
             }
@@ -666,27 +686,74 @@ fn is_index(media_type: &str) -> bool {
 /// behalf with no guest involved, and putting it there would blur the one
 /// boundary the store exists to draw.
 fn docker_config_auth(reference: &Reference) -> Option<String> {
-    let path = dirs_config()?.join(".docker/config.json");
+    docker_config_auth_in(&dirs_config()?.join(".docker/config.json"), reference)
+}
+
+/// Docker's legacy key for Hub. Nothing else is keyed this way.
+const HUB_LEGACY_KEY: &str = "https://index.docker.io/v1/";
+
+/// [`docker_config_auth`] against an explicit config path.
+///
+/// Split out because the real one reads `HOME`, which is process-global: a test
+/// that sets it steers every other test running beside it, and this session
+/// already lost an hour to exactly that in the import suite. The credential
+/// rule is the thing worth testing, and it does not need an environment.
+fn docker_config_auth_in(path: &Path, reference: &Reference) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let auths = json.get("auths")?.as_object()?;
-    // Docker keys Hub under a legacy URL, so the registry as written, the host
-    // it resolves to, and that URL all have to be tried.
-    let keys = [
-        reference.registry.clone(),
-        reference.host().to_string(),
-        "https://index.docker.io/v1/".to_string(),
-    ];
-    for key in keys {
-        if let Some(entry) = auths.get(&key) {
-            if let Some(auth) = entry.get("auth").and_then(|v| v.as_str()) {
-                if !auth.is_empty() {
-                    return Some(auth.to_string());
-                }
+
+    for (key, entry) in auths {
+        if !key_names_registry(key, reference) {
+            continue;
+        }
+        if let Some(auth) = entry.get("auth").and_then(|v| v.as_str()) {
+            // An empty `auth` is what Docker writes when the secret lives in a
+            // `credsStore`/`credHelpers` keychain instead. There is no
+            // credential here to send, and an empty `Basic ` header is not a
+            // degraded version of one.
+            if !auth.is_empty() {
+                return Some(auth.to_string());
             }
         }
     }
     None
+}
+
+/// Does a `config.json` key name the registry this pull is for?
+///
+/// Docker stores keys in several shapes (`ghcr.io`, `https://ghcr.io`,
+/// `https://ghcr.io/v1/`), so the key is reduced to the host it names before
+/// comparing — the same reduction Docker's own credential resolution does.
+///
+/// The Hub legacy key is matched **only for Hub**. It used to be tried for
+/// every registry, on the reasoning that Hub is keyed unusually and so the key
+/// has to be in the list. It does — but only when Hub is what was asked for.
+/// Unconditional, it meant any operator who had ever run `docker login` sent
+/// their Hub credential to every registry they subsequently named, on the first
+/// request, before any challenge.
+fn key_names_registry(key: &str, reference: &Reference) -> bool {
+    if reference.is_default_registry() {
+        if key == HUB_LEGACY_KEY {
+            return true;
+        }
+    } else if key == HUB_LEGACY_KEY {
+        // Never a fallback for anyone else.
+        return false;
+    }
+    let host = config_key_host(key);
+    // Exact host equality only. A key is not a pattern: `ghcr.io.evil.com`
+    // must not be answered with the credential for `ghcr.io`, and vice versa.
+    host == reference.registry || host == reference.host()
+}
+
+/// Reduce a `config.json` key to the host it names.
+fn config_key_host(key: &str) -> &str {
+    let k = key
+        .strip_prefix("https://")
+        .or_else(|| key.strip_prefix("http://"))
+        .unwrap_or(key);
+    k.split('/').next().unwrap_or(k)
 }
 
 fn dirs_config() -> Option<PathBuf> {

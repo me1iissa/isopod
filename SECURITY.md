@@ -176,6 +176,67 @@ A run started with `--inject <alias>` (or MCP `inject`) can authorise specific r
 
 ---
 
+## Importing an OCI image — code that runs before any VM
+
+`isopod image import` is the one part of isopod that processes attacker-authored
+bytes **on the host, as the operator's user, with no VM between them**. Every
+other guarantee in this document is about confining a guest; this is outside
+that boundary by construction. The registry is assumed hostile: the challenge,
+every redirect `Location`, every media type, every declared size and every byte
+is its text.
+
+### What holds
+
+- **Layers are unpacked by a confined extractor, not by `tar`.** Paths are
+  normalised and confined against the *logical tree being built*, never against
+  the host filesystem; every parent component is opened `O_NOFOLLOW` from a
+  directory fd, so a symbolic link planted by layer *N* cannot redirect a write
+  in layer *N+1*. Hard-link targets get the same check. Device and FIFO entries
+  are skipped and reported, never created.
+- **No setuid, setgid or sticky bit is ever written to the host tree.** They are
+  recorded and applied inside the squashfs at pack time, so attacker-authored
+  setuid files never exist in the operator's home directory. A bit survives only
+  if the finished tree still carries it.
+- **Every blob is verified against the digest that named it**, as a whole file,
+  before its bytes are used — layers are verified in a full pass *before* the
+  reader is handed out, because `tar` stops at the end-of-archive marker and
+  verifying as the caller reads verifies only part of a blob. Nothing is written
+  under a name it does not hash to.
+- **A credential belongs to the registry it was stored for.** The Docker Hub
+  entry in `~/.docker/config.json` authenticates to Docker Hub and to nothing
+  else. Keys are matched by host, exactly — `ghcr.io.evil.com` is not `ghcr.io`.
+- **`Authorization` never crosses an origin, and does not come back.** The flag
+  is a latch: once a redirect has left the origin the credential belongs to, no
+  later hop re-attaches it. A host reached *by redirect* also cannot trigger the
+  token dance — a CDN does not get to name a realm and be paid in the operator's
+  credential.
+- **A token realm gets the same destination floor a redirect target gets** — the
+  same predicate, not a second one. `https://169.254.169.254/` is https and is
+  the cloud metadata endpoint; both are refused. IPv4-mapped, IPv4-compatible
+  and NAT64 spellings of a blocked address are reduced to the address they name.
+- **The loopback exemption belongs to the operator**, not the registry. It
+  applies only when the operator themselves named a loopback registry.
+
+### What is explicitly **not** claimed
+
+- **The destination floor here judges the URL, not the resolved address.** The
+  guest egress broker resolves first and checks the address it got; this
+  client's floor screens IP literals and hostnames but does not re-check what a
+  name resolves to, so a registry-controlled DNS name pointing into the
+  operator's network is not stopped by it, and neither is a rebind between the
+  check and the connection. Do not read this floor as equivalent to the
+  broker's — it is a floor on the obvious cases, not a resolved-address gate.
+- **An imported image's contents are not vetted.** isopod runs your image's
+  filesystem; if you import something hostile, you have imported something
+  hostile. The claims above are about the *import* not compromising the host,
+  not about the image being safe to run.
+- **`~/.docker/config.json` credentials are read from disk in plaintext.**
+  `credsStore`/`credHelpers` keychains are not consulted, so an operator using
+  one simply gets no credential (and a clean 401) rather than a keychain prompt.
+- **Import is not sandboxed.** The extractor is careful, and carefulness is not
+  a boundary. Importing an image from a registry you would not run code from is
+  a decision, not a routine operation.
+
 ## Guidance for operators
 
 - **Enable the jail for untrusted code:** set `ISOPOD_JAIL=1` for the runtime, and/or run adversarial code with networking off (`isopod run --no-network -- …` / `sandbox_run(..., network=false)`).

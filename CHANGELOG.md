@@ -8,6 +8,68 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Fixed — five credential and SSRF defects in the registry client
+
+An adversarial pass scoped to `isopod-oci-registry`, the wave-2 exit criterion.
+The crate had never had one. Six attackers over separate surfaces, every serious
+finding then handed to a skeptic told to refute it. Each defect below was
+reproduced before it was fixed.
+
+**The Docker Hub credential was sent to every registry.** `docker_config_auth`
+tried three keys and returned the first hit; the third was Docker Hub's legacy
+`https://index.docker.io/v1/` key, tried **unconditionally**. So any operator who
+had ever run `docker login` sent that credential to whatever registry they named
+next — `isopod image import evil.example.com/x/y` handed it over on the *first*
+request, before any challenge, with no redirect and no hostile-registry
+behaviour required. For a `localhost` reference the scheme is `http`, so it went
+in the clear. Measured with a config containing only the Hub key: all six
+references tested came back with the Hub credential. The legacy key is now
+consulted only when the reference actually names Hub, and keys are matched to
+the host they name — `ghcr.io.evil.com` is not `ghcr.io`.
+
+**A token realm had no destination floor.** `Challenge::parse` required only
+that the realm be https *or* loopback — and the loopback half was ungated, while
+the identical exemption on the redirect path was gated on the operator having
+named a local registry. So a remote registry could answer `401` with
+`realm="http://localhost:5000/token"` and have the client post the operator's
+credential, in the clear, to whatever was listening on their own machine; or
+name `https://169.254.169.254/`, which is https and is the cloud metadata
+endpoint. The realm now goes through the same predicate a redirect target does.
+One floor, not two, because the second one was the weaker one and it was on the
+path that carries a credential.
+
+**A credential dropped at one hop came back at the next.** `carry_credential`
+was recomputed per hop from `may_carry_credential(current, next)`, which compares
+the two ends of one hop. Once a redirect had taken the client to the attacker's
+origin, the next hop compared their host to their host, said yes, and
+re-attached the token the first hop correctly dropped. Two redirects instead of
+one defeated the origin rule entirely. It is now a latch. The predicate was
+never wrong — the loop threw its answer away — so this is caught by a
+fake-registry test that redirects twice, not by a unit test of the predicate.
+
+**A host reached by redirect could start the token dance.** The `401` branch did
+not consult `carry_credential`, so a CDN the registry redirected to could
+challenge the client, name a realm, and be paid in the operator's
+`~/.docker/config.json` credential. A CDN has no business challenging us; the
+pull now fails with its 401.
+
+**IPv6 spellings walked through the SSRF floor.** The floor screened
+`169.254.169.254` and matched IPv6 by prefix, so `[::ffff:169.254.169.254]` —
+the same address, IPv4-mapped — was allowed, as were the IPv4-compatible and
+NAT64 (`64:ff9b::`) spellings, and CGNAT space. An IPv6 literal is now reduced
+to the IPv4 address it names before the rules are applied. The crate's own doc
+had claimed this was "the same destination floor the guest egress broker
+applies"; the broker handles mapped spellings and this did not, so the claim was
+false as well as the code being wrong.
+
+`SECURITY.md` gains an import section stating what holds and what is not
+claimed — in particular that this floor judges the URL, not the resolved
+address, so it is not equivalent to the broker's resolved-address gate.
+
+One existing test asserted a vulnerable behaviour (`http://localhost:5000` as an
+acceptable realm) and now asserts the fix, which is the second time this session
+a test had encoded the defect it was named for.
+
 ### Added — a run can boot an imported base, and its config becomes run defaults
 
 `--base oci:<name>` (and the same over MCP) boots an imported image. Verified

@@ -161,6 +161,14 @@ impl Reference {
         }
     }
 
+    /// `true` when this reference names Docker Hub, which is the only registry
+    /// Docker keys under a legacy URL rather than under its own host — so it is
+    /// the only one whose credential lookup may consult that key.
+    #[must_use]
+    pub fn is_default_registry(&self) -> bool {
+        self.registry == DEFAULT_REGISTRY
+    }
+
     /// `true` for a registry that may be reached over plain HTTP without the
     /// operator saying so: a loopback one, which cannot be a third party.
     #[must_use]
