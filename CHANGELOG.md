@@ -8,6 +8,37 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Added — a run can boot an imported base, and its config becomes run defaults
+
+`--base oci:<name>` (and the same over MCP) boots an imported image. Verified
+live: `alpine:3.20` pulled from Docker Hub, imported and cold-booted in ~0.8 s
+running a command as root, then committed as a stage and forked — the stage
+records `oci:alpine-3.20` with the image's content id, and the fork resolves it
+back without `--base`.
+
+Base selection is now a `BaseRef`: a closed type at the CLI and MCP edge, plain
+`(slug, digest)` strings everywhere the choice is persisted. `StageMeta::base`,
+`BaseId` and `SnapshotKey::base` were already strings, so nothing stored
+changed and no stage needed migrating — a `RootfsFlavor::Imported` variant would
+have rippled through every match on the enum instead. The `oci:` prefix is
+required: a bare name would collide with the flavor slugs the moment somebody
+imported an image called `base-alpine`, and an unknown base now says how an
+imported one is spelled.
+
+The image config becomes **defaults, never behaviour**. `Env` is merged *under*
+the run's own environment and `WorkingDir` is used only when the run names no
+cwd, so a `python:3.12` base finds `python` on `PATH` without the caller
+restating it, while a run that sets `PATH` still wins. Verified both ways, with
+a built-in base as the control: it keeps the agent's baseline `PATH` and picks
+up nothing.
+
+The defaults come from the base the run **actually resolved**, not from the
+`--base` field. A fork boots the base its stage recorded and ignores `--base`,
+so reading the caller's field would apply one image's environment to a run
+booting a different image. A `WorkingDir` of `/` or `""` is treated as "no
+opinion" rather than forced onto the run, and an `Env` entry with no `=` is
+skipped rather than half-guessed.
+
 ### Added — `isopod image import`
 
 Three ways in, one path after that:

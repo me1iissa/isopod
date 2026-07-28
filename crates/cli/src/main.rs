@@ -364,7 +364,7 @@ fn run_warmpool(cmd: WarmpoolCommand) -> i32 {
             vcpus,
             mem_mib,
         } => {
-            emit(RootfsFlavor::from_slug(&base).and_then(|b| vm::warmpool_build(b, vcpus, mem_mib)))
+            emit(image::BaseRef::parse(&base).and_then(|b| vm::warmpool_build(&b, vcpus, mem_mib)))
         }
         WarmpoolCommand::List => emit(
             isopod_core::snapshot::list()
@@ -470,10 +470,11 @@ fn run_run(args: RunArgs) -> i32 {
             );
         }
         let base_slug = args.base.as_deref().unwrap_or("base-sqfs");
-        let base = RootfsFlavor::from_slug(base_slug)?;
+        let base = image::BaseRef::parse(base_slug)?;
         if !base.is_squashfs_base() {
             anyhow::bail!(
-                "--base {base_slug} is not a squashfs base (use base-sqfs or base-alpine)"
+                "--base {base_slug} is not a squashfs base (use base-sqfs, base-alpine, \
+                 or an imported `oci:<name>`)"
             );
         }
         let env = vm::parse_env_kv(&args.env)?;

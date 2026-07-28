@@ -545,6 +545,28 @@ MUTATIONS = [
         ),
         package="isopod-oci-unpack",
     ),
+    Mutation(
+        name="oci-image-env-overrides-the-run",
+        file="crates/core/src/image/base.rs",
+        old="            .filter(|(k, _)| !named.contains(k.as_str()))",
+        new="            .filter(|(k, _)| named.contains(k.as_str()) || true)",
+        defect=(
+            "An imported image's Env wins over the run's own, so a base image "
+            "silently overrides the PATH, proxy settings or credentials the "
+            "caller explicitly set. The config is meant to be a DEFAULT: the "
+            "run names it, the run gets it."
+        ),
+    ),
+    Mutation(
+        name="oci-working-dir-overrides-the-run",
+        file="crates/core/src/image/base.rs",
+        old="        if cwd.is_none() {\n            cwd.clone_from(&self.cwd);\n        }",
+        new="        if true {\n            cwd.clone_from(&self.cwd);\n        }",
+        defect=(
+            "The image's WorkingDir replaces a cwd the run asked for, so a run "
+            "that names a directory silently executes somewhere else."
+        ),
+    ),
     # --- isopod-oci-registry ----------------------------------------------
     # The network half of an import. Its guards are not about tar at all: they
     # are about where a credential may travel and where a request may be aimed.

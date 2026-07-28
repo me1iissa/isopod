@@ -33,7 +33,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use isopod_core::image::RootfsFlavor;
+use isopod_core::image::{self, RootfsFlavor};
 use isopod_core::stage::{self, StageMeta};
 use isopod_core::vm::{self, RunOptions, RunReport};
 
@@ -768,20 +768,21 @@ issue calls from separate agents.",
         // Resolve the base flavor (only used for a fresh `base` run; forks reuse
         // the stage's recorded base). Default to the toolchain image via MCP.
         let base = match p.base.as_deref() {
-            None => RootfsFlavor::BaseAlpine,
+            None => image::BaseRef::Builtin(RootfsFlavor::BaseAlpine),
             Some(slug) => {
-                let flavor = RootfsFlavor::from_slug(slug).map_err(|e| {
+                let base = image::BaseRef::parse(slug).map_err(|e| {
                     ErrorData::invalid_params(format!("invalid base {slug:?}: {e}"), None)
                 })?;
-                if !flavor.is_squashfs_base() {
+                if !base.is_squashfs_base() {
                     return Err(ErrorData::invalid_params(
                         format!(
-                            "base {slug:?} is not a squashfs base (use base-alpine or base-sqfs)"
+                            "base {slug:?} is not a squashfs base (use base-alpine, \
+                             base-sqfs, or an imported `oci:<name>`)"
                         ),
                         None,
                     ));
                 }
-                flavor
+                base
             }
         };
 

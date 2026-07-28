@@ -758,10 +758,11 @@ pub struct RunOptions {
     /// After a clean run, commit the scratch upperdir as a new stage with this
     /// label. Only honoured in the overlay topology (requires [`stage`](Self::stage)).
     pub commit_as: Option<String>,
-    /// Squashfs base image the overlay topology boots as `vda` (only used with
-    /// [`stage`](Self::stage)): [`RootfsFlavor::BaseSqfs`] (busybox, default) or
-    /// [`RootfsFlavor::BaseAlpine`] (python/node/git/gcc toolchain).
-    pub base: RootfsFlavor,
+    /// Base image the overlay topology boots as `vda` (only used with
+    /// [`stage`](Self::stage)): a built-in squashfs flavor (`base-sqfs`,
+    /// busybox, the default; or `base-alpine`, the python/node/git/gcc
+    /// toolchain), or an imported image spelled `oci:<name>`.
+    pub base: image::BaseRef,
     /// Bytes written to the command's stdin (then closed). `None` = no stdin.
     pub stdin: Option<Vec<u8>>,
     /// Requested guest vCPU count. Validated against the host CPU count (and
@@ -1141,7 +1142,7 @@ pub fn parse_env_kv(items: &[String]) -> Result<Vec<(String, String)>> {
 /// # Errors
 /// Returns an error if an artifact cannot be resolved, the VMM fails to boot,
 /// the agent never becomes ready, or the exec RPC fails.
-pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
+pub fn run_ephemeral(mut opts: RunOptions) -> Result<RunReport> {
     if opts.argv.is_empty() {
         bail!("run_ephemeral requires a non-empty argv");
     }
@@ -1217,7 +1218,7 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
     // layers + fresh scratch); without it, boot the legacy dev-agent ext4
     // exactly as M2 did (zero regression).
     let plan = match &opts.stage {
-        Some(stage_ref) => resolve_stage_plan(stage_ref, opts.base)?,
+        Some(stage_ref) => resolve_stage_plan(stage_ref, &opts.base)?,
         None => {
             let (rootfs, flavor_slug) = resolve_rootfs(opts.flavor)?;
             BootPlan::Flavor {
@@ -1226,6 +1227,22 @@ pub fn run_ephemeral(opts: RunOptions) -> Result<RunReport> {
             }
         }
     };
+
+    // An imported base contributes DEFAULTS, never behaviour. Taken from the
+    // base the plan actually resolved rather than from `opts.base`, because a
+    // fork boots the base the STAGE recorded and `--base` is ignored for one —
+    // reading the caller's field here would apply one image's PATH to a run
+    // booting a different image entirely.
+    if let BootPlan::Stage { base, .. } = &plan {
+        let base_ref = image::BaseRef::parse(&base.flavor)?;
+        if let Some(prov) = base_ref.provenance_in(&paths::images_dir()?)? {
+            image::RunDefaults::from_provenance(&prov).apply(&mut opts.env, &mut opts.cwd);
+            // The merged list is what actually reaches the guest, so it gets
+            // the same validation the caller's own env got above. An image is
+            // free to ship an `Env` entry the exec surface will not carry.
+            validate_env(&opts.env)?;
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1313,7 +1330,7 @@ const ALLOW_BASE_SKEW_VAR: &str = "ISOPOD_ALLOW_BASE_SKEW";
 /// Resolve a `--stage <ref>` into a [`BootPlan::Stage`]: locate the squashfs
 /// base, and (unless `ref` is the reserved word `base`) resolve the stage, check
 /// it against the base image on this host, and resolve its full layer chain.
-fn resolve_stage_plan(stage_ref: &str, base: RootfsFlavor) -> Result<BootPlan> {
+fn resolve_stage_plan(stage_ref: &str, base: &image::BaseRef) -> Result<BootPlan> {
     resolve_stage_plan_in(
         &paths::stages_dir()?,
         &paths::images_dir()?,
@@ -1332,7 +1349,7 @@ fn resolve_stage_plan_in(
     stages_root: &Path,
     images_dir: &Path,
     stage_ref: &str,
-    base: RootfsFlavor,
+    base: &image::BaseRef,
     allow_base_skew: bool,
 ) -> Result<BootPlan> {
     // A fresh `--stage base` run uses the requested base flavor. Forking an
@@ -1341,8 +1358,8 @@ fn resolve_stage_plan_in(
     // produce a broken merge; the recorded base is authoritative and `--base` is
     // ignored for forks (removing a silent footgun).
     if stage_ref == STAGE_BASE {
-        let base_sqfs = image::base_image_path_in(images_dir, base)?;
-        let base_id = base_identity(&base_sqfs, base.slug());
+        let base_sqfs = base.image_path_in(images_dir)?;
+        let base_id = base_identity(&base_sqfs, &base.slug());
         return Ok(BootPlan::Stage {
             base_sqfs,
             base: base_id,
@@ -1352,13 +1369,13 @@ fn resolve_stage_plan_in(
         });
     }
     let meta = stage::resolve_in(stages_root, stage_ref)?;
-    let recorded_base = RootfsFlavor::from_slug(&meta.base)?;
-    let base_sqfs = image::base_image_path_in(images_dir, recorded_base)?;
+    let recorded_base = image::BaseRef::parse(&meta.base)?;
+    let base_sqfs = recorded_base.image_path_in(images_dir)?;
     // Same slug, possibly a different build: `isopod image build-all` replaces
     // the root these layers were made over, and an overlay merge onto the wrong
     // root succeeds silently. Refuse before anything boots — and judge the whole
     // chain, since every ancestor's layers get mounted, not just the tip's.
-    let base_id = base_identity(&base_sqfs, recorded_base.slug());
+    let base_id = base_identity(&base_sqfs, &recorded_base.slug());
     let verdict = stage::check_base_chain_in(stages_root, &meta, &base_id)?;
     enforce_base_compat_with(verdict, allow_base_skew)?;
     let layer_paths = stage::chain_paths_in(stages_root, &meta)?;
@@ -1733,7 +1750,7 @@ fn build_snapshot_key(
     let kernel_id = snapshot::kernel_identity(kernel)?;
     // The image's sidecar sha (cheap) keys content into the snapshot, so a
     // rebuilt base gets fresh snapshots instead of stale resumes (finding #25).
-    let base_sha = image::base_content_id(RootfsFlavor::from_slug(base_flavor)?)?;
+    let base_sha = image::BaseRef::parse(base_flavor)?.content_id()?;
     Ok(SnapshotKey::new(
         fc_build,
         kernel_id,
@@ -1814,10 +1831,15 @@ pub struct WarmpoolBuildReport {
 /// # Errors
 /// If `base` is not a squashfs base, host setup has not run, an artifact cannot
 /// be resolved, the resource shape is out of range, or the build fails.
-pub fn warmpool_build(base: RootfsFlavor, vcpus: u32, mem_mib: u32) -> Result<WarmpoolBuildReport> {
+pub fn warmpool_build(
+    base: &image::BaseRef,
+    vcpus: u32,
+    mem_mib: u32,
+) -> Result<WarmpoolBuildReport> {
     if !base.is_squashfs_base() {
         bail!(
-            "--base {} is not a squashfs base (use base-sqfs or base-alpine)",
+            "--base {} is not a squashfs base (use base-sqfs, base-alpine, or an \
+             imported `oci:<name>`)",
             base.slug()
         );
     }
@@ -1831,8 +1853,8 @@ pub fn warmpool_build(base: RootfsFlavor, vcpus: u32, mem_mib: u32) -> Result<Wa
     let resources = resources::resolve_for_host(vcpus, mem_mib)?;
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
-    let base_sqfs = image::base_image_path(base)?;
-    let key = build_snapshot_key(&fc, &kernel, base.slug(), resources)?;
+    let base_sqfs = base.image_path()?;
+    let key = build_snapshot_key(&fc, &kernel, &base.slug(), resources)?;
     let artifacts = snapshot::artifacts_for(&key)?;
     let cached = artifacts.is_complete();
 
@@ -2854,7 +2876,7 @@ mod tests {
             network: false,
             stage: None,
             commit_as: None,
-            base: RootfsFlavor::BaseSqfs,
+            base: image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
             stdin: None,
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
@@ -3221,8 +3243,14 @@ mod tests {
         let s = stage_in(&stages, home.path(), "env", None, Some("1111aaaa2222bbbb"));
 
         // Same image: the resolver produces a plan carrying that image.
-        let plan = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, false)
-            .expect("the image the stage was built on must resolve");
+        let plan = resolve_stage_plan_in(
+            &stages,
+            &images,
+            "env",
+            &image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
+            false,
+        )
+        .expect("the image the stage was built on must resolve");
         match &plan {
             BootPlan::Stage {
                 layer_paths,
@@ -3239,13 +3267,25 @@ mod tests {
 
         // Rebuilt image: refused here, before any disk is prepared.
         fake_base_image(&images, Some("9999ffff8888eeee"));
-        let err = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, false)
-            .expect_err("the run path must consult the base check, not merely define it");
+        let err = resolve_stage_plan_in(
+            &stages,
+            &images,
+            "env",
+            &image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
+            false,
+        )
+        .expect_err("the run path must consult the base check, not merely define it");
         assert!(format!("{err:#}").contains("rebuilt since"), "{err:#}");
 
         // ...and the opt-in reaches the plan, so the commit honours the same answer.
-        let plan = resolve_stage_plan_in(&stages, &images, "env", RootfsFlavor::BaseSqfs, true)
-            .expect("the opt-in boots it");
+        let plan = resolve_stage_plan_in(
+            &stages,
+            &images,
+            "env",
+            &image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
+            true,
+        )
+        .expect("the opt-in boots it");
         match &plan {
             BootPlan::Stage {
                 allow_base_skew, ..
@@ -3295,7 +3335,7 @@ mod tests {
             network: false,
             stage: Some("parent".into()),
             commit_as: Some("child".into()),
-            base: RootfsFlavor::BaseSqfs,
+            base: image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
             stdin: None,
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
@@ -3348,8 +3388,14 @@ mod tests {
         // The image now records something neither of them was built on.
         fake_base_image(&images, Some("9999ffff8888eeee"));
 
-        let err = resolve_stage_plan_in(&stages, &images, "b", RootfsFlavor::BaseSqfs, false)
-            .expect_err("an ancestor built over a vanished root must refuse the whole chain");
+        let err = resolve_stage_plan_in(
+            &stages,
+            &images,
+            "b",
+            &image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
+            false,
+        )
+        .expect_err("an ancestor built over a vanished root must refuse the whole chain");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&a.stage_id),
@@ -3362,8 +3408,14 @@ mod tests {
 
         // Positive control: with the ancestor's own image back, it boots.
         fake_base_image(&images, Some("1111aaaa2222bbbb"));
-        resolve_stage_plan_in(&stages, &images, "b", RootfsFlavor::BaseSqfs, false)
-            .expect("the chain is sound against the image it was built on");
+        resolve_stage_plan_in(
+            &stages,
+            &images,
+            "b",
+            &image::BaseRef::Builtin(RootfsFlavor::BaseSqfs),
+            false,
+        )
+        .expect("the chain is sound against the image it was built on");
     }
 
     // --- filtered egress ---------------------------------------------------

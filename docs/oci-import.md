@@ -50,6 +50,30 @@ surface is `/bin/sh -c <command>`, so a distroless or scratch-based image cannot
 run anything; the alternative to refusing is an exit 127 inside a VM long after
 the import looked like it worked.
 
+## Using an imported base
+
+An imported base is spelled `oci:<name>` wherever a base is named:
+
+```bash
+isopod image import alpine:3.20
+isopod run --stage base --base oci:alpine-3.20 -- /bin/sh -c 'cat /etc/alpine-release'
+isopod run --stage base --base oci:alpine-3.20 --commit-as myproj/deps -- apk add curl
+isopod run --stage myproj/deps -- curl --version     # the recorded base boots
+```
+
+The prefix is not decoration. A bare name would collide with the built-in flavor
+slugs the moment somebody imported an image called `base-alpine`, and "which one
+did it boot?" is not a question to have about a root filesystem.
+
+A stage records the base it was built on, so a fork boots that base and ignores
+`--base` — the layers were made over that root, and merging them onto a
+different one succeeds silently and wrongly.
+
+The image's `Env` and `WorkingDir` are applied as defaults on every run that
+boots the base, **including a fork**, taken from the base the run actually
+resolved rather than from what was typed. Without that a `python:3.12` base does
+not find `python` on `PATH`.
+
 ## What the import actually changes
 
 Deliberately little. Every byte of it is a difference between the image you

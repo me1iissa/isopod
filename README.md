@@ -304,10 +304,9 @@ isopod vm gc --keep-last 20
 isopod warmpool build
 isopod warmpool list
 
-# Import a container image as a bootable base.
+# Import a container image as a bootable base, then run on it.
 isopod image import alpine:3.20
-isopod image import --oci-layout ./layout --name my-base
-isopod image import --docker-save ./saved.tar --name my-base
+isopod run --stage base --base oci:alpine-3.20 -- /bin/sh -c 'cat /etc/alpine-release'
 ```
 
 Every subcommand prints exactly one JSON object to stdout (human-readable logs go to stderr), so the CLI, the MCP server, humans, and CI all drive the same core.
@@ -324,6 +323,8 @@ Every subcommand prints exactly one JSON object to stdout (human-readable logs g
 | `WorkingDir` | the run's default working directory |
 | `Entrypoint` / `Cmd` | recorded, **never executed** |
 | `User` | **ignored** — the agent execs as root |
+
+An imported base is named `oci:<name>` wherever a base is named — `--base oci:alpine-3.20`, and the same over MCP. A stage committed on one records it, so a fork boots the base it was built on. The image's `Env` and `WorkingDir` become run **defaults**, applied under whatever the run itself sets, so a `python:3.12` base finds `python` on `PATH` without the caller restating it.
 
 The adaptation is deliberately small: the agent at `/.isopod/init` with `/init` pointing at it, the three empty overlay mountpoints, and a `/tmp` if the image ships none. The image's own `/sbin/init` is left alone. An image with **no `/bin/sh` is refused by name at import time**, since the exec surface is `/bin/sh -c` and the alternative is an exit 127 inside a VM.
 
