@@ -480,6 +480,107 @@ fn a_directory_that_denies_its_owner_write_is_still_built_into() {
     assert_eq!(text(&case.at("locked/b")), "2");
 }
 
+#[test]
+fn a_deferred_mode_survives_its_directory_being_replaced_by_anything() {
+    // The neighbours of "a later layer deleted it". A restrictive directory
+    // mode waits for `finish`, and by then the path may be a file, a symbolic
+    // link, or gone. Only the first two of those were handled: the link arrived
+    // at the deferred walk as a `SymlinkEscape` and refused the whole image at
+    // the very last step, after every layer had been unpacked.
+    //
+    // `/lib -> usr/lib` is not a contrived shape — it is how every usrmerge
+    // image is built, and 0o555 is an ordinary mode for a directory a lower
+    // layer shipped read-only. An escape message accusing the author of
+    // hand-crafting an attack is the wrong answer to it.
+    let mut base = Layer::new();
+    base.dir("./lib", 0o555)
+        .file("./lib/libc.so", 0o644, b"ELF");
+    let base = base.done();
+
+    // Replaced by a symbolic link: the usrmerge case.
+    let case = Case::new();
+    let mut l2 = Layer::new();
+    l2.symlink("./lib", "usr/lib");
+    case.run(&[base.clone(), l2.done()])
+        .expect("an image that merges /lib into /usr must import");
+    assert!(
+        std::fs::symlink_metadata(case.at("lib"))
+            .expect("lib")
+            .is_symlink(),
+        "the later layer's link is what survives"
+    );
+
+    // Replaced by a file, and removed outright — the two that already worked,
+    // kept here so the trio cannot drift apart again.
+    let case = Case::new();
+    let mut l2 = Layer::new();
+    l2.file("./lib", 0o644, b"now a file");
+    case.run(&[base.clone(), l2.done()]).expect("must import");
+    assert_eq!(text(&case.at("lib")), "now a file");
+
+    let case = Case::new();
+    let mut l2 = Layer::new();
+    l2.whiteout("./.wh.lib");
+    case.run(&[base.clone(), l2.done()]).expect("must import");
+    assert!(!there(&case.at("lib")), "the whiteout removed it");
+}
+
+#[test]
+fn the_operators_umask_never_reaches_the_unpacked_tree() {
+    // `mkdirat`'s mode argument is masked by the process umask, so a directory
+    // this crate creates on its own — one no entry describes, brought into
+    // being only because something below it had to be written — took its mode
+    // from the operator's shell. Under `umask 077` every implicit directory in
+    // the image came out 0o700 instead of 0o755, and so did the image root.
+    //
+    // That is not only wrong, it is *unstable*: the pack step turns this tree
+    // into an image whose sha256 is its identity, so the same source image
+    // would import to two different images on two hosts.
+    //
+    // umask is per-process and Rust runs tests as threads in one process, so
+    // setting it here would corrupt every other test's mode assertions. The
+    // test re-executes its own binary under a hostile umask instead and
+    // asserts on what that child produced. `sh -c '…' <exe>` passes the path as
+    // `$0`, so nothing about it is interpreted as script.
+    const MARKER: &str = "ISOPOD_OCI_UNPACK_UMASK_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let exe = std::env::current_exe().expect("test binary");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "umask 077; exec \"$0\" --exact \
+                 tests::the_operators_umask_never_reaches_the_unpacked_tree --nocapture",
+            )
+            .arg(&exe)
+            .env(MARKER, "1")
+            .status()
+            .expect("re-exec the test binary under a hostile umask");
+        assert!(
+            status.success(),
+            "under `umask 077` the unpacked tree came out with different modes"
+        );
+        return;
+    }
+
+    let case = Case::new();
+    let mut l = Layer::new();
+    // No entry describes `deep` or `deep/er`; they exist only because the file
+    // does. `explicit` and `readonly` are described, and must keep the modes
+    // the archive gave them — the immediate path and the deferred one.
+    l.file("./deep/er/f", 0o644, b"x")
+        .dir("./explicit", 0o750)
+        .dir("./readonly", 0o555)
+        .file("./readonly/g", 0o600, b"y");
+    case.run(&[l.done()]).expect("must unpack");
+
+    assert_eq!(mode_of(&case.dest()), 0o755, "the image root");
+    assert_eq!(mode_of(&case.at("deep")), 0o755, "an implicit directory");
+    assert_eq!(mode_of(&case.at("deep/er")), 0o755, "a deeper implicit one");
+    assert_eq!(mode_of(&case.at("deep/er/f")), 0o644, "the file's own mode");
+    assert_eq!(mode_of(&case.at("explicit")), 0o750, "the archive's mode");
+    assert_eq!(mode_of(&case.at("readonly")), 0o555, "the deferred mode");
+}
+
 // --- limits -------------------------------------------------------------
 
 #[test]

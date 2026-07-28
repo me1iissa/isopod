@@ -509,6 +509,51 @@ MUTATIONS = [
         package="isopod-oci-unpack",
     ),
     Mutation(
+        name="oci-implicit-directory-takes-the-umask",
+        file="crates/oci-unpack/src/lib.rs",
+        old=(
+            "                    // `mkdirat`'s mode is masked by the umask; the image's\n"
+            "                    // layout must not depend on the operator's shell.\n"
+            "                    made.chmod(DIR_MODE).map_err(|e| io(&e))?;\n"
+        ),
+        new="",
+        defect=(
+            "A directory the extractor creates on its own goes back to taking "
+            "its mode from `mkdirat`, which the kernel masks with the process "
+            "umask. Under `umask 077` every implicit directory in the image "
+            "comes out 0o700, so the same source image imports to a different "
+            "image — and therefore a different content id — on two hosts."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-image-root-takes-the-umask",
+        file="crates/oci-unpack/src/lib.rs",
+        old="        if let Err(e) = root.chmod(DIR_MODE) {",
+        new="        if let Err(e) = root.chmod(0o700) {",
+        defect=(
+            "The root of the unpacked image gets a mode of its own rather than "
+            "the one every other implicit directory has. `create_dir` asks for "
+            "0o777 and gets it masked, so without an explicit mode the image "
+            "root is whatever the operator's shell was set to."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-deferred-mode-refuses-a-usrmerge-link",
+        file="crates/oci-unpack/src/lib.rs",
+        old="                Err(Refusal::SymlinkEscape { .. }) => continue,",
+        new="",
+        defect=(
+            "A deferred directory mode whose path a later layer replaced with "
+            "a symbolic link refuses the image again. `/lib -> usr/lib` is how "
+            "every usrmerge image is shaped, so an ordinary import fails at the "
+            "very last step, after every layer has been unpacked, with a "
+            "message accusing the author of hand-crafting an escape."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
         name="oci-entry-bytes-unbounded",
         file="crates/oci-unpack/src/lib.rs",
         old="            if this_entry + n64 > self.limits.max_entry_bytes {",

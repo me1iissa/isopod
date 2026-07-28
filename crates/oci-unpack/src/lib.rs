@@ -339,6 +339,23 @@ const fn host_mode(raw: u32) -> u32 {
     raw & 0o777
 }
 
+/// The mode of a directory the extractor creates on its own — one no entry in
+/// any layer describes, brought into being only because something below it had
+/// to be written.
+///
+/// It is applied with an explicit `fchmod` rather than left to `mkdirat`'s mode
+/// argument, which the kernel masks with the process umask. That masking is the
+/// bug this constant exists to prevent: an operator running under `umask 077`
+/// would get an image whose every implicit directory is `0o700` instead of
+/// `0o755`. The regular-file path already sets its mode explicitly for the same
+/// reason; the directories created on the way to it did not.
+///
+/// The consequence is not only fidelity. The pack step turns this tree into an
+/// image whose sha256 *is* its identity, so a mode that varies with the
+/// operator's shell means the same source image imports to two different images
+/// on two hosts, and stages stamped against one cannot be forked on the other.
+const DIR_MODE: u32 = 0o755;
+
 /// Applies layers onto a staging tree and promotes it only on success.
 ///
 /// Dropping an `Unpacker` that has not been [`finish`](Unpacker::finish)ed
@@ -401,6 +418,16 @@ impl Unpacker {
                 return Err(io(&staging, &e));
             }
         };
+        // `create_dir` asked for 0o777 and got 0o777 & ~umask, so without this
+        // the root of the image would be whatever the operator's shell happened
+        // to be set to. See [`DIR_MODE`]. The archive's own mode for `.` is
+        // deliberately not honoured: a root the image could set to 0o000 is one
+        // the teardown could not read, and invariant 9 would fail exactly when
+        // it matters.
+        if let Err(e) = root.chmod(DIR_MODE) {
+            let _ = std::fs::remove_dir(&staging);
+            return Err(io(&staging, &e));
+        }
         Ok(Self {
             dest: dest.to_path_buf(),
             staging,
@@ -492,13 +519,30 @@ impl Unpacker {
         // before its extensions, so reversing yields children before parents.
         let modes = std::mem::take(&mut self.deferred_modes);
         for (components, mode) in modes.iter().rev() {
-            // A later layer may have deleted the directory; that is not an error.
-            if let Some(dir) = self.dir_existing(components, "<deferred mode>")? {
-                dir.chmod(*mode).map_err(|e| Refusal::Io {
-                    path: name::join(components),
-                    detail: e.to_string(),
-                })?;
-            }
+            let dir = match self.dir_existing(components, "<deferred mode>") {
+                Ok(Some(d)) => d,
+                // A later layer deleted the directory, or replaced it with a
+                // file. Nothing is there to carry the mode, which is not an
+                // error — the image simply moved on.
+                Ok(None) => continue,
+                // Or replaced it with a symbolic link, which is how every
+                // usrmerge image is shaped (`/lib -> usr/lib`). That is the
+                // same "the directory is gone" case and it arrives here as an
+                // escape only because the walk cannot tell, at the last
+                // component, that nothing is about to be written through it.
+                // Refusing would reject an ordinary image at the very end of
+                // its unpack, and do it with a message accusing the author of
+                // hand-crafting an attack. Skipping is safe because this loop
+                // only ever *chmods a directory it already created*: no path is
+                // opened for writing, and a link means there is no such
+                // directory left to chmod.
+                Err(Refusal::SymlinkEscape { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            dir.chmod(*mode).map_err(|e| Refusal::Io {
+                path: name::join(components),
+                detail: e.to_string(),
+            })?;
         }
         std::fs::rename(&self.staging, &self.dest).map_err(|e| Refusal::Io {
             path: self.dest.display().to_string(),
@@ -798,8 +842,12 @@ impl Unpacker {
                     // An EEXIST here would mean something appeared between the
                     // two calls; the reopen below is what decides, and it is
                     // still O_NOFOLLOW, so a planted link cannot win the race.
-                    let _ = cur.mkdir(name, 0o755);
-                    cur.open_dir(name).map_err(|e| io(&e))?
+                    let _ = cur.mkdir(name, DIR_MODE);
+                    let made = cur.open_dir(name).map_err(|e| io(&e))?;
+                    // `mkdirat`'s mode is masked by the umask; the image's
+                    // layout must not depend on the operator's shell.
+                    made.chmod(DIR_MODE).map_err(|e| io(&e))?;
+                    made
                 }
                 Err(e) => {
                     let st = cur.lstat(name).map_err(|_| io(&e))?;
@@ -818,8 +866,10 @@ impl Unpacker {
                     // because the replacement is by name and never through the
                     // old inode.
                     remove_child(&cur, name, &self.limits, 0).map_err(|e| io(&e))?;
-                    cur.mkdir(name, 0o755).map_err(|e| io(&e))?;
-                    cur.open_dir(name).map_err(|e| io(&e))?
+                    cur.mkdir(name, DIR_MODE).map_err(|e| io(&e))?;
+                    let made = cur.open_dir(name).map_err(|e| io(&e))?;
+                    made.chmod(DIR_MODE).map_err(|e| io(&e))?;
+                    made
                 }
             };
             written.insert(so_far);
@@ -867,7 +917,7 @@ impl Unpacker {
             path: path.to_string(),
             detail: e.to_string(),
         };
-        match parent.mkdir(name, 0o755) {
+        match parent.mkdir(name, DIR_MODE) {
             Ok(()) => Ok(()),
             Err(e) if is(&e, libc::EEXIST) => {
                 let st = parent.lstat(name).map_err(|e| io(&e))?;
