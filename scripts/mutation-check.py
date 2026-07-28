@@ -487,8 +487,8 @@ MUTATIONS = [
     Mutation(
         name="oci-setuid-survives-its-own-removal",
         file="crates/oci-unpack/src/lib.rs",
-        old="            self.special_modes.remove(&path);",
-        new="            let _ = &path;",
+        old="            self.special_modes.remove(&path);\n        }\n        // Anything other than a directory landed on this path",
+        new="            let _ = &path;\n        }\n        // Anything other than a directory landed on this path",
         defect=(
             "A layer that rewrites a path WITHOUT the setuid bit no longer "
             "clears the earlier layer's recording, so the pack step re-arms a "

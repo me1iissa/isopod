@@ -1280,3 +1280,34 @@ fn the_running_total_and_the_layer_report_agree() {
     assert_eq!(special(u.report()), vec![]);
     assert_eq!(special(&u.finish().expect("promotes")), vec![]);
 }
+
+#[test]
+fn the_running_total_is_honest_between_layers_too() {
+    // `finish()` reconciles the recordings against the finished tree, which by
+    // itself would make the *final* report right while `report()` still named
+    // paths the tree had already lost. A caller adapting a tree between layers
+    // reads that accessor, so the subtree prune has to happen when the layer is
+    // applied and not only at the end.
+    let c = Case::new();
+    let mut u = Unpacker::create(&c.dest(), Limits::default()).expect("staging");
+    let mut l1 = Layer::new();
+    l1.file("d/su", 0o4755, b"one");
+    l1.file("d/nested/ping", 0o4711, b"two");
+    u.apply_layer(&l1.done()[..]).expect("layer 1");
+    assert_eq!(
+        special(u.report()),
+        vec![("d/nested/ping", 0o4711), ("d/su", 0o4755)]
+    );
+
+    // `d` becomes a plain file, so everything that was under it is gone.
+    let mut l2 = Layer::new();
+    l2.file("d", 0o0644, b"now a file");
+    let layer = u.apply_layer(&l2.done()[..]).expect("layer 2");
+    assert_eq!(
+        special(u.report()),
+        vec![],
+        "the subtree's bits outlived the subtree"
+    );
+    assert_eq!(special(&layer), vec![]);
+    assert_eq!(special(&u.finish().expect("promotes")), vec![]);
+}
