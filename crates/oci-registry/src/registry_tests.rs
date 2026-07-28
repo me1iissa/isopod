@@ -215,6 +215,134 @@ fn a_pull_authenticates_follows_the_blob_redirect_and_verifies_what_arrives() {
     );
 }
 
+/// The floor is on the address, and it is wired into the client that connects.
+///
+/// A unit test of the predicate proves the rule; it cannot prove the client
+/// asks. This drives the real client at a real socket, with `localhost` as the
+/// name — a name whose addresses are floored — so the only thing that can stop
+/// the connection is the resolver actually being consulted by the connector.
+///
+/// The two halves share a name, a port and a listening socket and differ only
+/// in `allow_local`, which is what makes the refusal mean something: a resolver
+/// that refused everything would fail the second half.
+#[test]
+fn the_client_dials_only_addresses_the_floor_allows() {
+    // The premise, checked rather than assumed: this client resolves for
+    // itself. A proxy in the environment would have it hand `localhost` to the
+    // proxy in a CONNECT instead, and both assertions below would then be about
+    // the proxy's behaviour rather than the floor's — a pass that means nothing
+    // on a machine nobody looked at. (If you have set `NO_PROXY` to cover
+    // loopback, unset the proxy variable for this run.)
+    for steering in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        assert!(
+            std::env::var_os(steering).is_none(),
+            "{steering} is set: this test cannot tell you anything about the \
+             destination floor while the request is being routed elsewhere"
+        );
+    }
+
+    let server = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = server.local_addr().expect("addr").port();
+    let (tx, rx) = mpsc::channel::<String>();
+    // Bounded by construction: it serves until it is told to stop, and the test
+    // tells it to on both paths. An `accept` loop with no exit hung this suite
+    // once already.
+    let t = thread::spawn(move || {
+        while let Ok((mut s, _)) = server.accept() {
+            let req = read_request(&mut s);
+            let path = req.line.split(' ').nth(1).unwrap_or_default().to_string();
+            let _ = tx.send(path.clone());
+            respond(&mut s, "200 OK", &[], b"served");
+            if path == "/stop" {
+                return;
+            }
+        }
+    });
+
+    // A pull whose registry the operator did NOT name as loopback. `localhost`
+    // resolves to 127.0.0.1 (and often ::1), and both are floored.
+    let floored = http_client(false).expect("client");
+    let err = floored
+        .get(format!("http://localhost:{port}/floored"))
+        .send()
+        .expect_err("a name that resolves to loopback must not be dialled");
+    let detail = transport_detail(&err);
+    assert!(
+        detail.contains("will not dial") && detail.contains("127.0.0.1"),
+        "the refusal has to reach the operator, and say which address it was \
+         about; got: {detail}"
+    );
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the socket was connected anyway — the resolver is not the one the \
+         client asks, or it is not being asked"
+    );
+
+    // The control, on the same socket: the operator named a loopback registry,
+    // so loopback is what they opted into.
+    let allowed = http_client(true).expect("client");
+    let resp = allowed
+        .get(format!("http://localhost:{port}/allowed"))
+        .send()
+        .expect("the operator's own loopback registry must still be reachable");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.text().expect("body"),
+        "served",
+        "the response has to come from the server, not from a cache of nothing"
+    );
+    assert_eq!(rx.recv().expect("the server was never asked"), "/allowed");
+
+    let _ = allowed.get(format!("http://localhost:{port}/stop")).send();
+    let _ = t.join();
+}
+
+/// An address written into the reference never reaches a resolver, so it is
+/// checked where it is written.
+///
+/// The neighbour of the test above: the same destination, spelled so that the
+/// floor the resolver applies is never consulted at all — hyper parses the
+/// authority as an address and dials it. Refusing it at `Puller::new` is the
+/// only place left.
+#[test]
+fn a_registry_named_as_a_floored_address_is_refused_before_any_request() {
+    for hostile in [
+        "169.254.169.254/x/y:1",
+        "169.254.169.254:5000/x/y:1",
+        "10.0.0.5/x/y:1",
+        "192.168.1.1:5000/x/y:1",
+        "100.64.1.1/x/y:1",
+        "[fd00::1]:5000/x/y:1",
+        // The metadata endpoint again, in the spellings the URL floor had to
+        // learn about: an IPv6 host in a reference reaches `url` as a literal
+        // exactly like a dotted quad does.
+        "[::ffff:169.254.169.254]:5000/x/y:1",
+        "[64:ff9b::a9fe:a9fe]:5000/x/y:1",
+    ] {
+        let err = Puller::new(hostile).expect_err("must refuse");
+        assert!(
+            matches!(err, PullError::Destination { .. }),
+            "{hostile}: expected a refused destination, got {err}"
+        );
+    }
+
+    // The controls. A public literal is a legitimate, if unusual, way to name a
+    // registry; a hostname is the resolver's business, not this check's; and
+    // the operator's own loopback registry is the workflow the exemption is
+    // for. Without these a check that refused every reference would pass.
+    for fine in [
+        "8.8.8.8/x/y:1",
+        "[2606:4700::6810:85e5]:443/x/y:1",
+        "ghcr.io/o/n:1",
+        "alpine:3.20",
+        "localhost:5000/x/y:1",
+        "127.0.0.1:5000/x/y:1",
+    ] {
+        assert!(Puller::new(fine).is_ok(), "{fine} must still be usable");
+    }
+}
+
 /// A blob already on disk is reused only if it still hashes to its own name.
 #[test]
 fn a_blob_on_disk_is_reused_only_when_it_is_still_the_blob_it_is_named_for() {

@@ -7,7 +7,7 @@
 //! hostile or compromised registry — and a client that posts its credentials to
 //! whatever realm it is handed has been talked into leaking them.
 //!
-//! Three rules fall out, and all three are enforced here rather than at the
+//! Four rules fall out, and all four are enforced here rather than at the
 //! call site:
 //!
 //! 1. A token realm must survive [`destination_is_allowed`] — the *same*
@@ -19,14 +19,37 @@
 //!    matter of course, so this is the ordinary path, not an edge case.
 //! 3. The loopback exemption belongs to the **operator**, not to the registry.
 //!    It applies only when the operator themselves named a loopback registry.
+//! 4. The floor judges the **address**, not the string. A URL check alone reads
+//!    `https://blob.evil.example/` as an ordinary public host and dials
+//!    whatever it resolves to, so a registry that controls a DNS name controls
+//!    where the request lands. [`FlooredResolver`] resolves every name this
+//!    client dials, applies [`address_is_allowed`] to *every* address the name
+//!    answers with, and hands the connector the addresses it checked.
 //!
 //! Rules 1 and 3 exist because the first version of this module had one
 //! destination floor for redirects and a second, laxer one for realms — so the
-//! path that carries a credential was the one with the weaker check.
+//! path that carries a credential was the one with the weaker check. Rule 4
+//! exists because the floor used to stop at the URL, which made it a floor on
+//! the spellings an attacker does not have to use.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use url::Url;
+
+/// How long this client will wait for one name to resolve.
+///
+/// `getaddrinfo` has no cancellation: it runs on a blocking thread that keeps
+/// going after the future holding it is dropped. Left unbounded, a name whose
+/// authoritative nameserver accepts the query and never answers stalls for the
+/// whole glibc resolver budget — several attempts against several nameservers —
+/// and the operator sees an import that has simply stopped.
+///
+/// Deliberately more generous than the guest egress broker's five seconds: a
+/// resolve that gives up there costs the guest one connection, and one that
+/// gives up here fails the operator's whole import.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A parsed `WWW-Authenticate: Bearer …` challenge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +253,10 @@ fn is_loopback_url(u: &Url) -> bool {
 ///
 /// A registry the operator deliberately named as loopback is exempt — that is
 /// the local-registry workflow, and the operator typed it.
+///
+/// A **name** passes here on the strength of being a name; where it points is
+/// [`FlooredResolver`]'s question, and it is asked at the moment the connector
+/// asks for an address.
 #[must_use]
 pub fn destination_is_allowed(to: &Url, allow_local: bool) -> bool {
     if to.scheme() != "https" && !(allow_local && is_loopback_url(to)) {
@@ -240,27 +267,48 @@ pub fn destination_is_allowed(to: &Url, allow_local: bool) -> bool {
     };
     match host {
         url::Host::Domain(d) => allow_local || !(d == "localhost" || d.ends_with(".localhost")),
-        url::Host::Ipv4(ip) => ipv4_is_allowed(ip, allow_local),
-        url::Host::Ipv6(ip) => {
-            // An IPv6 literal may *be* an IPv4 address wearing a different
+        url::Host::Ipv4(ip) => address_is_allowed(IpAddr::V4(ip), allow_local),
+        url::Host::Ipv6(ip) => address_is_allowed(IpAddr::V6(ip), allow_local),
+    }
+}
+
+/// May this client open a connection to `ip`?
+///
+/// The address half of [`destination_is_allowed`], and the whole of what
+/// [`FlooredResolver`] enforces — one set of rules, so a destination cannot be
+/// judged differently for having been written as a literal rather than reached
+/// through a name. It is the guest egress broker's rule set (see
+/// `isopod_core::net::egress::is_dialable`) with the private ranges refused
+/// unconditionally, because an image import has no `--allow-lan-egress` to opt
+/// into them with.
+#[must_use]
+pub fn address_is_allowed(ip: IpAddr, allow_local: bool) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_allowed(v4, allow_local),
+        IpAddr::V6(v6) => {
+            // An IPv6 address may *be* an IPv4 address wearing a different
             // spelling, and the v4 rules below are the ones with the addresses
             // that matter in them. Judging the spelling rather than the address
             // let `[::ffff:169.254.169.254]` — the cloud metadata endpoint —
             // straight through a floor written to block `169.254.169.254`.
-            if let Some(v4) = embedded_ipv4(ip) {
+            if let Some(v4) = embedded_ipv4(v6) {
                 return ipv4_is_allowed(v4, allow_local);
             }
-            if allow_local && ip.is_loopback() {
+            if allow_local && v6.is_loopback() {
                 return true;
             }
             // `is_unique_local`/`is_unicast_link_local` are not stable, so the
-            // prefixes are matched directly: fc00::/7 and fe80::/10.
-            let seg = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
+            // prefixes are matched directly: fc00::/7 unique-local, fe80::/10
+            // link-local, and fec0::/10 site-local — the last deprecated but
+            // still routed on plenty of networks, and refused by the broker, so
+            // refusing it here too keeps the two floors from disagreeing.
+            let seg = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
                 || (seg & 0xfe00) == 0xfc00
-                || (seg & 0xffc0) == 0xfe80)
+                || (seg & 0xffc0) == 0xfe80
+                || (seg & 0xffc0) == 0xfec0)
         }
     }
 }
@@ -317,6 +365,115 @@ fn ipv4_is_allowed(ip: std::net::Ipv4Addr, allow_local: bool) -> bool {
         || ip.is_multicast()
         || ip.is_unspecified()
         || is_shared)
+}
+
+/// The resolver `reqwest` calls, so the floor is about the address.
+///
+/// [`destination_is_allowed`] screens a URL. That is enough for a literal and
+/// worth nothing for a name: `https://blob.evil.example/` is an ordinary public
+/// host as a string, and the registry that named it chooses what it resolves
+/// to. Resolving here means the check and the lookup are **one act** — the
+/// connector dials the addresses this returns and performs no lookup of its own
+/// — so there is no interval between "checked" and "connected" for an answer to
+/// change in. That is what shuts the rebinding door, not the checking.
+///
+/// `ClientBuilder::resolve`/`resolve_to_addrs` would pin an address just as
+/// firmly, but they take their map at *build* time and most of the hosts a pull
+/// dials are not known then: the redirect targets and the token realm are the
+/// registry's own text, produced mid-pull. Covering them would mean a fresh
+/// client — and a fresh connection pool — at every hop.
+///
+/// Certificate validation is unaffected: only the socket address comes from
+/// here, and TLS is still verified against the host name in the URL.
+pub struct FlooredResolver {
+    /// The operator's intent, as in [`destination_is_allowed`]: true only when
+    /// they themselves named a loopback registry.
+    allow_local: bool,
+}
+
+impl FlooredResolver {
+    /// A resolver for a pull whose registry is (or is not) the operator's own
+    /// loopback.
+    #[must_use]
+    pub fn new(allow_local: bool) -> Self {
+        Self { allow_local }
+    }
+}
+
+impl reqwest::dns::Resolve for FlooredResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_local = self.allow_local;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // `lookup_host` rather than a blocking `to_socket_addrs`: the
+            // blocking client drives every request on one current-thread
+            // runtime, and its own request timeout is a timer on that runtime.
+            // Blocking the thread inside `getaddrinfo` would be a request
+            // timeout that cannot fire while the thing it is timing hangs.
+            let addrs = match tokio::time::timeout(
+                RESOLVE_TIMEOUT,
+                tokio::net::lookup_host((host.as_str(), 0u16)),
+            )
+            .await
+            {
+                Ok(Ok(iter)) => iter.collect::<Vec<SocketAddr>>(),
+                Ok(Err(e)) => return Err(format!("{host} did not resolve: {e}").into()),
+                Err(_) => {
+                    return Err(format!(
+                        "{host} did not resolve within {} seconds",
+                        RESOLVE_TIMEOUT.as_secs()
+                    )
+                    .into())
+                }
+            };
+            screen_resolved(&host, addrs, allow_local)
+                .map(|kept| Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+                .map_err(Into::into)
+        })
+    }
+}
+
+/// The addresses a name may be dialled at, or why it may not be dialled at all.
+///
+/// **One floored address refuses the whole name.** Not a filter: a name that
+/// answers with a public address and a private one is not a name with a usable
+/// half, it is the standard shape of a rebinding payload — the client keeps a
+/// connection open to the public record while a second lookup, or a second
+/// connection, lands on the private one. The guest egress broker filters
+/// instead, and is right to: its names come from an allowlist the operator
+/// wrote, and dropping a record there merely declines one address of a
+/// multi-homed host the operator asked for. Here the name is as likely as not
+/// the registry's own text, and there is nothing to preserve.
+///
+/// The refusal names the address, unlike the broker's, whose message reaches
+/// the guest and must not describe the host's networks. This one reaches the
+/// operator's terminal about their own machine, and it is the only thing that
+/// tells them whether they hit an attack or their own split-horizon DNS.
+fn screen_resolved(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+    allow_local: bool,
+) -> Result<Vec<SocketAddr>, String> {
+    if addrs.is_empty() {
+        return Err(format!("{host} resolved to no addresses at all"));
+    }
+    if let Some(bad) = addrs
+        .iter()
+        .find(|a| !address_is_allowed(a.ip(), allow_local))
+    {
+        return Err(format!(
+            "{host} resolves to {}, which isopod will not dial for an image \
+             import: it is loopback, link-local (the cloud metadata endpoint \
+             lives there), a private or carrier-NAT range, or otherwise not a \
+             public address. A registry chooses its own redirect targets and \
+             its own token realm, so a name it supplies is a request it aimed. \
+             Every address a name answers with has to pass, because one that \
+             does not is how a name is made to point somewhere else on the \
+             next lookup.",
+            bad.ip()
+        ));
+    }
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -431,6 +588,9 @@ mod tests {
             "https://172.16.3.4/internal",
             "https://[fd00::1]/internal",
             "https://[fe80::1]/internal",
+            // fec0::/10, deprecated site-local. The broker refuses it; this
+            // floor did not, which is the two of them disagreeing.
+            "https://[fec0::1]/internal",
             "https://localhost/admin",
             "http://cdn.example.com/blob",
             "https://0.0.0.0/",
@@ -493,6 +653,84 @@ mod tests {
             assert!(
                 !destination_is_allowed(&u, true),
                 "{still_blocked} is not unlocked by a local registry"
+            );
+        }
+    }
+
+    /// Build an address list the way a resolver hands one over.
+    fn resolved(ips: &[&str]) -> Vec<SocketAddr> {
+        ips.iter()
+            .map(|s| SocketAddr::new(s.parse().expect("an address"), 0))
+            .collect()
+    }
+
+    #[test]
+    fn a_name_is_judged_by_every_address_it_answers_with() {
+        // The control first, and it has to be first: a floor that refuses
+        // everything passes every one of the refusals below.
+        let good = resolved(&["93.184.216.34", "2606:4700::6810:85e5"]);
+        assert_eq!(
+            screen_resolved("cdn.example.com", good.clone(), false),
+            Ok(good),
+            "a public name must resolve and be dialled, or nothing imports"
+        );
+
+        // One record, and it points into the operator's machine or network.
+        // These are the addresses a URL check cannot see, because the URL says
+        // `https://blob.evil.example/` in every one of them.
+        for ip in [
+            "169.254.169.254", // the cloud metadata endpoint
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.3.4",
+            "100.64.1.1", // carrier-grade NAT, and not `is_private`
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "fec0::1",
+            "::ffff:169.254.169.254", // the same metadata endpoint, mapped
+            "64:ff9b::a9fe:a9fe",     // and via the NAT64 prefix
+            "::a9fe:a9fe",            // and IPv4-compatible
+        ] {
+            assert!(
+                screen_resolved("blob.evil.example", resolved(&[ip]), false).is_err(),
+                "a name resolving to {ip} must not be dialled"
+            );
+        }
+
+        // The one the obvious implementation misses: a name with a good record
+        // AND a bad one, in both orders. A check of `addrs[0]` alone accepts
+        // the first of these and refuses the second — a floor whose answer
+        // depends on which record the resolver happened to list first.
+        for pair in [
+            ["93.184.216.34", "169.254.169.254"],
+            ["169.254.169.254", "93.184.216.34"],
+            ["93.184.216.34", "10.0.0.5"],
+            ["2606:4700::6810:85e5", "fd00::1"],
+        ] {
+            assert!(
+                screen_resolved("blob.evil.example", resolved(&pair), false).is_err(),
+                "{pair:?}: one floored record refuses the name, it does not \
+                 leave a usable half"
+            );
+        }
+
+        // A name that resolves to nothing is not a name that resolves to
+        // anything permitted, and an empty address list handed to the connector
+        // is a confusing failure somewhere further down.
+        assert!(screen_resolved("nx.example", Vec::new(), false).is_err());
+
+        // The operator's own loopback registry, which is the workflow the
+        // exemption exists for — and it unlocks loopback only.
+        assert!(screen_resolved("localhost", resolved(&["127.0.0.1", "::1"]), true).is_ok());
+        assert!(screen_resolved("localhost", resolved(&["127.0.0.1"]), false).is_err());
+        for still_blocked in ["10.0.0.5", "169.254.169.254"] {
+            assert!(
+                screen_resolved("lan.example", resolved(&[still_blocked]), true).is_err(),
+                "{still_blocked} is not what the operator opted into by typing localhost"
             );
         }
     }

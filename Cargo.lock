@@ -981,6 +981,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "tokio",
  "url",
 ]
 

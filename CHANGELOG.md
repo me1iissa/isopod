@@ -8,6 +8,73 @@ Versioning for the policy.
 
 ## [0.12.0] — 2026-07-27
 
+### Added — `image ls` lists imported bases, and `image rm` removes them
+
+`image ls` enumerated the built flavors and nothing else, so an imported base was
+invisible to it — while `BaseRef::parse`'s refusal for an unknown base told the
+operator to run that very command. A doc and a surface disagreeing is a defect
+here, and this was one.
+
+One list, not two: `image ls` answers "what can I pass to `--base`?", and that is
+a single namespace — `BaseRef::parse` takes either spelling and a stage records
+either in one string. Rows gain `kind` (`builtin`/`imported`) and `source_ref`,
+and an imported base gets the **identical** freshness computation a built one
+gets, which matters more for imports because every guest-agent rebuild
+invalidates them.
+
+`isopod image rm <name> [--force]` implements design decision 5: it refuses while
+a stage records that base, names the stages, and a forced removal reports what it
+broke. The sidecar is removed **after** the image — the opposite order to
+publishing, because here the bytes never change, so the dangerous failure is a
+live image left unstamped rather than a new image vouched for by an old stamp.
+
+Over MCP, `image_list` is new and read-only. Import and rm stay CLI-only: nothing
+a model asks for can pull bytes onto the host or take a base out from under a
+stage.
+
+**The blob cache key was a real defect, not just untidy.** It was
+`slug_for(reference)`, which maps every run of non-alphanumerics to one dash, so
+`a/b:c` and `a-b-c` collided. A cache directory is an OCI *layout* — the blobs
+are content-addressed and safely shared, but the single `index.json` is not. Two
+concurrent imports of colliding references could interleave into an image packed
+from the *other* reference's manifest, while its sidecar recorded the reference
+that was asked for. Every digest still verified, because nothing was substituted
+at the blob level: digests answer "are these the bytes that were named", and the
+key has to answer "whose layout is this". Now keyed on a readable prefix plus 16
+hex of the reference's sha256. Existing `oci-blobs/<slug>` directories are
+orphaned but inert; a re-import re-downloads once.
+
+### Fixed — a registry name is judged by the address it resolves to
+
+The destination floor screened URLs and IP literals, so `https://blob.evil/`
+resolving to `169.254.169.254` walked straight through, and a name that checked
+out could be re-resolved before the socket opened. `SECURITY.md` carried that as
+an explicit non-claim.
+
+The client now installs a `reqwest` DNS resolver that applies the address rules
+to **every** address a name answers with — one floored record refuses the whole
+name rather than filtering it, because unlike the broker's operator-written
+allowlist, this name is as likely as not the registry's own text. The check and
+the lookup are one act: the connector dials what the resolver returned and
+performs no lookup of its own, so there is no interval for an answer to change
+in. `dns_resolver` rather than `resolve_to_addrs` precisely because the latter
+takes its map at client-build time, and half the hosts a pull dials — redirect
+targets, the token realm — arrive mid-pull. TLS still verifies against the name.
+
+A registry named as a floored address literal never reaches a resolver at all, so
+`isopod image import 169.254.169.254/x/y` is now refused at construction. The
+floor also gained `fec0::/10`, which the guest broker already refused — the two
+floors disagreeing was the thing being fixed.
+
+`SECURITY.md`'s non-claim was **replaced with three narrower ones, not deleted**;
+the honest remaining gap is the system-proxy path, where the host is handed to a
+proxy and nothing resolves locally.
+
+`Reference::is_local` was also wrong for IPv6: it split the authority on `:`, so
+`[::1]:5000` yielded `"["` and a bare `::1` yielded `""` — meaning the `"::1"` arm
+was **unreachable**, a case listed as supported that could never match. It failed
+closed, so an IPv6 loopback registry was refused rather than over-trusted.
+
 ### Fixed — two concurrent warm-pool builds could publish each other's bytes
 
 Dogfood finding #32, the only open HIGH and the only one that could publish

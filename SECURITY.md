@@ -216,16 +216,45 @@ is its text.
   and NAT64 spellings of a blocked address are reduced to the address they name.
 - **The loopback exemption belongs to the operator**, not the registry. It
   applies only when the operator themselves named a loopback registry.
+- **The floor judges the resolved address, not just the URL.** Every name this
+  client dials — the registry the operator named, every redirect target, and the
+  token realm — is resolved by isopod's own resolver, and **every** address the
+  name answers with is checked against the guest egress broker's address rules,
+  with private ranges refused unconditionally because an import has no
+  `--allow-lan-egress` to opt into them. One floored record refuses the whole
+  name: a name answering with a public address and a private one is not a name
+  with a usable half, it is the shape a rebinding payload has.
+- **The address that was checked is the address that is dialled.** Resolution
+  and the check are one act — the HTTP connector asks isopod's resolver for
+  addresses and connects to what it returns, performing no lookup of its own —
+  so there is no interval between checking a name and connecting to it for the
+  answer to change in. Certificate validation is unaffected: TLS is verified
+  against the host name in the URL, never against the address.
+- **An address written into a reference is checked where it is written.** A
+  literal never reaches a resolver at all — the connector parses the authority
+  and dials it — so `isopod image import 169.254.169.254/x/y` is refused before
+  the first request rather than left to a check it would never reach.
 
 ### What is explicitly **not** claimed
 
-- **The destination floor here judges the URL, not the resolved address.** The
-  guest egress broker resolves first and checks the address it got; this
-  client's floor screens IP literals and hostnames but does not re-check what a
-  name resolves to, so a registry-controlled DNS name pointing into the
-  operator's network is not stopped by it, and neither is a rebind between the
-  check and the connection. Do not read this floor as equivalent to the
-  broker's — it is a floor on the obvious cases, not a resolved-address gate.
+- **A proxy, if one is configured, resolves instead of isopod.** The client
+  honours `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` from the environment, and a
+  proxied request names the *host* to the proxy and lets the proxy resolve it.
+  The URL floor still applies; the resolved-address floor cannot, because no
+  resolution happens on this machine. If you import through a proxy, the proxy
+  is the thing deciding where the request lands.
+- **The floor knows an address's category, not where it can reach.** A public
+  address that forwards inward — an open proxy, a redirector, a public address
+  the operator's own routing sends onto their LAN — passes, because by every
+  rule it is public. Equally, the answer comes from the host's ordinary stub
+  resolver and is not authenticated: a poisoned answer naming a *different
+  public* address is a destination the floor has no reason to refuse.
+- **A registry on a private range is not importable.** The floor refuses
+  RFC1918, CGNAT and unique-local addresses with no flag to permit them, so an
+  internal registry at `10.0.0.5` or behind split-horizon DNS is refused rather
+  than dialled. Only a registry the operator names as loopback
+  (`localhost:5000`, `127.0.0.1:5000`) is exempt, and only because they typed
+  it. This is deliberate and it is a real limitation, not an oversight.
 - **An imported image's contents are not vetted.** isopod runs your image's
   filesystem; if you import something hostile, you have imported something
   hostile. The claims above are about the *import* not compromising the host,

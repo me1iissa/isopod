@@ -173,8 +173,10 @@ impl Reference {
     /// operator saying so: a loopback one, which cannot be a third party.
     #[must_use]
     pub fn is_local(&self) -> bool {
-        let host = self.registry.split(':').next().unwrap_or(&self.registry);
-        host == "localhost" || host == "127.0.0.1" || host == "::1"
+        matches!(
+            registry_host(&self.registry),
+            "localhost" | "127.0.0.1" | "::1"
+        )
     }
 
     /// What a `/v2/` request path for this repository looks like.
@@ -246,6 +248,29 @@ fn check_tag(tag: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The host part of a registry authority, with an IPv6 literal's brackets
+/// removed.
+///
+/// `registry.split(':').next()` — what this used to be — yields `"["` for
+/// `[::1]:5000` and `""` for a bare `::1`, so the `"::1"` arm of
+/// [`Reference::is_local`] was unreachable: a case the code listed as supported
+/// and could never match. It failed closed (an IPv6 loopback registry was
+/// treated as a third party, so `http` and loopback destinations were both
+/// refused), which is the right direction to be wrong in and still wrong.
+fn registry_host(registry: &str) -> &str {
+    // `[::1]:5000` and `[::1]`: the authority form that has a port to
+    // disambiguate from the address's own colons.
+    if let Some(rest) = registry.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // A bare IPv6 literal has more than one colon and cannot carry a port;
+    // exactly one colon is `host:port`.
+    if registry.matches(':').count() > 1 {
+        return registry;
+    }
+    registry.split(':').next().unwrap_or(registry)
 }
 
 #[cfg(test)]
@@ -371,6 +396,60 @@ mod tests {
             let once = p(input);
             let twice = p(&once.to_string());
             assert_eq!(once, twice, "{input} did not survive a round trip");
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_host_tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv6_loopback_registry_is_recognised_as_local() {
+        // `is_local` unlocks plain http and loopback destinations, so it has to
+        // recognise the spellings an operator actually types for a local
+        // registry. The bracketed forms are what an OCI reference requires.
+        for r in ["[::1]:5000/mine:1", "[::1]/mine:1", "::1/mine:1"] {
+            let parsed = Reference::parse(r).unwrap_or_else(|e| panic!("{r}: {e}"));
+            assert!(parsed.is_local(), "{r} is a loopback registry");
+        }
+        // The two that already worked, which must keep working.
+        for r in ["localhost:5000/mine:1", "127.0.0.1:5000/mine:1"] {
+            assert!(Reference::parse(r).expect("parses").is_local(), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_registry_that_merely_resembles_loopback_is_not_local() {
+        // The neighbouring inputs: `is_local` is a permission, so a near-miss
+        // must not acquire it.
+        for r in [
+            "localhost.evil.com/x:1",
+            "notlocalhost/x:1",
+            "127.0.0.1.evil.com/x:1",
+            "[::2]:5000/x:1",
+            "[fe80::1]:5000/x:1",
+            "ghcr.io/o/a:1",
+            "alpine:3.20",
+        ] {
+            let parsed = Reference::parse(r).unwrap_or_else(|e| panic!("{r}: {e}"));
+            assert!(!parsed.is_local(), "{r} must NOT be treated as local");
+        }
+    }
+
+    #[test]
+    fn the_host_parse_handles_every_authority_shape() {
+        for (authority, want) in [
+            ("[::1]:5000", "::1"),
+            ("[::1]", "::1"),
+            ("[fe80::1]:443", "fe80::1"),
+            ("::1", "::1"),
+            ("localhost:5000", "localhost"),
+            ("localhost", "localhost"),
+            ("127.0.0.1:5000", "127.0.0.1"),
+            ("ghcr.io", "ghcr.io"),
+        ] {
+            assert_eq!(registry_host(authority), want, "{authority}");
         }
     }
 }

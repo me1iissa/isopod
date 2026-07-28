@@ -25,6 +25,11 @@
 //!   content; it does not stop the request, and a request to `169.254.169.254`
 //!   is an SSRF from the operator's machine — with a credential attached, in the
 //!   realm's case. One predicate governs both: [`auth::destination_is_allowed`].
+//!   It judges the URL, and [`auth::FlooredResolver`] judges what a name in that
+//!   URL resolves to — every address it answers with, at the moment the
+//!   connector asks, so the address that is checked is the address that is
+//!   dialled. A name is otherwise a way to write `169.254.169.254` that no
+//!   amount of reading the string can catch.
 //! - **A credential belongs to the registry it was stored for.** The Docker Hub
 //!   entry in `~/.docker/config.json` authenticates to Docker Hub and to nothing
 //!   else, and no credential is sent to a host reached by redirect.
@@ -101,6 +106,13 @@ pub enum PullError {
         /// The registry's own message, when it sent a usable one.
         detail: String,
     },
+    /// The registry host itself is somewhere this client will not dial.
+    Destination {
+        /// The host, as it was written.
+        host: String,
+        /// Why it was refused.
+        detail: String,
+    },
     /// A redirect went somewhere this client will not follow.
     Redirect {
         /// Where it pointed.
@@ -158,6 +170,10 @@ impl fmt::Display for PullError {
                 }
                 Ok(())
             }
+            Self::Destination { host, detail } => write!(
+                f,
+                "the registry {host} is not somewhere isopod will dial: {detail}"
+            ),
             Self::Redirect { to, detail } => write!(
                 f,
                 "the registry redirected to {to}, which isopod will not follow: \
@@ -229,31 +245,27 @@ impl fmt::Debug for Puller {
 impl Puller {
     /// Build a client for `reference`.
     ///
-    /// Redirects are followed by hand rather than by the HTTP client, so that
-    /// where a credential may travel and where a request may be aimed are this
-    /// crate's decisions and not a library default that could change.
+    /// See [`http_client`] for what the client does and does not decide for
+    /// itself: redirects are followed by hand, and every name it dials is
+    /// resolved through the destination floor.
     ///
     /// # Errors
-    /// [`PullError::Reference`] if the reference does not parse, or
-    /// [`PullError::Transport`] if the HTTP client cannot be built.
+    /// [`PullError::Reference`] if the reference does not parse,
+    /// [`PullError::Destination`] if the reference names an address this client
+    /// will not dial, or [`PullError::Transport`] if the HTTP client cannot be
+    /// built.
     pub fn new(reference: &str) -> Result<Self, PullError> {
         let reference = Reference::parse(reference)?;
-        let http = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("isopod/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| PullError::Transport {
-                what: "the HTTP client".into(),
-                detail: e.to_string(),
-            })?;
+        let http = http_client(reference.is_local())?;
         let basic = docker_config_auth(&reference);
-        Ok(Self {
+        let puller = Self {
             reference,
             http,
             token: None,
             basic,
-        })
+        };
+        puller.refuse_a_floored_literal_host()?;
+        Ok(puller)
     }
 
     /// The reference this client was built for.
@@ -271,6 +283,107 @@ impl Puller {
         };
         format!("{scheme}://{}", self.reference.host())
     }
+
+    /// Refuse a registry host that is an address the floor blocks.
+    ///
+    /// A registry named by *name* is floored when [`auth::FlooredResolver`]
+    /// resolves it, but an address literal never reaches a resolver at all: the
+    /// connector parses the authority as an address and dials it. So
+    /// `isopod image import 169.254.169.254/x/y` would issue a request to the
+    /// cloud metadata endpoint past a floor that stops the identical
+    /// destination the moment a name leads to it — and this is the only place
+    /// it can be caught. The guest broker has the same asymmetry and the same
+    /// answer for a credential's pinned host.
+    ///
+    /// Judged through `url`, which is the parser that will dial it, so a
+    /// spelling this disagrees with cannot be the spelling that connects.
+    fn refuse_a_floored_literal_host(&self) -> Result<(), PullError> {
+        let base = self.base();
+        let host = Url::parse(&base)
+            .map_err(|e| PullError::Destination {
+                host: self.reference.host().to_string(),
+                detail: format!("it is not a URL: {e}"),
+            })?
+            .host()
+            .map(|h| match h {
+                url::Host::Domain(d) => Ok(d.to_string()),
+                url::Host::Ipv4(ip) => Err(std::net::IpAddr::V4(ip)),
+                url::Host::Ipv6(ip) => Err(std::net::IpAddr::V6(ip)),
+            });
+        let Some(Err(ip)) = host else {
+            return Ok(()); // a name, or no host at all: the resolver's problem
+        };
+        if auth::address_is_allowed(ip, self.reference.is_local()) {
+            return Ok(());
+        }
+        Err(PullError::Destination {
+            host: self.reference.host().to_string(),
+            detail: format!(
+                "{ip} is loopback, link-local (the cloud metadata endpoint lives \
+                 there), a private or carrier-NAT range, or otherwise not a \
+                 public address. An address written into the reference is dialled \
+                 directly rather than resolved, so it would bypass the check a \
+                 registry named by hostname goes through; the import is refused \
+                 instead. A registry on your own machine is reachable as \
+                 `localhost:<port>`, which isopod treats as your decision"
+            ),
+        })
+    }
+}
+
+/// The HTTP client every request in a pull goes through.
+///
+/// Redirects are followed by hand rather than by the client, so where a
+/// credential may travel and where a request may be aimed stay this crate's
+/// decisions rather than a library default that could change.
+///
+/// The resolver is the other half of that: with [`auth::FlooredResolver`]
+/// installed, the connector asks *it* for an address and dials what it gets
+/// back, which is the same act as the check. `resolve`/`resolve_to_addrs` pin
+/// just as firmly but take their map when the client is built, and the hosts a
+/// pull dials are not all known then — a redirect target and a token realm
+/// arrive mid-pull, in the registry's own text — so covering them that way
+/// would mean a new client, and a new connection pool, at every hop.
+///
+/// The environment's proxy settings are still honoured, and they are the one
+/// way past the resolver: a proxied request hands the *host* to the proxy in a
+/// `CONNECT` and the proxy resolves it, so nothing resolves on this machine for
+/// the floor to judge. Refusing to import through a proxy would break the
+/// operators who need one to reach a registry at all, so it stays, and
+/// `SECURITY.md` says so rather than claiming a floor that has a hole in it.
+fn http_client(allow_local: bool) -> Result<reqwest::blocking::Client, PullError> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(concat!("isopod/", env!("CARGO_PKG_VERSION")))
+        .dns_resolver(std::sync::Arc::new(auth::FlooredResolver::new(allow_local)))
+        .build()
+        .map_err(|e| PullError::Transport {
+            what: "the HTTP client".into(),
+            detail: transport_detail(&e),
+        })
+}
+
+/// A `reqwest` failure with its causes, not just its headline.
+///
+/// `Display` on a `reqwest::Error` says what it was doing and to which URL, and
+/// nothing about why it failed — the reason lives in the source chain. The
+/// destination floor's refusal arrives that way, and an operator told only
+/// "error sending request" has been told nothing they can act on.
+fn transport_detail(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Hyper repeats its inner message in its own `Display` often enough
+        // that a naive chain reads as a stutter.
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
 }
 
 /// One descriptor, as much of it as deciding what to fetch next requires. The
@@ -550,7 +663,7 @@ impl Puller {
             }
             let resp = req.send().map_err(|e| PullError::Transport {
                 what: what.to_string(),
-                detail: e.to_string(),
+                detail: transport_detail(&e),
             })?;
             let status = resp.status();
 
@@ -638,7 +751,7 @@ impl Puller {
         }
         let resp = req.send().map_err(|e| PullError::Transport {
             what: "a token".into(),
-            detail: e.to_string(),
+            detail: transport_detail(&e),
         })?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -650,7 +763,7 @@ impl Puller {
         }
         let body: serde_json::Value = resp.json().map_err(|e| PullError::Transport {
             what: "a token".into(),
-            detail: e.to_string(),
+            detail: transport_detail(&e),
         })?;
         body.get("token")
             .or_else(|| body.get("access_token"))

@@ -16,6 +16,12 @@ reqwest = { workspace = true, features = ["blocking"] }
 # The same URL parser that will dial the address, so a check and a request
 # cannot disagree about what the string meant.
 url = "2"
+# For `lookup_host` alone. The destination floor has to resolve names itself to
+# be a floor on addresses, and the blocking client runs every request on one
+# current-thread runtime — resolving with a blocking call would park the thread
+# that owns the request timeout. Nothing here starts a runtime: this runs inside
+# the one `reqwest::blocking` already keeps.
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
