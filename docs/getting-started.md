@@ -404,15 +404,24 @@ flowchart TB
     Q -->|"same content id"| RUN["fork boots"]
     Q -->|"no sidecar<br/>(image predates stamping)"| WARN["warns, boots<br/>nothing to compare"]
     Q -->|"rebuilt: different id"| REFUSE["refused before boot"]
-    REFUSE -->|"rebuild the stage on the new image"| FRESH["run --stage base, commit again"]
-    REFUSE -->|"ISOPOD_ALLOW_BASE_SKEW=1"| RUN
+    REFUSE -->|"rebuild the stage<br/>on the current image"| FRESH["run --stage base, commit again<br/>the whole chain agrees"]
+    REFUSE -->|"ISOPOD_ALLOW_BASE_SKEW=1"| SKEW["boots this run; a commit stacks<br/>on the same stale ancestors"]
+    SKEW -->|"the new stage inherits the old chain"| S
 ```
 
 The refusal names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1`
-covers the commit as well as the boot, so the ordinary way to rebase a stage
-onto a rebuilt image is to fork it with the variable set and commit the result —
-the new layer records the new image. It does **not** excuse a different base
-*flavor*: those layers belong to another root, not an older one.
+covers the commit as well as the boot: rebuilding the images changes the base of
+every stage at once, and a hatch that booted the fork but refused to save what it
+produced would strand exactly the work it exists for. It does **not** excuse a
+different base *flavor* — those layers belong to another root, not an older one.
+
+It is an escape for a run, not a repair. Committing under it stacks a new layer
+on the same stale ancestors, and the check walks every link, so the stage you get
+back still disagrees with the image and still needs the variable to boot. Its own
+`base_sha256` is the current image's, so `stage info` on it reads clean while the
+chain beneath it does not. Rebuilding the stage from `--stage base` on the
+current image is the only thing that clears it — and nothing enumerates which
+stages a rebuild affected, so a refused fork is how you find out.
 
 Stages committed before isopod 0.12.0 carry no content id. They fork exactly as
 they did, unchecked — there is nothing recorded to disagree with.

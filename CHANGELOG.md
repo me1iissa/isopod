@@ -48,10 +48,11 @@ Three cases deliberately do **not** refuse:
 `ISOPOD_ALLOW_BASE_SKEW=1` overrides the refusal, loudly. It covers the commit as
 well as the boot on purpose: rebuilding the guest images changes the base of
 every stage at once, and an escape hatch that boots the fork but then refuses to
-save what it produced would strand exactly the work it exists for. Forking with
-the variable set and committing the result is the ordinary way to rebase a stage
-onto a rebuilt image — the new layer records the new image, and the old parent
-keeps its own stamp, so the store keeps the evidence either way.
+save what it produced would strand exactly the work it exists for. It is an
+escape for a run, not a repair: the layer it commits records the new image while
+its ancestors keep their own stamps, and since the check walks every link, the
+stage it produces still needs the variable to boot. Rebuilding the stage on the
+current image is what clears it; the store keeps the evidence either way.
 
 Eight mutations were added to `scripts/mutation-check.py` covering the new
 guards: accepting any content id, dropping the stamp at commit time (which fails

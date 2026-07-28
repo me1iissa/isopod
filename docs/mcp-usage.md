@@ -195,9 +195,13 @@ rebuilt since — `isopod image build-all`, a new guest agent, or even a rebuild
 an unchanged tree, since `mksquashfs` is not byte-reproducible — the fork is refused
 before boot rather than mounting layers over a root they no longer match. The
 error names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1` in
-the server's environment overrides it, for the commit as well as the boot, which
-is how a stage is rebased onto a new image. Stages committed before isopod
-0.12.0 record no content id and fork unchecked.
+the server's environment overrides it, for the commit as well as the boot — but
+it is set by whoever launches `isopod-mcp`, not by a tool call, so a client that
+hits this cannot lift it itself. Nor does it repair anything: a commit made under
+it stacks on the same stale ancestors, so the stage it produces still disagrees
+with the image and still needs the variable. Rebuilding the stage from
+`stage: "base"` on the current image is what clears it. Stages committed before
+isopod 0.12.0 record no content id and fork unchecked.
 
 Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
