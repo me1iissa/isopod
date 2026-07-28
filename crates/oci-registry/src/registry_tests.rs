@@ -241,17 +241,24 @@ fn the_client_dials_only_addresses_the_floor_allows() {
         );
     }
 
-    // Bind where `localhost` actually points ON THIS HOST. GitHub's runners
-    // answer `::1` first; this developer machine answers `127.0.0.1`. A
-    // listener pinned to one stack makes the control below fail for a reason
-    // that has nothing to do with the destination floor — which is exactly how
-    // this test failed the first time it ever ran anywhere but its author's
-    // laptop.
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
-        .expect("localhost resolves to something")
-        .next()
-        .expect("localhost resolves to at least one address");
-    let server = TcpListener::bind(addr).expect("bind");
+    // Every address `localhost` answers with on THIS host. GitHub's runners
+    // answer `::1` first; this developer machine answers `127.0.0.1`.
+    //
+    // Binding to the first is hardening rather than a fix: hyper-util's
+    // happy-eyeballs would fall back to the other family, and three sibling
+    // tests in this file bind v4 and dial by name on a `::1`-first runner
+    // without trouble. What it buys is that the connector reaches the listener
+    // on the family it tries FIRST, so the `recv_timeout` below catches a
+    // broken floor immediately instead of after a fallback.
+    let addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+            .expect("localhost resolves to something")
+            .collect();
+    assert!(
+        !addrs.is_empty(),
+        "localhost resolves to nothing on this host"
+    );
+    let server = TcpListener::bind(addrs[0]).expect("bind");
     let port = server.local_addr().expect("addr").port();
     let (tx, rx) = mpsc::channel::<String>();
     // Bounded by construction: it serves until it is told to stop, and the test
@@ -277,14 +284,18 @@ fn the_client_dials_only_addresses_the_floor_allows() {
         .send()
         .expect_err("a name that resolves to loopback must not be dialled");
     let detail = transport_detail(&err);
-    // Either loopback spelling: which one `localhost` answers with is the
-    // host's business, not this crate's, and asserting on one of them tests
-    // the resolver's configuration rather than the floor.
+    // Assert against the addresses this host actually resolved, not against
+    // hardcoded spellings. `screen_resolved` documents naming the address as
+    // deliberate — it is what tells an operator whether they hit an attack or
+    // their own split-horizon DNS — and this is the only test that pins it, so
+    // it is worth pinning properly. Two hardcoded literals would merely be two
+    // host assumptions where there was one: a host answering `127.0.0.53`
+    // fails, and a stray `fe80::1` would satisfy a bare `"::1"` substring.
     assert!(
         detail.contains("will not dial")
-            && (detail.contains("127.0.0.1") || detail.contains("::1")),
-        "the refusal has to reach the operator, and say which address it was \
-         about; got: {detail}"
+            && addrs.iter().any(|a| detail.contains(&a.ip().to_string())),
+        "the refusal has to reach the operator, and say which of {addrs:?} it \
+         was about; got: {detail}"
     );
     assert!(
         rx.recv_timeout(std::time::Duration::from_millis(500))

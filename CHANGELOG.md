@@ -17,11 +17,23 @@ say `::1` first. The floor behaved correctly on both — the assertion did not,
 and the test failed the first time it ran anywhere but the machine it was
 written on.
 
-It now accepts either spelling, and binds its listener to whatever `localhost`
-actually resolves to rather than pinning `127.0.0.1`. That second half was a
-latent failure sitting directly behind the first: the control connects by name,
-so on a `::1`-first host it would have dialled a stack with nothing listening
-and failed for a reason unrelated to what it tests.
+It now asserts against the addresses the host actually resolved rather than
+against hardcoded spellings — which is strictly stronger than the literal it
+replaced, and stronger than a two-way disjunction would have been, since that
+is merely two host assumptions where there was one.
+
+The old assertion was worse than brittle: it was **inverted with respect to the
+v6 floor**. Had the IPv6 loopback branch of `address_is_allowed` been broken,
+the first floored record would have been `127.0.0.1`, the message would have
+named it, and the test would have **passed** on the very runner where correct
+code made it fail.
+
+The listener now binds to whichever address `localhost` answers with first.
+That is hardening, not a fix: happy-eyeballs falls back to the other family, and
+three sibling tests bind v4 and dial by name on a `::1`-first runner without
+trouble. What it buys is that the connector reaches the listener on the family
+it tries first, so the test's 500 ms "was the socket connected anyway?" check
+catches a broken floor immediately rather than after a fallback.
 
 ## [0.12.0] — 2026-07-27
 
