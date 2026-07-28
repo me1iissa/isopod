@@ -105,7 +105,9 @@ A stage's layers belong to the *build* of the base image they were made over, so
 each one records the content id that image's build sidecar reports, and a fork
 refuses a base rebuilt since — checking every ancestor in the chain, naming both
 ids and both ways out, rather than mounting silently over a root that no longer
-matches. Stages committed before this existed fork unchecked.
+matches. The image pack is timestamp-pinned, so a rebuild that changes nothing
+keeps its id and refuses nothing; only a base whose *contents* moved retires the
+stages on it. Stages committed before this existed fork unchecked.
 [docs/getting-started.md](docs/getting-started.md#when-the-base-image-is-rebuilt)
 has the diagram and the escape hatch.
 

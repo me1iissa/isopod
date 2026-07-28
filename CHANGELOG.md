@@ -13,6 +13,48 @@ and a fork refuses a base that has been rebuilt since. Existing stages are
 unaffected: they carry no stamp, so there is nothing to disagree with, and they
 fork exactly as they did.
 
+### Fixed — a base image built twice from one tree is the same image
+
+`mksquashfs` wrote the current time into the superblock and copied each file's
+mtime out of the assembly directory, which is created fresh on every build. So
+`isopod image build-rootfs --force` over an *unchanged* tree minted a new content
+id: measured, two runs four seconds apart produced two different images of the
+same root filesystem. (Three runs inside one second produced one, which is what
+made it look reproducible.)
+
+Nothing about that id is cosmetic. It is what a stage records as the base its
+layers were made over and what the warm pool keys a snapshot on, so a rebuild
+that changed nothing retired every stamped stage on the flavor and orphaned a
+512 MiB snapshot — and `image build-all` is documented as *required* after a
+`PROTO_VERSION` bump, which made the mandatory operation the expensive one.
+
+The pack now pins both halves of the clock, `-mkfs-time` for the superblock and
+`-all-time` for the files. Each alone still moves the id; together the same tree
+packs to the same bytes across any gap, while a real content change still moves
+it. 1980-01-01 rather than the epoch, because it is the earliest instant a
+DOS/ZIP date field can represent and a guest that archives something it copied
+out of the base should get a valid date. Nothing in the guest reads base
+timestamps: `base-alpine` ships hash-based bytecode caches (PEP 552), and every
+file a run writes lands in the overlay upper with a real, strictly newer mtime.
+
+`SOURCE_DATE_EPOCH` is removed from the packer's environment rather than
+honoured. squashfs-tools reads it itself and treats it as competing with the
+flags — with both present it exits `SOURCE_DATE_EPOCH and command line options
+can't be used at the same time to set timestamp(s)` and builds nothing, so an
+operator whose shell exports it, which is the ordinary reproducible-build
+environment, could not build an image at all. It also settles what the variable
+would otherwise raise: an image id that moves with the ambient environment is the
+defect the pin exists to close.
+
+This is a **behaviour change to a guarantee, not only a speedup**: a rebuild is
+no longer proof that a base has moved, so the prose that said "any rebuild
+counts" is now wrong and has been corrected in `README.md`,
+`docs/getting-started.md`, `docs/mcp-usage.md` and the `Unverifiable` refusal —
+which used to promise that re-stamping a sidecar-less image would always mint a
+new build, and now says it restores the same id when the tree has not changed.
+The ext4 dev flavors are deliberately untouched: they are not stage bases, so no
+content id is keyed on them.
+
 ### Added — a stage records the base build, and a fork checks it
 
 `StageMeta` gains `base_sha256`: the content id (the image sidecar's sha256) of

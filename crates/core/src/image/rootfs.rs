@@ -30,6 +30,29 @@ const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34
 /// Preferred host-provided busybox (Ubuntu ships a static build).
 const SYSTEM_BUSYBOX: &str = "/bin/busybox";
 
+/// The single timestamp every packed base image carries — 1980-01-01T00:00:00Z,
+/// as `mksquashfs` spells it.
+///
+/// A base image's content id ([`ImageMeta::sha256`]) is what a stage records as
+/// the build its layers were made over, and what the warm pool keys a snapshot
+/// on. It therefore has to be a function of the packed tree and nothing else.
+/// Unpinned it is not: `mksquashfs` writes the current time into the superblock
+/// and copies each file's mtime out of the assembly directory, which is freshly
+/// created on every build — so rebuilding an *identical* tree mints a new id,
+/// which retires every stamped stage on the flavor and orphans a 512 MiB
+/// snapshot, for a root filesystem that did not change.
+///
+/// Both halves are pinned because each alone still moves the id: `-mkfs-time`
+/// covers the superblock, `-all-time` covers the files.
+///
+/// 1980 rather than the Unix epoch because it is the earliest instant a DOS/ZIP
+/// date field can represent — a guest that zips something it copied out of the
+/// base gets a valid date rather than an error. Nothing in the guest compares
+/// base timestamps: the bytecode caches shipped in `base-alpine` are hash-based
+/// (PEP 552), and every file a run writes lands in the overlay upper with a real
+/// mtime, which is strictly newer than this.
+const IMAGE_EPOCH: &str = "315532800";
+
 // ---- base-alpine flavor pins -------------------------------------------------
 //
 // The `base-alpine` dev base is assembled with Alpine's `apk.static` against a
@@ -1273,18 +1296,42 @@ fn run_mkfs(dir: Option<&Path>, img: &Path, size: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pack `root` into a read-only squashfs image at `img` with
-/// `mksquashfs <root> <img> -all-root -noappend` (quiet). `-all-root` maps every
-/// file to uid/gid 0 so the unprivileged build produces a root-owned image;
-/// `-noappend` overwrites the pre-created temp file rather than appending.
-fn run_mksquashfs(root: &Path, img: &Path) -> Result<()> {
-    let out = Command::new("mksquashfs")
-        .arg(root)
+/// The `mksquashfs` invocation [`run_mksquashfs`] spawns.
+///
+/// Split out from the run so the pin is inspectable without a packer on the
+/// host: the flags and the environment it is spawned with are the guarantee, and
+/// a test that only packs a tree cannot see the environment at all.
+fn mksquashfs_command(root: &Path, img: &Path) -> Command {
+    let mut cmd = Command::new("mksquashfs");
+    cmd.arg(root)
         .arg(img)
         .arg("-all-root")
         .arg("-noappend")
         .arg("-quiet")
         .arg("-no-progress")
+        .args(["-mkfs-time", IMAGE_EPOCH])
+        .args(["-all-time", IMAGE_EPOCH])
+        // squashfs-tools reads SOURCE_DATE_EPOCH itself and treats it as
+        // *competing* with the flags above: with both present it exits
+        // "SOURCE_DATE_EPOCH and command line options can't be used at the same
+        // time to set timestamp(s)" and builds nothing. Removing it from the
+        // child keeps an ordinary reproducible-build environment — where that
+        // variable is exported as a matter of course — from breaking `isopod
+        // image build-rootfs` outright, and settles the question the variable
+        // would otherwise raise: an image id that moves with the operator's
+        // shell is the defect this pin exists to close.
+        .env_remove("SOURCE_DATE_EPOCH");
+    cmd
+}
+
+/// Pack `root` into a read-only squashfs image at `img` with
+/// `mksquashfs <root> <img> -all-root -noappend` (quiet). `-all-root` maps every
+/// file to uid/gid 0 so the unprivileged build produces a root-owned image;
+/// `-noappend` overwrites the pre-created temp file rather than appending; the
+/// timestamps are pinned to [`IMAGE_EPOCH`] so the image's content id follows the
+/// tree and not the clock.
+fn run_mksquashfs(root: &Path, img: &Path) -> Result<()> {
+    let out = mksquashfs_command(root, img)
         .output()
         .context("spawning mksquashfs (is squashfs-tools installed?)")?;
     if !out.status.success() {
@@ -1816,6 +1863,105 @@ mod tests {
         assert!(
             preallocated.is_empty(),
             "/layers must ship empty; found {preallocated:?}"
+        );
+    }
+
+    /// The `mksquashfs` pin, checked on the command rather than on an image, so
+    /// it holds on a host with no packer — and so the environment half of it is
+    /// visible at all. `SOURCE_DATE_EPOCH` is read by squashfs-tools itself and
+    /// *conflicts* with the flags: left in the child's environment it aborts the
+    /// build, so its removal is as load-bearing as the flags are.
+    #[test]
+    fn the_pack_pins_its_timestamps_and_refuses_an_ambient_epoch() {
+        let cmd = mksquashfs_command(Path::new("/tree"), Path::new("/img.sqfs"));
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for flag in ["-mkfs-time", "-all-time"] {
+            let at = args.iter().position(|a| a == flag);
+            let at = at.unwrap_or_else(|| panic!("{flag} not passed; args were {args:?}"));
+            assert_eq!(
+                args.get(at + 1).map(String::as_str),
+                Some(IMAGE_EPOCH),
+                "{flag} must pin {IMAGE_EPOCH}"
+            );
+        }
+
+        // `env_remove` shows up as an override mapped to `None`. Inheriting the
+        // variable instead is not a weaker pin, it is a build that does not run.
+        let cleared = cmd
+            .get_envs()
+            .any(|(k, v)| k == "SOURCE_DATE_EPOCH" && v.is_none());
+        assert!(
+            cleared,
+            "SOURCE_DATE_EPOCH must be removed from the child environment"
+        );
+    }
+
+    /// What the pin is *for*: two builds of a tree that has not changed produce
+    /// the same image, and a build of a tree that has produces a different one.
+    ///
+    /// The control is the point. A pack that returned identical bytes for
+    /// everything would satisfy the first half and destroy the property the id
+    /// exists for, so the changed tree has to move it.
+    #[test]
+    fn an_unchanged_tree_packs_to_the_same_image_and_a_changed_one_does_not() {
+        // Hermetic skip when squashfs-tools is unavailable.
+        if Command::new("mksquashfs").arg("-version").output().is_err() {
+            eprintln!("SKIP squashfs reproducibility test: mksquashfs not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        write_base_overlay_dirs(&root).unwrap();
+        std::fs::write(root.join("hello"), b"hello\n").unwrap();
+        std::os::unix::fs::symlink("hello", root.join("link")).unwrap();
+
+        let pack = |name: &str| {
+            let img = dir.path().join(name);
+            run_mksquashfs(&root, &img).expect("pack");
+            paths::sha256_file(&img).unwrap()
+        };
+        // Set the mtimes apart explicitly rather than sleeping: the assembly
+        // directory is built fresh on every real build, so differing file times
+        // are the normal case, not a contrived one.
+        let touch = |p: &Path, secs: u64| {
+            let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t))
+                .unwrap();
+        };
+
+        touch(&root.join("hello"), 1_000_000_000);
+        let first = pack("a.sqfs");
+        touch(&root.join("hello"), 1_700_000_000);
+        let second = pack("b.sqfs");
+        assert_eq!(
+            first, second,
+            "a rebuild over an unchanged tree must not mint a new image id"
+        );
+
+        std::fs::write(root.join("hello"), b"goodbye\n").unwrap();
+        let changed = pack("c.sqfs");
+        assert_ne!(
+            first, changed,
+            "a real content change must still move the image id"
+        );
+
+        // The superblock's own creation stamp is the half `-all-time` cannot
+        // reach: squashfs magic `hsqs` at 0, then inode count, then mkfs time.
+        let bytes = std::fs::read(dir.path().join("a.sqfs")).unwrap();
+        assert_eq!(&bytes[0..4], b"hsqs", "squashfs magic present");
+        let mkfs_time = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(
+            mkfs_time.to_string(),
+            IMAGE_EPOCH,
+            "the superblock creation time must be pinned, not the clock"
         );
     }
 

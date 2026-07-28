@@ -214,8 +214,10 @@ pub fn check_base(stage: &StageMeta, current: &BaseId) -> BaseCheck {
             "stage {} ({:?}) records the {} image it was built on ({}), but that image has no \
              build-metadata sidecar on this host, so the two cannot be compared — the stage is \
              booting on a base that may not be the one its layers were made over. Rebuilding \
-             the image (`isopod image build-rootfs --flavor {} --force`) restores the stamp, \
-             but stamps it as a NEW build: every stage recording the old one then refuses to \
+             the image (`isopod image build-rootfs --flavor {} --force`) restores the stamp. \
+             The pack is timestamp-pinned, so an unchanged tree restores the SAME id and \
+             nothing else changes; if the tree has moved on — a new agent, different \
+             packages — the id is new, and every stage recording the old one then refuses to \
              fork until it is rebuilt or booted with the opt-in.",
             stage.stage_id,
             stage.label,
@@ -1500,9 +1502,10 @@ mod tests {
             why.contains("build-rootfs --flavor base-sqfs --force"),
             "the fix names the one flavor, not a whole-store rebuild: {why}"
         );
-        // Following the advice re-stamps the image as a NEW build, which turns
-        // this warning into a refusal for every stage holding the old id. Advice
-        // that costs that much has to say so.
+        // Following the advice can re-stamp the image as a new build, which
+        // turns this warning into a refusal for every stage holding the old id.
+        // Since the pack is timestamp-pinned that only happens when the tree
+        // really moved, but advice that can cost that much has to say so.
         assert!(
             why.contains("refuses to fork"),
             "the cost of the fix: {why}"

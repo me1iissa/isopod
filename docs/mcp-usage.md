@@ -190,10 +190,12 @@ each tool's MCP schema (self-describing); this is the one-line semantics.
 
 Forking checks the base *build*, not just the flavor, for every stage in the
 chain rather than only the one named. Every stage records the
-content id of the image it was made over (`base_sha256`); if that image has been
-rebuilt since — `isopod image build-all`, a new guest agent, or even a rebuild over
-an unchanged tree, since `mksquashfs` is not byte-reproducible — the fork is refused
-before boot rather than mounting layers over a root they no longer match. The
+content id of the image it was made over (`base_sha256`); if the image has
+*changed* since — `isopod image build-all` with a new guest agent, a
+`PROTO_VERSION` bump, different packages — the fork is refused
+before boot rather than mounting layers over a root they no longer match. A
+rebuild that produces the same tree produces the same id and refuses nothing:
+the pack is timestamp-pinned, so the clock is not part of the image. The
 error names both content ids and both ways out. `ISOPOD_ALLOW_BASE_SKEW=1` in
 the server's environment overrides it, for the commit as well as the boot — but
 it is set by whoever launches `isopod-mcp`, not by a tool call, so a client that

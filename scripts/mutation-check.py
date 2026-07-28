@@ -331,6 +331,46 @@ MUTATIONS = [
         ),
         filter="image::",
     ),
+    Mutation(
+        name="pack-superblock-time-not-pinned",
+        file="crates/core/src/image/rootfs.rs",
+        old='        .args(["-mkfs-time", IMAGE_EPOCH])\n',
+        new="",
+        defect=(
+            "The squashfs superblock takes its creation stamp from the clock "
+            "again, so rebuilding an unchanged tree mints a new image id — "
+            "which retires every stamped stage on that flavor and orphans the "
+            "warm-pool snapshot keyed on it, for a root that did not change."
+        ),
+        filter="image::",
+    ),
+    Mutation(
+        name="pack-file-times-not-pinned",
+        file="crates/core/src/image/rootfs.rs",
+        old='        .args(["-all-time", IMAGE_EPOCH])\n',
+        new="",
+        defect=(
+            "File timestamps are copied out of the assembly directory, which is "
+            "built fresh on every run, so the image id moves even with the "
+            "superblock pinned. Each half of the pin is separately sufficient "
+            "to break it, which is why both are asserted."
+        ),
+        filter="image::",
+    ),
+    Mutation(
+        name="pack-inherits-an-ambient-source-date-epoch",
+        file="crates/core/src/image/rootfs.rs",
+        old='        .env_remove("SOURCE_DATE_EPOCH");',
+        new='        .env_remove("ISOPOD_RESERVED_NOT_SOURCE_DATE_EPOCH");',
+        defect=(
+            "SOURCE_DATE_EPOCH reaches the packer, which refuses to run at all "
+            "when it is set alongside the timestamp flags. An operator whose "
+            "shell exports it — the ordinary reproducible-build environment — "
+            "cannot build an image, and the failure names neither isopod nor "
+            "the variable."
+        ),
+        filter="image::",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

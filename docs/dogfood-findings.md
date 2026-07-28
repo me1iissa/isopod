@@ -585,7 +585,7 @@ flowchart TB
     count the stages whose chain references the outgoing id and report them in
     the result JSON and on stderr. It must never fail the rebuild.
 
-30. **[open] MEDIUM — the squashfs pack is not timestamp-pinned, so a rebuild
+30. **[fixed] MEDIUM — the squashfs pack is not timestamp-pinned, so a rebuild
     over an unchanged tree mints a new base identity.** Measured: two
     `build-rootfs --force` runs 4 s apart over an identical tree gave
     `86f20abd…` and `6398c829…`. (Three runs inside the same second gave one id —
@@ -600,6 +600,16 @@ flowchart TB
     reads them (everything a run writes lands in the overlay upper, not the
     base), and note that `base-alpine` pulls packages, so its inputs can vary for
     real — pinning removes the spurious churn, not the genuine kind.
+    **Fixed**, to 1980-01-01 rather than the epoch so a DOS/ZIP date field can
+    hold it. Two things the finding did not anticipate turned up in the doing.
+    The timestamps a guest might have cared about are not read: Alpine ships
+    *hash*-based bytecode caches (`flags=3`, PEP 552), so a pinned mtime cannot
+    invalidate them. And squashfs-tools treats an ambient `SOURCE_DATE_EPOCH` as
+    **competing** with the flags rather than as a default — with both present it
+    exits `SOURCE_DATE_EPOCH and command line options can't be used at the same
+    time to set timestamp(s)` and builds nothing, so the naive pin would have
+    broken `image build-rootfs` outright on any host that exports it. The
+    variable is removed from the packer's environment.
 
 31. **[open] MEDIUM — warm-pool snapshots accumulate and nothing retires an
     orphan.** The key embeds `base_sha256`, so a rebuilt base can never resume a

@@ -391,11 +391,13 @@ Every commit records the content id of the base image it was built on
 re-hash of the file), and a fork checks it — **for every stage in the chain, not
 just the one you named**, since an ancestor's layers get mounted too — before
 anything boots.
-**Any rebuild counts**, not just one that changes the contents: `mksquashfs`
-stamps build times into the image, so re-running the build over an unchanged tree
-still produces a new content id. The check is deliberately conservative — it
-knows the image is not the one the layers were made over, not whether that
-matters.
+**A rebuild that changes nothing costs nothing.** The pack pins every timestamp
+it writes — the superblock's and every file's — so an image built twice from the
+same tree is byte-identical and keeps its content id, and the stages on it go on
+forking. What moves the id is a change to what is *in* the image: a new guest
+agent, a `PROTO_VERSION` bump, different Alpine packages. The check is still
+deliberately conservative about those — it knows the image is not the one the
+layers were made over, not whether the difference matters to them.
 
 ```mermaid
 flowchart TB
