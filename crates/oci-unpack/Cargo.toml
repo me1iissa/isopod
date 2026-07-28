@@ -14,6 +14,15 @@ tar = { workspace = true }
 # in `sys.rs`, the only module with `unsafe`. Matches the raw-libc style of the
 # sibling crates (no `nix`), and is already in the lockfile.
 libc = "0.2"
+# The image layout's `index.json`, manifests and config blob. Untrusted JSON
+# from the same archive as the layers, so it is parsed with the same suspicion:
+# every blob is digest-verified before it is deserialized.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Digest verification. A descriptor's `digest` is the only thing that makes a
+# blob the blob it claims to be, so it is checked rather than trusted.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -509,6 +509,46 @@ MUTATIONS = [
         package="isopod-oci-unpack",
     ),
     Mutation(
+        name="oci-digest-becomes-a-path-unchecked",
+        file="crates/oci-unpack/src/digest.rs",
+        old="        if encoded.len() != *len\n",
+        new="        if false\n",
+        defect=(
+            "A descriptor's digest stops being checked for length and alphabet "
+            "before it is turned into `blobs/<algorithm>/<encoded>`. A manifest "
+            "naming `sha256:../../../etc/shadow` then addresses whatever it "
+            "likes — read on the host, as the operator's user, before any layer "
+            "is looked at."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-blob-is-trusted-rather-than-verified",
+        file="crates/oci-unpack/src/layout.rs",
+        old="        if actual != d.digest.encoded() {\n            return Err(LayoutError::DigestMismatch {\n                expected: d.digest.to_string(),\n                actual,\n            });\n        }\n        Ok(())\n    }\n}",
+        new="        let _ = actual;\n        Ok(())\n    }\n}",
+        defect=(
+            "A layer blob's bytes stop being checked against the digest that "
+            "named them, so a layout whose blob store has been altered unpacks "
+            "whatever is in it. Content addressing that is not verified is "
+            "just a filename."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
+        name="oci-descriptor-size-wraps-instead-of-refusing",
+        file="crates/oci-unpack/src/layout.rs",
+        old='    let size = u64::try_from(size).map_err(|_| malformed("a descriptor has a negative size"))?;',
+        new="    let size = size as u64;",
+        defect=(
+            "A negative size in a descriptor wraps to an enormous unsigned one "
+            "instead of being refused. JSON has no unsigned integers, and every "
+            "ceiling in the reader is a comparison against this number — one "
+            "that is absurd rather than small sails past all of them."
+        ),
+        package="isopod-oci-unpack",
+    ),
+    Mutation(
         name="oci-implicit-directory-takes-the-umask",
         file="crates/oci-unpack/src/lib.rs",
         old=(

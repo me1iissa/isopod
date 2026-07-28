@@ -92,6 +92,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod digest;
+pub mod layout;
 mod name;
 // The only module permitted `unsafe`: `openat` and friends have no safe
 // equivalent in `std`, and keeping them in one place is what makes the
@@ -101,6 +103,8 @@ mod sys;
 
 #[cfg(test)]
 mod fixture;
+#[cfg(test)]
+mod layout_tests;
 #[cfg(test)]
 mod tests;
 
