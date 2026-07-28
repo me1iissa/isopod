@@ -241,7 +241,17 @@ fn the_client_dials_only_addresses_the_floor_allows() {
         );
     }
 
-    let server = TcpListener::bind("127.0.0.1:0").expect("bind");
+    // Bind where `localhost` actually points ON THIS HOST. GitHub's runners
+    // answer `::1` first; this developer machine answers `127.0.0.1`. A
+    // listener pinned to one stack makes the control below fail for a reason
+    // that has nothing to do with the destination floor — which is exactly how
+    // this test failed the first time it ever ran anywhere but its author's
+    // laptop.
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+        .expect("localhost resolves to something")
+        .next()
+        .expect("localhost resolves to at least one address");
+    let server = TcpListener::bind(addr).expect("bind");
     let port = server.local_addr().expect("addr").port();
     let (tx, rx) = mpsc::channel::<String>();
     // Bounded by construction: it serves until it is told to stop, and the test
@@ -267,8 +277,12 @@ fn the_client_dials_only_addresses_the_floor_allows() {
         .send()
         .expect_err("a name that resolves to loopback must not be dialled");
     let detail = transport_detail(&err);
+    // Either loopback spelling: which one `localhost` answers with is the
+    // host's business, not this crate's, and asserting on one of them tests
+    // the resolver's configuration rather than the floor.
     assert!(
-        detail.contains("will not dial") && detail.contains("127.0.0.1"),
+        detail.contains("will not dial")
+            && (detail.contains("127.0.0.1") || detail.contains("::1")),
         "the refusal has to reach the operator, and say which address it was \
          about; got: {detail}"
     );

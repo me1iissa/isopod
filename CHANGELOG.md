@@ -6,6 +6,23 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.1] — 2026-07-28
+
+### Fixed — a test asserted the host's resolver configuration, not the floor
+
+`the_client_dials_only_addresses_the_floor_allows` checked that the refusal
+message named `127.0.0.1`. Which loopback address `localhost` answers with is
+the host's business: this developer machine says `127.0.0.1`, GitHub's runners
+say `::1` first. The floor behaved correctly on both — the assertion did not,
+and the test failed the first time it ran anywhere but the machine it was
+written on.
+
+It now accepts either spelling, and binds its listener to whatever `localhost`
+actually resolves to rather than pinning `127.0.0.1`. That second half was a
+latent failure sitting directly behind the first: the control connects by name,
+so on a `::1`-first host it would have dialled a stack with nothing listening
+and failed for a reason unrelated to what it tests.
+
 ## [0.12.0] — 2026-07-27
 
 ### Added — `image ls` lists imported bases, and `image rm` removes them
