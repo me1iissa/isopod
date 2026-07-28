@@ -164,8 +164,11 @@ struct SandboxRunParams {
     /// image with no committed layers.
     #[serde(default)]
     stage: Option<String>,
-    /// Squashfs base image for a fresh (`stage: "base"`) run: `base-alpine`
-    /// (Python/Node/git/gcc toolchain, the default) or `base-sqfs` (busybox).
+    /// Base image for a fresh (`stage: "base"`) run: `base-alpine`
+    /// (Python/Node/git/gcc toolchain, the default), `base-sqfs` (busybox), or
+    /// an imported OCI image as `oci:<name>` (see `isopod image import`). An
+    /// imported image's `Env` and `WorkingDir` become defaults for the run,
+    /// applied under whatever this call sets itself.
     /// Ignored when forking an existing stage (it reuses the recorded base).
     #[serde(default)]
     base: Option<String>,
@@ -325,7 +328,8 @@ struct SandboxRunResult {
     vm_id: String,
     /// Human-memorable vanity name for this run's VM.
     vm_name: String,
-    /// Rootfs flavor / base the sandbox booted.
+    /// Rootfs flavor / base the sandbox booted (`oci:<name>` for an imported
+    /// image).
     rootfs_flavor: String,
     /// Committed stage id, present only when `commit_as` persisted a stage.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,7 +576,8 @@ struct StageEntry {
     parent: Option<String>,
     /// Full lineage, root-first, ending with `stage_id` itself.
     chain: Vec<String>,
-    /// Base image identifier the chain was built on (`base-alpine`/`base-sqfs`).
+    /// Base image identifier the chain was built on (`base-alpine`, `base-sqfs`,
+    /// or `oci:<name>` for an imported image).
     base: String,
     /// Content id (sha256) of the base image build the layers were made
     /// against. `null` for a stage committed before stamping existed, or on an
