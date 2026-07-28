@@ -188,6 +188,33 @@ parent — the caller's own destination directory — and the recursive delete
 emptied it. Refused now in both the name planner and the syscall layer, with a
 mutation for each so the pairing cannot quietly become decorative.
 
+A second pass, scoped to the crate alone before anything is wired to it — the
+wave-1 exit criterion — found **no escape**. The directory-fd walk, the
+hard-link confinement, the whiteout and opaque rules and the teardown all held
+against the inputs built against them, including the delete paths, which refuse
+a planted link exactly as the write path does. What it did find were two defects
+either side of the confinement, both the shape the previous three passes kept
+finding: a fix that covered the branch that worked.
+
+- **The operator's umask reached the image.** `mkdirat`'s mode argument is
+  masked by the process umask. The regular-file path already knew that and set
+  its mode explicitly; the directories created on the way to it did not, and
+  neither did the staging root. Under `umask 077` every directory no entry
+  describes came out `0o700` instead of `0o755` — and since the pack step turns
+  this tree into an image whose sha256 *is* its identity, one source image would
+  have imported to two different images on two hosts.
+- **A usrmerge link was reported as an escape.** A directory mode held back
+  because the directory denies its owner write access is applied at `finish`, by
+  which time the path may be something else. Gone and replaced-by-a-file were
+  handled; replaced by a *symbolic link* was not, and refused the whole image at
+  the very last step. `/lib -> usr/lib` is how every usrmerge image is shaped, so
+  this was an ordinary image rejected with a message accusing its author of
+  hand-crafting an attack.
+
+The umask test cannot set a umask — it is per-process and Rust runs tests as
+threads — so it re-executes the test binary under `umask 077` and asserts on
+what that child produced.
+
 ## [0.11.0] — 2026-07-26
 
 A hardening release. An adversarial review of shipped 0.10.0 — 34 agents, no
