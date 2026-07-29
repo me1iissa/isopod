@@ -1,0 +1,142 @@
+name: Full boot probe
+
+# Whether a GitHub-hosted runner can boot a real isopod microVM, end to end.
+#
+# The KVM probe established that /dev/kvm is present and that KVM_CREATE_VM
+# returns a file descriptor once the runner is in the kvm group. That is
+# necessary and NOT sufficient. isopod also needs a vendored Firecracker build,
+# guest images, and — for anything beyond --no-network — tap devices and an
+# nftables ruleset installed by `isopod setup`, which is the one privileged
+# step. None of that has been shown to work on a hosted runner.
+#
+# This probe answers it. It is workflow_dispatch only, deliberately: it builds
+# Firecracker from the vendored submodule and is far too slow for the PR path.
+# Its output decides whether the #[ignore]d live suite — the jail, VM lifecycle
+# and network enforcement tests, which today run nowhere but a maintainer's
+# laptop — can run in CI at all.
+#
+# Every step reports what it did rather than only succeeding, because a failure
+# here is a finding, not a defect.
+on:
+  workflow_dispatch:
+    inputs:
+      run_live_suite:
+        description: "Also run the #[ignore]d live tests if the boot succeeds"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  boot:
+    name: Boot a real microVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive # vendor/firecracker is built from source below
+          persist-credentials: false
+
+      - name: Runner shape
+        run: |
+          echo "vCPU:   $(nproc)"
+          echo "memory: $(free -g | awk '/Mem:/{print $2}') GiB"
+          echo "disk:   $(df -h / | awk 'NR==2{print $4}') free"
+          echo "kernel: $(uname -r)"
+
+      # Established by the KVM probe: the device is root:kvm 0660 and the runner
+      # user is not in the group, so this rule is the difference between present
+      # and usable. GitHub's own Android-virtualisation docs prescribe it.
+      - name: Grant kvm access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Host dependencies
+        run: |
+          sudo apt-get update -qq
+          # musl-tools: the guest agent is a static-pie musl binary.
+          # busybox-static: build-rootfs copies the host's static busybox in.
+          # nftables: `isopod setup` installs the egress ruleset through it.
+          sudo apt-get install -y -qq musl-tools busybox-static nftables
+          echo "busybox: $(command -v busybox) $(file -b "$(command -v busybox)" | cut -c1-40)"
+          echo "nft:     $(nft --version)"
+
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build isopod
+        run: |
+          cargo build --release --workspace --locked
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p isopod-guest-agent
+          ./target/release/isopod --version
+
+      # The slow step: Firecracker is built from the vendored submodule rather
+      # than downloaded, which is why this probe is dispatch-only.
+      - name: Build vendored Firecracker
+        run: |
+          ./target/release/isopod dev build-fc
+          ls -l "$HOME/.isopod/bin/firecracker"
+
+      - name: Guest images
+        run: |
+          ./target/release/isopod image fetch-kernel
+          ./target/release/isopod image build-all
+          ./target/release/isopod image ls
+
+      # THE UNPRIVILEGED HALF. If this succeeds and the next step does not, the
+      # answer is "hosted runners can boot guests but not network them", which
+      # is still worth knowing: most of the live suite would run.
+      - name: Boot with no network
+        run: |
+          ./target/release/isopod run --no-network -- \
+            /bin/sh -c 'echo booted; ip addr show lo | head -1; uname -a'
+
+      - name: Boot latency
+        run: ./target/release/isopod dev boot || echo "::warning::dev boot reported a problem"
+
+      # THE PRIVILEGED HALF, and the real unknown. `setup` creates tap devices in
+      # the root netns and installs an nftables table. A hosted runner has
+      # passwordless sudo, but nothing guarantees it permits tap creation or that
+      # nftables is usable in whatever container-ish environment the job runs in.
+      - name: Provision networking
+        id: setup
+        run: |
+          sudo ./target/release/isopod setup
+          ip -o link show | grep isopod-tap | head -3 || echo "::warning::no isopod-tap devices found"
+          sudo nft list tables || echo "::warning::nft list tables failed"
+
+      - name: Boot with NAT egress
+        run: |
+          ./target/release/isopod run -- \
+            /bin/sh -c 'ip addr show eth0 | head -3; wget -qO- -T 10 https://example.com | head -c 60; echo'
+
+      - name: Boot with filtered egress and a real allowlist
+        run: |
+          ./target/release/isopod run --allow-host example.com -- \
+            /bin/sh -c 'wget -qO- -T 10 https://example.com >/dev/null && echo allowed-ok; \
+                        wget -qO- -T 6 https://pypi.org >/dev/null 2>&1 && echo "LEAK: pypi reachable" || echo denied-ok'
+
+      - name: Live suite
+        if: inputs.run_live_suite
+        run: cargo test --workspace --locked -- --ignored --test-threads=1
+
+      - name: Verdict
+        if: always()
+        run: |
+          {
+            echo "### Full boot probe"
+            echo ""
+            echo "Whether a hosted runner can run isopod's live suite."
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| networking provisioned | ${{ steps.setup.outcome }} |"
+            echo "| job | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
