@@ -6,6 +6,53 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.4] — 2026-07-29
+
+### Security — the S3 XML parser carried two denial-of-service defects in its dependency
+
+`quick-xml` 0.39.4 is subject to two RustSec advisories, and isopod's one use
+of it — `quick_xml::de::from_str` parsing S3 `ListObjectsV2` responses during
+kernel selection (`crates/core/src/image/s3.rs`) — reaches both defective
+paths. That was established by reading the 0.39.4 source, not by assuming the
+serde surface was insulated:
+
+- **RUSTSEC-2026-0194**, quadratic attribute duplicate checking. The serde
+  deserializer probes every start tag for `xsi:nil` through the default,
+  checks-on attribute iterator, which compares each attribute name against
+  every previous one in the same tag — O(N²), pure computation, so no I/O
+  timeout on the consumer can interrupt it. A single crafted tag with enough
+  attributes stalls the parse for minutes.
+- **RUSTSEC-2026-0195**, unbounded namespace allocation. `de::from_str` is
+  built on `NsReader`, which copies every `xmlns` declaration into resolver
+  heap before the consumer ever sees the event; a crafted start tag forces
+  allocations at a multiple of its own size, with no cap and no knob to add
+  one.
+
+What reachable means here, and what it does not: the only bytes that parser
+ever sees come from `https://s3.amazonaws.com/spec.ccfc.min` — Firecracker's
+public kernel bucket — over TLS, on the blocking one-shot `image` import path.
+Exploiting either defect requires that endpoint, or the TLS path to it, to
+turn hostile, and the blast radius is a hung or OOM-killed `isopod image`
+command in the operator's terminal. No sandbox, no guest, and no long-lived
+process parses this XML. This was a real defect in a parser of remote input,
+not a reachable compromise of anything isopod isolates.
+
+`quick-xml` moves to 0.41.0, which fixes both: a hash pre-filter replaces the
+quadratic scan, and a start tag declaring more than 256 namespace bindings is
+rejected instead of allocated. No isopod source changed — the crate crosses
+two 0.x minors, but the API churn was elsewhere; the `de` surface and the
+`serialize` feature are intact, and the lockfile holds exactly one copy of the
+crate. `cargo deny check advisories` fails on the tree before this commit and
+passes after it.
+
+The upgrade's own risk is behavioural drift in deserialization, and the
+fixtures in `s3.rs` stand guard over every shape isopod parses — the
+pagination fields (including the `Option` continuation token), the
+`CommonPrefixes` roll-up, the `Contents` keys, each under the real bucket's
+namespace declaration. All pass unchanged. The one behaviour 0.41 adds —
+rejecting more than 256 namespace declarations on one element — cannot fire on
+a well-formed S3 listing, which declares one.
+
 ## [0.12.3] — 2026-07-29
 
 ### Fixed — a guest booted with no NIC left loopback down, so it could not talk to itself

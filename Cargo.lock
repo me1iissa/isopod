@@ -884,7 +884,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isopod-cli"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-core"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-fc"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "libc",
  "reqwest",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-guest-agent"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "isopod-core",
  "isopod-fc",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-jail"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "libc",
  "tempfile",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-mcp"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "isopod-core",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-registry"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "flate2",
  "hex",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-unpack"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "flate2",
  "hex",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-proto"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "base64",
  "serde",
@@ -1285,9 +1285,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
  "serde",

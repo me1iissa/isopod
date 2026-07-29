@@ -34,7 +34,7 @@ isopod-oci-registry = { path = "../oci-registry" }
 # opt the workspace reqwest into its `blocking` client (keeps the CLI runtime-free).
 reqwest = { workspace = true, features = ["blocking", "query"] }
 # Crate-local (not in the workspace set): S3 ListObjectsV2 XML parsing + home dir.
-quick-xml = { version = "0.39", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 dirs = "6"
 # `flock` for the network-slot claim, and `kill` for the orphan reaper. Matches
 # the raw-libc style of the sibling crates (no `nix`); already in the lockfile
