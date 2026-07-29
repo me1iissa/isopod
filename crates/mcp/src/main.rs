@@ -180,7 +180,8 @@ struct SandboxRunParams {
     #[serde(default)]
     base: Option<String>,
     /// Attach a NAT-egress network interface. Default `true`; set `false` to run
-    /// untrusted code with no network at all (exec still works over vsock).
+    /// untrusted code with no NIC and no egress (exec still works over vsock,
+    /// and loopback stays up so the workload can talk to itself).
     #[serde(default)]
     network: Option<bool>,
     /// Permit egress ONLY to these hosts (default-deny everything else). Setting
@@ -795,7 +796,7 @@ destroy). Use for executing code, builds, tests, package installs, or untrusted/
 commands isolated from the host. `cmd` runs via /bin/sh -c. Defaults to the toolchain base \
 (Python/Node/git/gcc); pass `stage` to fork a committed stage, `commit_as` to persist the result \
 as a new stage (only on exit 0). Non-zero exit codes are returned normally, not as errors. \
-Networking on by default; pass network=false for no network at all, or \
+Networking on by default; pass network=false for no NIC and no egress (loopback still works), or \
 allow_hosts=['host', ...] for DEFAULT-DENY egress that reaches only those hosts \
 (host-enforced, outside the sandbox) and returns an `egress` record of every \
 allowed and denied destination. timeout_s covers boot + exec \

@@ -6,6 +6,43 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.3] — 2026-07-29
+
+### Fixed — a guest booted with no NIC left loopback down, so it could not talk to itself
+
+The only loopback bring-up lived inside the network-config `apply()`, which is
+reached only after `configure_if_requested` finds an `isopod.net` token on the
+kernel command line — and the whole point of `--no-network` / `network: false`
+is that there is none. The guest's one interface stayed `state DOWN`, so `lo`
+came up in every boot except the one that had nothing else.
+
+The failure is expensive because it is partial. `bind()` on `127.0.0.1`
+succeeds — binding never required the link to be up — so a workload gets a
+socket and a port number and fails later, far from the cause, when something
+dials it. Measured with isopod's own suite as the workload (finding #49):
+`network: false` gave isopod-core 363 passed / 18 failed, every failure a
+broker test that listens and then dials itself; one `ip link set lo up` first
+gave 381 / 0.
+
+Loopback is now a boot duty, not network configuration: the agent's `main()`
+brings `lo` up unconditionally (`net::ensure_loopback_up`), before any network
+decision, and `apply()` shares the helper so a runtime reconfigure is still a
+full replacement on its own. `configure_if_requested` keeps its contract of
+being a no-op absent the token. `--no-network` still means what it says about
+egress — no NIC is attached and nothing leaves the guest; loopback is the
+guest's own plumbing, not a way out.
+
+This changes the agent binary, not the protocol: `PROTO_VERSION` stays 3, and
+an existing guest image keeps the old agent until rebuilt. The agent-hash
+freshness check exists for exactly this shape of change — once the host
+binaries are rebuilt, every agent-carrying image reports stale and the run
+path refuses it, naming the fix: `isopod image build-all` for the built
+flavors, a re-import (local, from cached blobs) for OCI bases.
+
+Mutation `loopback-left-down-without-a-nic` deletes the unconditional call and
+pairs with the boot-order assertion in the agent's tests, so the duty cannot
+be refactored away in silence.
+
 ## [0.12.2] — 2026-07-29
 
 ### Fixed — the refusal named an address, but nothing made it name the right one

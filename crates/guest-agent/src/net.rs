@@ -28,6 +28,11 @@
 //! networking off. Absent the `isopod.net` token (e.g. `--no-network`) this is a
 //! no-op. The runtime [`configure`] instead surfaces failures to the caller so
 //! the host learns the reconfiguration did not take.
+//!
+//! **Loopback is not network configuration.** [`ensure_loopback_up`] lives here
+//! because the ioctl plumbing does, but it is a boot duty `main()` performs
+//! unconditionally — before, and independent of, any `isopod.net` decision. A
+//! guest with no NIC still needs `127.0.0.1` to work (finding #49).
 
 use std::io;
 use std::sync::Mutex;
@@ -166,6 +171,21 @@ struct NetConfig {
     dns: Vec<String>,
 }
 
+/// Bring the loopback interface up, logging a failure rather than panicking.
+///
+/// A boot duty like mounting `/proc`, not part of network configuration: a
+/// guest booted with no NIC (`--no-network`) still needs `lo` up, or a workload
+/// that binds `127.0.0.1` gets a socket and a port — binding never required the
+/// link to be up — and then reaches nothing when it dials itself (finding #49).
+/// `main()` calls this unconditionally before any network decision; [`apply`]
+/// shares it so the runtime reconfigure path keeps its idempotent shape.
+/// Raising an interface that is already up is a no-op, so the repeat is free.
+pub fn ensure_loopback_up() {
+    if let Err(e) = sys::set_if_up("lo") {
+        log(&format!("net: bringing up lo failed (continuing): {e}"));
+    }
+}
+
 /// Configure `eth0` from `/proc/cmdline` if `isopod.net` is present.
 ///
 /// A no-op when the token is absent. All failures are logged and swallowed (the
@@ -250,9 +270,9 @@ pub fn configure(
 /// it (a no-NIC boot is expected).
 fn apply(cfg: &NetConfig) -> io::Result<()> {
     // Loopback is independent of the NIC and cheap; bring it up regardless.
-    if let Err(e) = sys::set_if_up("lo") {
-        log(&format!("net: bringing up lo failed (continuing): {e}"));
-    }
+    // (Already done at boot by `main()` — repeated here so a runtime
+    // reconfigure remains a full replacement on its own.)
+    ensure_loopback_up();
 
     // Start from a clean slate: bringing eth0 down flushes its prior address and
     // the routes through it, so a runtime reconfigure cannot leave stale state.
@@ -437,6 +457,17 @@ mod tests {
             .find(|(n, _)| n == k)
             .map(|(_, v)| v.as_str())
             .unwrap_or_else(|| panic!("{k} must be set"))
+    }
+
+    #[test]
+    fn bringing_loopback_up_is_best_effort_and_never_panics() {
+        // On the machine running this suite the SIOCSIFFLAGS ioctl is either
+        // refused (EPERM without CAP_NET_ADMIN) or a no-op (`lo` is already
+        // up); in the guest it is the fix for finding #49. The helper's
+        // contract is the same in all three cases: log and return. PID 1
+        // panicking over loopback would turn a degradation into a boot
+        // failure, which is the one outcome the agent must never choose.
+        ensure_loopback_up();
     }
 
     #[test]

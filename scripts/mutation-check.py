@@ -69,6 +69,11 @@ class Mutation:
     # is defended from several directions at once.
     package: str = "isopod-core"
     filter: str = ""
+    # Cargo target selector used alongside `package`. `--lib` fits a library
+    # crate; the guest agent is a binary crate, where `--lib` does not narrow
+    # the run but refuses it outright ("no library targets") — a non-zero exit
+    # with no compile error, which the harness would misread as "caught".
+    target: str = "--lib"
     field_names: tuple = field(default=(), repr=False)
 
 
@@ -407,6 +412,26 @@ MUTATIONS = [
             "nothing calls holds in the test suite and nowhere else."
         ),
         filter="snapshot::",
+    ),
+    # --- isopod-guest-agent -----------------------------------------------
+    # A binary crate: its unit tests live in the bin target, hence `--bins`.
+    Mutation(
+        name="loopback-left-down-without-a-nic",
+        file="crates/guest-agent/src/main.rs",
+        old="    net::ensure_loopback_up();\n",
+        new="",
+        defect=(
+            "Boot stops bringing `lo` up unconditionally, so it comes up only "
+            "inside the network-config path — which returns early when the "
+            "kernel command line has no `isopod.net` token. That is exactly "
+            "the `--no-network` boot, and the breakage is partial: bind() on "
+            "127.0.0.1 still succeeds (binding never needed the link up), so "
+            "a workload gets a port and fails only when something dials it, "
+            "far from the cause. Finding #49: 18 of isopod's own tests failed "
+            "this way inside a guest, none of them anywhere near an interface."
+        ),
+        package="isopod-guest-agent",
+        target="--bins",
     ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
@@ -1019,7 +1044,7 @@ def main() -> int:
 
             cmd = ["cargo", "test", "--workspace"]
             if m.package:
-                cmd = ["cargo", "test", "-p", m.package, "--lib"]
+                cmd = ["cargo", "test", "-p", m.package, m.target]
                 if m.filter:
                     cmd.append(m.filter)
             rc, out = run(cmd, tree, TEST_TIMEOUT_S)

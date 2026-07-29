@@ -9,11 +9,19 @@
 //!    (`isopod.layers=<N>`), assemble the overlay root over the squashfs base +
 //!    committed stage layers + writable scratch and `pivot_root` into it
 //!    ([`overlay`]); otherwise boot the writable ext4 root as before.
-//! 3. Emit the boot markers the host console parser keys on: `ISOPOD-INIT-START`
+//! 3. Bring the loopback interface up ([`net::ensure_loopback_up`]) —
+//!    unconditionally, before any network decision. A guest booted with no NIC
+//!    (`--no-network`) still needs `127.0.0.1` to work; leaving `lo` down lets
+//!    a workload bind a port and then reach nothing when it dials itself
+//!    (finding #49).
+//! 4. If the kernel command line carries `isopod.net=…`, apply the static
+//!    network config ([`net::configure_if_requested`]); absent the token that
+//!    step is a no-op.
+//! 5. Emit the boot markers the host console parser keys on: `ISOPOD-INIT-START`
 //!    then `ISOPOD-BOOT-COMPLETE uptime=<s>`.
-//! 4. Start a 1 Hz `TICK <uptime>` liveness loop (restore-continuity proof).
-//! 5. Start the single zombie-reaping thread (PID-1 duty).
-//! 6. Serve the [`isopod_proto`] RPC on vsock port [`isopod_proto::VSOCK_PORT`]
+//! 6. Start a 1 Hz `TICK <uptime>` liveness loop (restore-continuity proof).
+//! 7. Start the single zombie-reaping thread (PID-1 duty).
+//! 8. Serve the [`isopod_proto`] RPC on vsock port [`isopod_proto::VSOCK_PORT`]
 //!    forever.
 //!
 //! `unsafe` is unavoidable for the libc calls PID 1 must make; it is confined to
@@ -47,6 +55,11 @@ fn main() {
     // the overlay root over the squashfs base + committed layers + scratch and
     // pivots into it; without it, the ext4 root is used unchanged.
     overlay::assemble_if_requested();
+
+    // Loopback is a boot duty, not network configuration: bring `lo` up before
+    // any network decision, so 127.0.0.1 works even when no NIC is attached and
+    // `isopod.net` is absent (`--no-network`; finding #49).
+    net::ensure_loopback_up();
 
     // Apply static network config from the kernel command line (`isopod.net=…`).
     // Done AFTER the overlay pivot so `/etc/resolv.conf` lands in the merged
@@ -99,4 +112,35 @@ fn spawn_tick_thread() {
             server::print_marker(&format!("TICK {:.2}", server::read_uptime()));
             std::thread::sleep(Duration::from_secs(1));
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Negative control for finding #49. `main()` cannot run under `cargo
+    /// test` (it mounts filesystems and serves vsock forever) and the ioctl
+    /// itself needs a guest to mean anything (see `tests/live_net.rs`), so
+    /// what is checkable on any host is the boot sequence's shape: the duty
+    /// exists, and it comes before the one call that is allowed to skip
+    /// network work. If the unconditional bring-up is deleted — or slides
+    /// after `configure_if_requested`, whose early return absent `isopod.net`
+    /// is exactly the `--no-network` boot — this fails.
+    #[test]
+    fn boot_brings_loopback_up_unconditionally_and_before_any_network_decision() {
+        let src = include_str!("main.rs");
+        // Each needle spells its newline as an escape, so this function's own
+        // string literals cannot satisfy the search — only the real statements
+        // in `main()` (at main's four-space indent) can.
+        let lo = src.find("\n    net::ensure_loopback_up();").expect(
+            "main() must bring the loopback up as an unconditional boot duty (finding #49)",
+        );
+        let net = src
+            .find("\n    net::configure_if_requested();")
+            .expect("main() must still apply cmdline network config when requested");
+        assert!(
+            lo < net,
+            "the loopback bring-up must precede configure_if_requested: the \
+             latter returns early when `isopod.net` is absent, which is the \
+             --no-network boot that needs `lo` up in the first place"
+        );
+    }
 }

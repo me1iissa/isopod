@@ -1,12 +1,17 @@
-//! Live integration test for the guest network-config path with **no NIC
-//! attached**.
+//! Live integration tests for the guest network path with **no NIC attached**.
 //!
-//! It boots a real `dev-agent` microVM whose kernel command line carries
-//! `isopod.net=…`/`isopod.gw=…`/`isopod.dns=…` but attaches **no**
-//! `network-interfaces` device. The guest agent therefore exercises its full
-//! cmdline-parse + ioctl path against an absent `eth0`: `SIOCSIFADDR` returns
-//! `ENODEV`, and the agent must log the graceful `eth0 missing` line and keep
-//! serving vsock (proving a broken/absent NIC never kills exec).
+//! Two boots of a real `dev-agent` microVM, neither with a
+//! `network-interfaces` device:
+//!
+//! - [`live_net_no_nic_degrades_gracefully`] carries `isopod.net=…` on the
+//!   kernel command line, so the agent exercises its full cmdline-parse +
+//!   ioctl path against an absent `eth0`: `SIOCSIFADDR` returns `ENODEV`, and
+//!   the agent must log the graceful `eth0 missing` line and keep serving
+//!   vsock (proving a broken/absent NIC never kills exec).
+//! - [`live_no_network_boot_brings_loopback_up`] carries **no** `isopod.net`
+//!   token — the `--no-network` boot — and asserts `lo` is administratively
+//!   up anyway (finding #49), with the absence of `eth0` as the control that
+//!   loopback did not come up as a side effect of network configuration.
 //!
 //! This is the root-free proof of the ioctl path — no `sudo isopod setup`, no
 //! tap. The real egress test happens after setup (see `docs/m4-verify.md`).
@@ -32,10 +37,18 @@ use isopod_fc::models::{BootSource, Drive, MachineConfig, Vsock};
 use isopod_fc::vsock::connect_to_guest;
 use isopod_fc::{FcProcess, FcProcessConfig, StdioMode, VmId};
 use isopod_proto::frame::aio::{read_frame, write_frame};
-use isopod_proto::{Request, RequestOp, Response, VSOCK_PORT};
+use isopod_proto::{
+    b64_decode, ExecRequest, ExecStreamKind, Request, RequestOp, Response, ResponseBody, VSOCK_PORT,
+};
 use tokio::io::AsyncReadExt;
 
-/// Optimized boot args plus the static net config — but the test attaches **no**
+/// Optimized boot args with **no** `isopod.*` network tokens — the shape a
+/// `--no-network` run boots with.
+const BOOT_ARGS_PLAIN: &str =
+    "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda init=/init quiet \
+     i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd 8250.nr_uarts=1";
+
+/// [`BOOT_ARGS_PLAIN`] plus the static net config — but the test attaches **no**
 /// NIC, so the guest's `eth0` is absent.
 const BOOT_ARGS_NET: &str =
     "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda init=/init quiet \
@@ -141,6 +154,156 @@ async fn live_net_no_nic_degrades_gracefully() {
         log.contains("eth0 missing"),
         "expected the agent to log 'eth0 missing' on a no-NIC boot; serial was:\n{log}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires ISOPOD_FC_BIN/KERNEL, a dev-agent ISOPOD_AGENT_ROOTFS, and /dev/kvm"]
+async fn live_no_network_boot_brings_loopback_up() {
+    let (Some(fc_bin), Some(kernel), Some(rootfs_src)) = (
+        env_path("ISOPOD_FC_BIN"),
+        env_path("ISOPOD_FC_KERNEL"),
+        env_path("ISOPOD_AGENT_ROOTFS"),
+    ) else {
+        eprintln!(
+            "SKIP: set ISOPOD_FC_BIN, ISOPOD_FC_KERNEL, ISOPOD_AGENT_ROOTFS to run this test"
+        );
+        return;
+    };
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let base = work.path();
+    let rootfs = base.join("rootfs.ext4");
+    std::fs::copy(&rootfs_src, &rootfs).expect("copy rootfs");
+    let api_sock = base.join("api.sock");
+    let vsock_uds = base.join("vsock.sock");
+
+    let stdio = if std::env::var_os("ISOPOD_AGENT_SERIAL").is_some() {
+        StdioMode::Inherit
+    } else {
+        StdioMode::Null
+    };
+    let mut proc = FcProcess::spawn(
+        FcProcessConfig::new(&fc_bin, &api_sock)
+            .id(VmId::new("isopod-lo-live").expect("valid id"))
+            .stdio(stdio)
+            .socket_timeout(Duration::from_secs(10)),
+    )
+    .await
+    .expect("spawn firecracker");
+
+    let client = proc.client().expect("client");
+    client
+        .put_machine_config(&MachineConfig::new(1, 256))
+        .await
+        .expect("machine-config");
+    // No isopod.net token: the --no-network boot shape.
+    client
+        .put_boot_source(&BootSource::new(kernel.to_string_lossy(), BOOT_ARGS_PLAIN))
+        .await
+        .expect("boot-source");
+    client
+        .put_drive(&Drive::virtio(
+            "rootfs",
+            rootfs.to_string_lossy(),
+            true,
+            false,
+        ))
+        .await
+        .expect("drive");
+    // NOTE: deliberately NO put_network_interface — eth0 must be absent.
+    client
+        .put_vsock(&Vsock::new(3, vsock_uds.to_string_lossy()))
+        .await
+        .expect("vsock");
+    client.instance_start().await.expect("InstanceStart");
+
+    assert!(
+        wait_for_agent(&vsock_uds, Duration::from_secs(20)).await,
+        "agent never answered Ping"
+    );
+
+    // `lo`'s admin state, plus the interface list as the control: if eth0 were
+    // present, loopback being up could be network configuration's side effect
+    // rather than the unconditional boot duty this test exists to pin.
+    let frames = exec_collect(
+        &vsock_uds,
+        1,
+        ExecRequest {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat /sys/class/net/lo/flags; ls /sys/class/net".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            timeout_ms: Some(10_000),
+            stdin_b64: None,
+        },
+    )
+    .await;
+    let stdout = collect_stream(&frames, ExecStreamKind::Stdout);
+    eprintln!("\n==== GUEST PROBE OUTPUT ====\n{stdout}============================");
+
+    let mut lines = stdout.lines();
+    let flags_line = lines.next().expect("flags line from /sys/class/net/lo");
+    let flags = u32::from_str_radix(flags_line.trim().trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("unparseable lo flags {flags_line:?}"));
+    // IFF_UP is bit 0x1; a DOWN loopback reads 0x8 (IFF_LOOPBACK alone), which
+    // is exactly the measured state finding #49 starts from.
+    assert!(
+        flags & 0x1 != 0,
+        "lo must be administratively UP on a no-network boot; flags were {flags_line:?}"
+    );
+    let interfaces: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+    assert!(
+        !interfaces.contains(&"eth0"),
+        "control failed: eth0 present, so this boot had a NIC and proves \
+         nothing about the unconditional path; interfaces were {interfaces:?}"
+    );
+
+    let _ = proc.shutdown(Duration::from_secs(3)).await;
+}
+
+/// Run an exec and collect every response frame up to and including `ExecDone`
+/// (or a terminal `Error`) — same shape as `live_agent.rs`.
+async fn exec_collect(uds: &std::path::Path, id: u64, req: ExecRequest) -> Vec<Response> {
+    let mut s = connect_to_guest(uds, VSOCK_PORT)
+        .await
+        .expect("vsock connect");
+    write_frame(
+        &mut s,
+        &Request {
+            id,
+            op: RequestOp::Exec(req),
+        },
+    )
+    .await
+    .expect("write exec");
+    let mut frames = Vec::new();
+    while let Some(resp) = read_frame::<_, Response>(&mut s).await.expect("read frame") {
+        let terminal = matches!(
+            resp.body,
+            ResponseBody::ExecDone { .. } | ResponseBody::Error { .. }
+        );
+        frames.push(resp);
+        if terminal {
+            break;
+        }
+    }
+    frames
+}
+
+/// Concatenate the base64-decoded chunks of one stream from a set of exec frames.
+fn collect_stream(frames: &[Response], want: ExecStreamKind) -> String {
+    let mut out = Vec::new();
+    for f in frames {
+        if let ResponseBody::ExecStream { stream, data_b64 } = &f.body {
+            if *stream == want {
+                out.extend_from_slice(&b64_decode(data_b64).expect("valid base64"));
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Poll `Ping` until the agent answers or the deadline passes.
