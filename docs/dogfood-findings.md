@@ -871,3 +871,62 @@ deliberate, and already recorded as sound by the previous session; payloads went
 under `target/` again. Forking the same stage three times concurrently-in-sequence left
 the parent untouched, and none of the three throwaway VMs was committed, so the
 store gained nothing from a session that ran a full mutation harness inside it.
+
+## 2026-07-29 — 0.12.2 verified in-sandbox, and a guest that cannot talk to itself
+
+The wave-closing bump had to be run on the exact tree being tagged. The host's
+taps were gone — WSL2 had restarted, which destroys them — so the only way to
+boot at all was `network: false`. That is where this entry starts, because the
+suite came back **18 failed**, and all 18 were broker tests.
+
+A uniform failure is a harness result until something proves otherwise, and the
+control was already in the same output: 363 tests passed beside the 18, and
+those same 18 are green on CI. The cause is not the code:
+
+```mermaid
+flowchart LR
+    NF["sandbox_run with network false"] --> NIC["no NIC attached — intended"]
+    NF --> LO["lo left DOWN — not intended"]
+    LO --> B["bind on 127.0.0.1 SUCCEEDS<br/>a bind does not need the link up"]
+    LO --> C["connect on 127.0.0.1 reaches nothing"]
+    B --> T["a test that binds, then dials itself,<br/>fails far from the actual fault"]
+    C --> T
+```
+
+49. **[open] MEDIUM — `network: false` leaves the loopback interface DOWN, so a
+    guest cannot talk to itself.** Booted with `network: false`, the guest has
+    exactly one interface and it is down: `1: lo: <LOOPBACK> mtu 65536 qdisc noop
+    state DOWN`. The failure mode is bad because it is *partial* — `bind()` on
+    `127.0.0.1` succeeds, since binding never required the link to be up, so a
+    workload gets a socket and a port number and only fails later when something
+    tries to reach it. Measured against the workspace suite: `network: false`
+    gives isopod-core **363 passed / 18 failed**, every failure a broker test that
+    listens and then dials itself; a single `ip link set lo up` first gives
+    **381 passed / 0 failed**, and the whole workspace goes to **604 passed /
+    0 failed / 14 ignored**. The flag's documentation says it runs code "with no
+    network at all", which an operator reads as *no egress* — loopback is not
+    egress, it is the guest's own plumbing, and a test suite, a local server, or a
+    database that binds a port all need it. → FIX: bring `lo` up unconditionally
+    at guest-agent start. It costs nothing on a networked run and removes a class
+    of failure that presents as the workload's bug rather than the sandbox's.
+
+50. **[open] LOW — the bare `isopod-build` stage is older than the dependency set,
+    so the label the docs tell you to fork no longer builds offline.**
+    `docs/sandbox-build.md` says every build "forks `isopod-build`". That stage
+    was committed before `flate2` entered the tree, so its crates.io cache does
+    not contain it, and an offline build there dies with `no matching package
+    named flate2 found` — a resolution error that reads like a broken lockfile
+    rather than a stale cache. The versioned siblings are fine:
+    `isopod-build/0.12.0-tested` carries the current dependency set and ran the
+    whole suite offline. → FIX: the doc now names the newest `isopod-build/*`
+    stage rather than the bare label, and `stage_list` is the way to find it.
+    The deeper issue is that a mutable-looking label pinned to an immutable stage
+    silently rots; label-reuse semantics are still untested (noted in
+    `docs/sandbox-build.md`).
+
+**Checked and found sound**: the tap teardown was reported exactly right — the
+error named WSL2 as the likely cause, named `sudo isopod setup` as the fix, and
+offered `--no-network` as the alternative, which is what made the offline route
+obvious. Forking `isopod-build/0.12.0-tested` three times left the parent
+untouched and nothing was committed, so a session that ran the full suite twice
+and a probe VM added nothing to the store.
