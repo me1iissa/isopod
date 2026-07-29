@@ -6,6 +6,50 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.5] — 2026-07-29
+
+### Fixed — the commit hash pass read a gigabyte 8 KiB at a time
+
+`stage_id_for` streamed `layer.ext4` through `std::io::copy`, whose stack buffer
+is 8 KiB: 131 072 `read()` calls per apparent GiB, each also zero-filling its
+slice wherever the sparse scratch has a hole. It now reads through a 4 MiB heap
+buffer — 256 reads per GiB — retrying `EINTR` as `io::copy` did.
+
+**The measurement that motivated this did not reproduce, and the claim is
+corrected rather than repeated.** One instrumented run showed the hash pass at
+10.81 s against 0.38 s for the sparse copy of the same file, and that state did
+not appear again. Real end-to-end commits of the same shape ran 987/881/1018 ms
+before and 923/888/992 ms after: indistinguishable, and dominated by writeback
+of the scratch that had just been written.
+
+What survives measurement, on a real committed layer of 1 GiB apparent and
+64 MiB allocated, warm cache, isolated pass: **0.90 s before, 0.47 s after.**
+So the claim is 1.9× on the pass, plus a 512× cut in `read()` calls — which is
+what bounds the pathological case. Per-call overhead has only to reach ~80 µs
+for the old loop to cost 10 s/GiB, where the new loop stays under a second.
+That is worth having on a contended machine even though today's commits do not
+show it.
+
+**The digest does not change, and that is the whole constraint.** Stage ids are
+content-addressed, and the id is BLAKE3 over the file's full apparent bytes,
+holes included as the zeros they read back as. Skipping the holes would have
+been faster again — and would have silently re-identified every stage in every
+existing store, breaking forks with no error anywhere. A new test keeps the old
+`std::io::copy` implementation in place as the definition and asserts the
+buffered pass is byte-identical to it, over a fixture shaped for every loop
+boundary and over a real `make_scratch_ext4` image.
+
+A plain revert to `io::copy` is invisible to any test by design, since identical
+bytes is the contract; so mutation `stage-hash-feeds-the-whole-buffer` breaks
+the seam the loop actually has — feeding the hasher its whole buffer rather than
+the bytes read — and two tests catch it from different directions.
+
+`blake3`'s `mmap` and `rayon` features cut the isolated pass a further ~4×,
+measured, and are declined: six crates and a thread pool in a sandbox tool, none
+of them in the guest build stage's cargo cache, so offline in-guest builds would
+stop working. The stake is ~0.35 s per apparent GiB that writeback absorbs
+today.
+
 ## [0.12.4] — 2026-07-29
 
 ### Security — the S3 XML parser carried two denial-of-service defects in its dependency

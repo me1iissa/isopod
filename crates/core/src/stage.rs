@@ -386,16 +386,44 @@ pub fn chain_paths(stage: &StageMeta) -> Result<Vec<PathBuf>> {
 /// track owns the scratch builder; this re-export keeps existing callers stable).
 pub use crate::image::make_scratch_ext4;
 
+/// Read-buffer size for [`stage_id_for`]'s hash pass, in bytes (4 MiB).
+///
+/// `std::io::copy`'s 8 KiB stack buffer made the pass syscall-bound: 131072
+/// `read()` calls per apparent GiB, each one also paying to zero-fill its slice
+/// when it lands in a hole. 4 MiB cuts that to 256 calls and keeps BLAKE3's
+/// SIMD kernels fed with large slices. Larger buffers measured no faster.
+const HASH_BUF_LEN: usize = 4 * 1024 * 1024;
+
 /// The content-addressed stage id for `path`: `st-` + first 16 hex characters of
 /// the streamed BLAKE3 hash of the file.
+///
+/// The digest is over the file's full **apparent** bytes — holes in a sparse
+/// file read back as zeros, and those zeros are part of the identity. This is
+/// load-bearing: every stage id in every existing store was derived this way,
+/// so an implementation that fed the hasher anything else (skipping holes, say)
+/// would silently re-identify every stage and orphan every fork. Only the I/O
+/// pattern may change here, never the bytes.
 ///
 /// # Errors
 /// If the file cannot be opened or read.
 pub fn stage_id_for(path: &Path) -> Result<String> {
+    use std::io::Read;
+
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hashing {}", path.display()))?;
+    let mut buf = vec![0u8; HASH_BUF_LEN];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("hashing {}", path.display())))
+            }
+        };
+        hasher.update(&buf[..n]);
+    }
     let hex = hex::encode(hasher.finalize().as_bytes());
     Ok(format!("st-{}", &hex[..16]))
 }
@@ -1333,6 +1361,76 @@ mod tests {
                 .map(|p| p.join("mkfs.ext4"))
                 .find(|p| p.exists())
         })
+    }
+
+    /// `stage_id_for` is the identity of every stage ever committed, so its
+    /// digest must be byte-identical to the one the store was built on: the
+    /// BLAKE3 of the file's full apparent bytes, streamed through
+    /// `std::io::copy` — holes included, as the zeros they read back as. The
+    /// buffered read exists to change the I/O pattern, never the bytes; this
+    /// test holds the old implementation in place as the definition.
+    #[test]
+    fn the_buffered_hash_is_byte_identical_to_the_streamed_hash_ids_were_built_on() {
+        /// The pre-0.12.4 implementation, verbatim: the digest every existing
+        /// stage id in every existing store was derived with.
+        fn streamed_id(path: &Path) -> String {
+            let mut file = std::fs::File::open(path).unwrap();
+            let mut hasher = blake3::Hasher::new();
+            std::io::copy(&mut file, &mut hasher).unwrap();
+            format!("st-{}", &hex::encode(hasher.finalize().as_bytes())[..16])
+        }
+
+        let home = tempfile::tempdir().unwrap();
+
+        // A sparse file shaped to exercise every boundary the buffered loop
+        // has: data at the start, data straddling the first buffer boundary,
+        // holes between and after, and an apparent size that is NOT a multiple
+        // of the buffer — so the pass ends on a short read inside a hole.
+        let p = home.path().join("scratch.img");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(b"isopod sparse hash fixture").unwrap();
+            f.seek(SeekFrom::Start(HASH_BUF_LEN as u64 - 17)).unwrap();
+            f.write_all(&[0xAB; 64]).unwrap();
+            f.set_len(2 * HASH_BUF_LEN as u64 + 137).unwrap();
+        }
+        let m = std::fs::metadata(&p).unwrap();
+        assert!(
+            m.blocks() * 512 < m.len(),
+            "fixture must be genuinely sparse (allocated {} < apparent {})",
+            m.blocks() * 512,
+            m.len()
+        );
+
+        assert_eq!(
+            stage_id_for(&p).unwrap(),
+            streamed_id(&p),
+            "the buffered hash changed the digest; every existing stage id \
+             would be silently re-identified"
+        );
+        // And both equal the hash of the apparent bytes read back whole —
+        // holes hash as their zeros, not as nothing.
+        let apparent = std::fs::read(&p).unwrap();
+        assert_eq!(apparent.len() as u64, m.len());
+        assert_eq!(
+            stage_id_for(&p).unwrap(),
+            format!(
+                "st-{}",
+                &hex::encode(blake3::hash(&apparent).as_bytes())[..16]
+            ),
+            "the id must be the hash of the file's apparent bytes"
+        );
+
+        // The same equality over the production writer's artifact: a real
+        // sparse ext4 from `make_scratch_ext4`, when mkfs.ext4 is available.
+        if which_mkfs().is_some() {
+            let scratch = home.path().join("scratch.ext4");
+            make_scratch_ext4(&scratch, 32).expect("mkfs a 32 MiB scratch");
+            assert_eq!(stage_id_for(&scratch).unwrap(), streamed_id(&scratch));
+        } else {
+            eprintln!("skipping the ext4 half: mkfs.ext4 not found on PATH");
+        }
     }
 
     // -- base stamping and the skew check ------------------------------------

@@ -240,6 +240,23 @@ MUTATIONS = [
         filter="stage::",
     ),
     Mutation(
+        name="stage-hash-feeds-the-whole-buffer",
+        file="crates/core/src/stage.rs",
+        old="        hasher.update(&buf[..n]);",
+        new="        hasher.update(&buf);",
+        defect=(
+            "The commit hash loop feeds the hasher its whole read buffer "
+            "rather than the bytes the read returned, so any file whose "
+            "apparent size is not a buffer multiple gets a different digest "
+            "than the streamed hash every existing stage id was derived from. "
+            "Nothing errors: commits keep succeeding, forks keep resolving — "
+            "the store is simply re-identified out from under every user, "
+            "which is the one way the buffered-read optimisation (0.12.4) "
+            "was allowed to go wrong."
+        ),
+        filter="stage::",
+    ),
+    Mutation(
         name="layers-mountpoint-not-shipped",
         file="crates/core/src/image/rootfs.rs",
         old='const BASE_OVERLAY_DIRS: &[&str] = &["overlay", "mnt", "layers"];',
