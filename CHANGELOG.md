@@ -6,6 +6,55 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.12.2] — 2026-07-29
+
+### Fixed — the refusal named an address, but nothing made it name the right one
+
+`screen_resolved` refuses a name when any address it resolves to is floored, and
+that function's own doc calls naming the address load-bearing: the message
+reaches an operator's terminal about their own machine, and it is the only thing
+that tells them whether they hit a rebinding payload or their own split-horizon
+DNS.
+
+Nothing pinned it. Replacing `bad.ip()` with `addrs[0].ip()` — a refusal that
+fires correctly and then points at the wrong record — left all 31 tests green.
+That was established by applying the change and running the suite, not by
+reading it.
+
+**The unit level is the only level that reaches it.** The integration test
+asserts against the addresses the host actually resolved, which is right for
+what it covers and cannot cover this: `localhost` answers with loopback and
+nothing else, so every address it resolves is itself an offender and the match
+holds under either implementation. A record that passes and a record that is
+floored only coexist in the unit test's pairs.
+
+The assertion now has two halves and the second is the load-bearing one: the
+message must name the offender, and must **not** name the record that passed.
+Naming `addrs[0]` satisfies the first half in three of the four pairs — only the
+good-record-first case catches it, and only the negative half catches it there.
+Put in operator terms, what `addrs[0]` does is send someone debugging a
+split-horizon resolver to look at the one record that is fine.
+
+Addresses are compared by parsing the literal and printing it back, rather than
+by searching for the spelling the table typed, because the two differ: `std`
+prints an IPv4-mapped address in mixed notation and a NAT64 one in hex, so a
+table's `64:ff9b::169.254.169.254` would never be found in a message that says
+`64:ff9b::a9fe:a9fe`.
+
+Mutation `oci-registry-refusal-names-the-wrong-address` pairs with the assertion
+so it cannot be refactored away in silence.
+
+### Fixed — the in-sandbox build recipe encoded a payload that was already encoded
+
+`docs/sandbox-build.md` told you to `base64 -w0` a source tarball before handing
+it to `--stdin-file`. The channel is binary-safe on both the CLI and the MCP
+surface — the bytes are base64'd inside the protocol frame either way — so
+encoding them first only inflated the payload by a third, against a ceiling that
+is already the binding constraint. The recipe now sends the tarball raw and
+states that ceiling: `PutFile` is a single frame capped at `MAX_FRAME_LEN`, so
+roughly 6 MiB of raw input, and there is no inbound equivalent to the streamed,
+unbounded `copy_out`.
+
 ## [0.12.1] — 2026-07-28
 
 ### Fixed — a test asserted the host's resolver configuration, not the floor
