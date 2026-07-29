@@ -22,7 +22,15 @@ jobs:
       - name: Host packaging deps
         run: sudo apt-get update && sudo apt-get install -y musl-tools rpm
 
-      - uses: Swatinem/rust-cache@v2
+      # Deliberately NOT cached. A restored `target/` is compiled object code,
+      # and everything below packages whatever it finds there into the .deb,
+      # the .rpm and the tarball. `--locked` pins dependency versions; it says
+      # nothing about the contents of a cache entry. Actions caches are writable
+      # from the default branch and readable by a tag build, so caching here
+      # would let anything that can run a workflow on `main` place artifacts
+      # into a signed-off release without touching a line of source — and
+      # SHA256SUMS below would checksum the result without complaint.
+      # A release is the one build that must start from nothing.
 
       - name: Build host binaries
         run: cargo build --release --workspace --locked
