@@ -70,6 +70,12 @@ jobs:
           head_ver="$HEAD_VER"
           echo "current (base): $base_ver -> incoming (head): $head_ver"
           if [ "$head_ver" = "$base_ver" ]; then
+            # CODE_PATHS is a space-separated pathspec list and MUST word-split
+            # here. Quoting it hands git one path literally named
+            # "crates/ Cargo.toml Cargo.lock vendor/ scripts/", which matches
+            # nothing, so the diff is always empty and the guard passes on
+            # every change it exists to catch.
+            # shellcheck disable=SC2086
             if git diff --name-only "$base_sha"...HEAD -- $CODE_PATHS | grep -q .; then
               echo "::error file=Cargo.toml::code changed but the workspace version is still $base_ver — bump it (semver: minor for features/breaking, patch for fixes)"
               exit 1
@@ -94,6 +100,12 @@ jobs:
           fi
           if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
             tagged="$(git rev-list -n1 "v$ver")"
+            # CODE_PATHS is a space-separated pathspec list and MUST word-split
+            # here. Quoting it hands git one path literally named
+            # "crates/ Cargo.toml Cargo.lock vendor/ scripts/", which matches
+            # nothing, so the diff is always empty and the guard passes on
+            # every change it exists to catch.
+            # shellcheck disable=SC2086
             if [ "$tagged" != "$GITHUB_SHA" ] && \
                git diff --name-only "$tagged" "$GITHUB_SHA" -- $CODE_PATHS | grep -q .; then
               echo "::error file=Cargo.toml::code changed since v$ver but the workspace version was not bumped"

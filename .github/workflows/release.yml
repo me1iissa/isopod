@@ -91,7 +91,7 @@ jobs:
           done
 
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS
+        run: cd dist && sha256sum -- * > SHA256SUMS
 
       # SHA256SUMS above proves a download matches what the workflow uploaded;
       # it proves nothing about where the build came from — an attacker with
