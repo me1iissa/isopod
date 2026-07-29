@@ -112,16 +112,53 @@ jobs:
           ip -o link show | grep isopod-tap | head -3 || echo "::warning::no isopod-tap devices found"
           sudo nft list tables || echo "::warning::nft list tables failed"
 
+      # busybox wget cannot be used to test egress. It issues absolute-form
+      # requests for https:// URLs instead of CONNECT, so the broker refuses it
+      # as malformed before policy is ever consulted — and a DNS failure reads
+      # identically to a blocked host. The first run of this probe passed both
+      # egress steps that way, proving nothing. Use the alpine base and python's
+      # urllib, which speaks CONNECT and distinguishes the failure modes.
       - name: Boot with NAT egress
         run: |
-          ./target/release/isopod run -- \
-            /bin/sh -c 'ip addr show eth0 | head -3; wget -qO- -T 10 https://example.com | head -c 60; echo'
+          set -o pipefail
+          ./target/release/isopod run --stage base --base base-alpine -- \
+            /bin/sh -c 'python3 - <<PY
+          import urllib.request, sys
+          body = urllib.request.urlopen("https://example.com/", timeout=20).read()
+          assert b"Example Domain" in body, body[:200]
+          print("nat-egress-ok", len(body), "bytes")
+          PY' | tee /dev/stderr | grep -q nat-egress-ok
 
+      # Two assertions, and BOTH must hold: the allowlisted host is reachable
+      # AND the other one is refused BY POLICY. Checking only the refusal is
+      # worthless — everything fails when nothing works. The denial is matched
+      # on the broker's own 403, so a timeout or a DNS error fails the step
+      # instead of being mistaken for enforcement.
       - name: Boot with filtered egress and a real allowlist
         run: |
-          ./target/release/isopod run --allow-host example.com -- \
-            /bin/sh -c 'wget -qO- -T 10 https://example.com >/dev/null && echo allowed-ok; \
-                        wget -qO- -T 6 https://pypi.org >/dev/null 2>&1 && echo "LEAK: pypi reachable" || echo denied-ok'
+          set -o pipefail
+          ./target/release/isopod run --stage base --base base-alpine --allow-host example.com -- \
+            /bin/sh -c 'python3 - <<PY
+          import urllib.request, urllib.error
+          body = urllib.request.urlopen("https://example.com/", timeout=20).read()
+          assert b"Example Domain" in body, body[:200]
+          print("allowed-ok")
+          try:
+              urllib.request.urlopen("https://pypi.org/simple/", timeout=15).read()
+              print("LEAK: a host outside the allowlist was reachable")
+          except Exception as e:
+              # The broker refuses a tunnel to a non-allowlisted host with 403.
+              # Anything else — timeout, DNS, connection reset — is NOT proof of
+              # enforcement and must not be reported as one.
+              if "403" in str(e):
+                  print("denied-by-policy-ok")
+              else:
+                  print("INCONCLUSIVE: refused, but not by policy:", type(e).__name__, e)
+          PY' | tee /dev/stderr > out.txt
+          grep -q allowed-ok out.txt || { echo "::error::allowlisted host was NOT reachable"; exit 1; }
+          grep -q denied-by-policy-ok out.txt || { echo "::error::no policy denial observed"; exit 1; }
+          grep -q LEAK out.txt && { echo "::error::egress leak"; exit 1; }
+          echo "both halves held: allowlisted reachable, other refused by policy"
 
       - name: Live suite
         if: inputs.run_live_suite
