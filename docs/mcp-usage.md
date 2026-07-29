@@ -208,9 +208,11 @@ isopod 0.12.0 record no content id and fork unchecked.
 
 Return shape (abridged): `{exit_code, signal, timed_out, stdout, stderr,
 stdout_truncated, stderr_truncated, stdout_bytes, stderr_bytes, duration_ms,
-total_ms, path, resume_ms?, snapshot_built, commit_ms?, vcpus, mem_mib,
-vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?, guest_ip?,
-stdout_log_path, stderr_log_path, serial_log_path, copied?, egress?}`.
+total_ms, path, boot_ms?, teardown_ms?, copy_out_ms?, snapshot_build_ms?,
+resume_ms?, snapshot_built, commit_ms?, commit_hash_ms?, commit_copy_ms?,
+vcpus, mem_mib, vm_id, vm_name, rootfs_flavor, stage_id?, stage_name?, slot?,
+guest_ip?, stdout_log_path, stderr_log_path, serial_log_path, copied?,
+egress?}`.
 
 It is one flat object with two nested ones hanging off it. A `?` marks a field
 that is only there under a condition — which condition is the useful part:
@@ -229,8 +231,14 @@ classDiagram
         +u64 total_ms
         +String path
         +bool snapshot_built
+        +u64 boot_ms?
         +u64 resume_ms?
+        +u64 teardown_ms?
+        +u64 copy_out_ms?
+        +u64 snapshot_build_ms?
         +u64 commit_ms?
+        +u64 commit_hash_ms?
+        +u64 commit_copy_ms?
         +String stage_id?
         +String stage_name?
         +u32 slot?
@@ -264,9 +272,15 @@ classDiagram
 ```
 
 `stderr` mirrors every `stdout` field. `resume_ms` and `snapshot_built` track
-`path` — `"warm"` means a snapshot resume, `"cold"` a full boot. `stage_*` and
-`commit_ms` appear only when `commit_as` actually committed; `slot`/`guest_ip`
-only when networking was on.
+`path` — `"warm"` means a snapshot resume, `"cold"` a full boot, and `boot_ms`
+(InstanceStart → first agent ping) is the cold path's counterpart to
+`resume_ms`. `teardown_ms` (halt → VMM exit → log drain) is on every completed
+run; `copy_out_ms` only when `copy_out` streamed files; `snapshot_build_ms`
+only beside `snapshot_built: true` — the one-time builder-VM cost inside that
+run's `total_ms`. `stage_*` and `commit_ms` appear only when `commit_as`
+actually committed, with `commit_hash_ms` (the BLAKE3 content pass) and
+`commit_copy_ms` (the sparse layer copy) splitting where the commit time went;
+`slot`/`guest_ip` only when networking was on.
 
 The inline `stdout`/`stderr` are 64 KiB **heads**, with exact byte totals
 alongside them and the complete streams on disk at the `*_log_path`s — those

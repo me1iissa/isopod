@@ -315,6 +315,58 @@ isopod image rm alpine-3.20            # refused while a stage records it as its
 
 Every subcommand prints exactly one JSON object to stdout (human-readable logs go to stderr), so the CLI, the MCP server, humans, and CI all drive the same core.
 
+### Where a run's time goes
+
+`total_ms` is the whole run; the report now says where it went. Each phase
+that used to be invisible has its own additive field — absent when the phase
+did not happen, so existing consumers see the exact JSON they always did:
+
+| Field | Phase | Present |
+|---|---|---|
+| `boot_ms` | `InstanceStart` → first agent ping (±50 ms poll quantum) | cold path |
+| `resume_ms` | snapshot resume | warm path |
+| `teardown_ms` | guest halt → VMM exit → log drain | every completed run |
+| `copy_out_ms` | streaming `copy_out` files to the host | when files were copied |
+| `snapshot_build_ms` | one-time warm-pool builder VM | when `snapshot_built` |
+| `commit_ms` = `commit_hash_ms` + `commit_copy_ms` + scans | stage commit, split into the BLAKE3 content pass and the sparse layer copy | when a stage committed |
+
+A real 509 ms cold `--no-network` run:
+
+```mermaid
+gantt
+    dateFormat x
+    axisFormat %L ms
+    section run
+    validate + resolve  :0, 21
+    prepare_disk (mkfs) :22, 46
+    boot fc_spawn       :46, 53
+    boot api_config     :53, 110
+    boot kernel_wait    :110, 320
+    exec                :321, 368
+    teardown            :368, 509
+```
+
+The same spans print live on stderr — every build, no feature flag, off by
+default. `RUST_LOG=isopod=debug` enables them (stdout stays the single JSON
+line):
+
+```console
+$ RUST_LOG=isopod=debug isopod run --no-network --stage base --base base-alpine -- true
+DEBUG isopod.run:isopod.run.prepare_disk{isopod.disk.kind="scratch_mkfs"}: close time.busy=23.4ms
+DEBUG isopod.run:isopod.run.boot:isopod.boot.kernel_wait: close time.idle=209ms
+DEBUG isopod.run:isopod.run.boot{isopod.boot_ms=232}: close
+DEBUG isopod.run:isopod.run.exec: close time.idle=46.4ms
+DEBUG isopod.run:isopod.run.teardown: close time.idle=138ms
+DEBUG isopod.run{isopod.vm_id="dev-d82b5562" isopod.run.path="cold" ...}: close
+```
+
+This is instrumentation, not telemetry: the spans go to your stderr and
+nowhere else. There is no exporter, no network path, and no `opentelemetry`
+dependency in any build; span attributes carry no command lines, no paths, no
+stage names, and no exact output sizes (guest-influenced magnitudes appear
+only as log2 buckets). What this does not buy: per-run CPU or guest memory
+numbers, and `exec_ms` still folds vsock output streaming into compute time.
+
 ### Importing OCI images
 
 `isopod image import` turns a container image into an isopod base — pulled from a registry, read from a local OCI layout, or read from a `docker save` tarball. Every blob is digest-verified before its bytes are used, and layers are unpacked by a confined extractor that never follows a symbolic link an earlier layer planted.

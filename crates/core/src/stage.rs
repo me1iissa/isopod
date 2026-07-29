@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -432,6 +433,17 @@ pub fn stage_id_for(path: &Path) -> Result<String> {
 // Root-parameterized implementations (unit-testable without $ISOPOD_HOME).
 // ===========================================================================
 
+/// The commit's internal phase timings, measured where the phases run so the
+/// run report can split `commit_ms` into its dominant costs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommitTimings {
+    /// The streamed BLAKE3 pass over the scratch — one full read.
+    pub(crate) hash_ms: u64,
+    /// The sparse copy + freeze + rename — the second full read. `None` when
+    /// no new layer was written (the idempotent re-commit path).
+    pub(crate) copy_ms: Option<u64>,
+}
+
 pub(crate) fn commit_in(
     root: &Path,
     scratch_path: &Path,
@@ -440,12 +452,34 @@ pub(crate) fn commit_in(
     base: &BaseId,
     allow_base_skew: bool,
 ) -> Result<StageMeta> {
+    commit_in_timed(root, scratch_path, label, parent, base, allow_base_skew).map(|(meta, _)| meta)
+}
+
+pub(crate) fn commit_in_timed(
+    root: &Path,
+    scratch_path: &Path,
+    label: &str,
+    parent: Option<&str>,
+    base: &BaseId,
+    allow_base_skew: bool,
+) -> Result<(StageMeta, CommitTimings)> {
     if label.trim().is_empty() {
         bail!("stage label must not be empty");
     }
-    let stage_id = stage_id_for(scratch_path)?;
-    let by_id = get_by_id_in(root, &stage_id)?;
-    let by_label = list_in(root)?.into_iter().find(|s| s.label == label);
+    let t_hash = Instant::now();
+    let stage_id = {
+        let _g = tracing::debug_span!(target: crate::obs::TARGET, "isopod.commit.hash").entered();
+        stage_id_for(scratch_path)?
+    };
+    let hash_ms = t_hash.elapsed().as_millis() as u64;
+    let (by_id, by_label) = {
+        let _g =
+            tracing::debug_span!(target: crate::obs::TARGET, "isopod.commit.store_scan").entered();
+        (
+            get_by_id_in(root, &stage_id)?,
+            list_in(root)?.into_iter().find(|s| s.label == label),
+        )
+    };
 
     match (by_id, by_label) {
         // Content-addressed store: identical bytes *under the same label* ⇒
@@ -457,7 +491,13 @@ pub(crate) fn commit_in(
                  returning existing stage {:?}",
                 existing.name
             );
-            return Ok(existing);
+            return Ok((
+                existing,
+                CommitTimings {
+                    hash_ms,
+                    copy_ms: None,
+                },
+            ));
         }
         // A label is a *reference* other runs resolve by, and `resolve_in` returns
         // an exact label match before it considers prefixes — so committing a stage
@@ -543,7 +583,11 @@ pub(crate) fn commit_in(
     }
 
     // Vanity name, unique among existing stages.
-    let taken: HashSet<String> = list_in(root)?.into_iter().map(|s| s.name).collect();
+    let taken: HashSet<String> = {
+        let _g =
+            tracing::debug_span!(target: crate::obs::TARGET, "isopod.commit.store_scan").entered();
+        list_in(root)?.into_iter().map(|s| s.name).collect()
+    };
     let name = crate::names::unique_name(&stage_id, |n| taken.contains(n));
 
     let dir = root.join(&stage_id);
@@ -552,13 +596,18 @@ pub(crate) fn commit_in(
 
     // Sparse-copy the artifact, then freeze it read-only. Write to a `.partial`
     // sibling and rename so a crash never leaves a half-written `layer.ext4`.
+    let t_copy = Instant::now();
     let layer = dir.join(LAYER_FILE);
-    let layer_tmp = dir.join("layer.ext4.partial");
-    sparse_copy(scratch_path, &layer_tmp)?;
-    std::fs::set_permissions(&layer_tmp, std::fs::Permissions::from_mode(0o444))
-        .with_context(|| format!("chmod 0444 {}", layer_tmp.display()))?;
-    std::fs::rename(&layer_tmp, &layer)
-        .with_context(|| format!("finalizing {}", layer.display()))?;
+    {
+        let _g = tracing::debug_span!(target: crate::obs::TARGET, "isopod.commit.copy").entered();
+        let layer_tmp = dir.join("layer.ext4.partial");
+        sparse_copy(scratch_path, &layer_tmp)?;
+        std::fs::set_permissions(&layer_tmp, std::fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("chmod 0444 {}", layer_tmp.display()))?;
+        std::fs::rename(&layer_tmp, &layer)
+            .with_context(|| format!("finalizing {}", layer.display()))?;
+    }
+    let copy_ms = t_copy.elapsed().as_millis() as u64;
 
     let fmeta = std::fs::metadata(&layer).with_context(|| format!("stat {}", layer.display()))?;
     let meta = StageMeta {
@@ -574,7 +623,13 @@ pub(crate) fn commit_in(
         bytes_allocated: fmeta.blocks() * 512,
     };
     write_meta(&dir, &meta)?;
-    Ok(meta)
+    Ok((
+        meta,
+        CommitTimings {
+            hash_ms,
+            copy_ms: Some(copy_ms),
+        },
+    ))
 }
 
 pub(crate) fn list_in(root: &Path) -> Result<Vec<StageMeta>> {

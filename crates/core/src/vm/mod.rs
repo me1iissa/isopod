@@ -23,6 +23,9 @@ use crate::image::{self, RootfsFlavor};
 use crate::net;
 use crate::net::broker;
 use crate::net::egress::DenyReason;
+use crate::obs::{self, Attr};
+use tracing::field::Empty;
+use tracing::Instrument as _;
 // Re-exported below so the CLI and the MCP server can name a caller without
 // reaching into `net::credentials` for a two-variant enum.
 pub use crate::net::credentials::Caller;
@@ -905,6 +908,28 @@ pub struct RunReport {
     pub total_ms: u64,
     /// Which boot path served this run (`warm` snapshot resume vs `cold` boot).
     pub path: RunPath,
+    /// Cold-boot duration in milliseconds: `InstanceStart` through the first
+    /// successful vsock ping. Present only on the cold path; the warm path
+    /// reports [`resume_ms`](Self::resume_ms) instead. Readiness polls at
+    /// 50 ms, so the value is quantized +0–50 ms high.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_ms: Option<u64>,
+    /// Teardown duration in milliseconds: the in-guest halt request, waiting
+    /// for the VMM to exit (forcing it after 3 s), and the serial-log drain.
+    /// On the user's critical path and inside `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teardown_ms: Option<u64>,
+    /// Total `--copy-out` streaming duration in milliseconds, across all
+    /// requested files. Present only when at least one file was copied. Runs
+    /// after the exec, outside the `timeout_s` budget, inside `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_out_ms: Option<u64>,
+    /// Wall time in milliseconds this run spent building the warm-pool
+    /// snapshot (booting and snapshotting a builder VM). Present only when
+    /// `snapshot_built` is `true`; it is the one-time cost hidden inside that
+    /// first run's `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_build_ms: Option<u64>,
     /// Snapshot-resume duration in milliseconds — the time from spawning the
     /// fresh Firecracker process through a ready, network-reconfigured guest.
     /// Present only on the warm path; compare against a cold run's `total_ms`.
@@ -918,6 +943,15 @@ pub struct RunReport {
     /// committed a stage this run; included in `total_ms`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_ms: Option<u64>,
+    /// The BLAKE3 content-hash pass inside `commit_ms`, milliseconds — one
+    /// full read of the scratch. Present whenever `commit_ms` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_hash_ms: Option<u64>,
+    /// The sparse-copy pass inside `commit_ms`, milliseconds — the second full
+    /// read of the scratch, plus the fsync-and-rename publish. Present when a
+    /// new layer was actually written (absent on an idempotent re-commit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_copy_ms: Option<u64>,
     /// Guest vCPU count the VM actually booted with (host-validated).
     pub vcpus: u32,
     /// Guest memory in MiB the VM actually booted with (host-validated).
@@ -1143,6 +1177,33 @@ pub fn parse_env_kv(items: &[String]) -> Result<Vec<(String, String)>> {
 /// Returns an error if an artifact cannot be resolved, the VMM fails to boot,
 /// the agent never becomes ready, or the exec RPC fails.
 pub fn run_ephemeral(mut opts: RunOptions) -> Result<RunReport> {
+    // The run's root span. Lives for the whole function — including the
+    // pre-`t_total` validation/resolution and the post-report runtime shutdown
+    // that `total_ms` has never covered — so the root's wall clock is the gap
+    // detector for both. Attributes are recorded in `run_exec` once known;
+    // every value passes through the sealed `obs::Attr` type.
+    let run_span = tracing::debug_span!(
+        target: obs::TARGET,
+        "isopod.run",
+        isopod.vm_id = Empty,
+        isopod.run.path = Empty,
+        isopod.exit_zero = Empty,
+        isopod.exec.timed_out = Empty,
+        isopod.vm.vcpus = Empty,
+        isopod.vm.mem_mib = Empty,
+        isopod.net.slot = Empty,
+        isopod.run.snapshot_built = Empty,
+        isopod.flavor.kind = Empty,
+        isopod.stage.chain_depth = Empty,
+        isopod.exec.stdout_b2 = Empty,
+        isopod.exec.stderr_b2 = Empty,
+    );
+    let validate_guard = tracing::debug_span!(
+        target: obs::TARGET,
+        parent: &run_span,
+        "isopod.run.validate"
+    )
+    .entered();
     if opts.argv.is_empty() {
         bail!("run_ephemeral requires a non-empty argv");
     }
@@ -1210,7 +1271,14 @@ pub fn run_ephemeral(mut opts: RunOptions) -> Result<RunReport> {
     if crate::jail::is_enabled() {
         crate::jail::preflight().context("jail preflight (ISOPOD_JAIL=1)")?;
     }
+    drop(validate_guard);
     let t_total = Instant::now();
+    let resolve_guard = tracing::debug_span!(
+        target: obs::TARGET,
+        parent: &run_span,
+        "isopod.run.resolve"
+    )
+    .entered();
     let fc = resolve_fc_bin()?;
     let kernel = resolve_kernel()?;
 
@@ -1243,20 +1311,16 @@ pub fn run_ephemeral(mut opts: RunOptions) -> Result<RunReport> {
             validate_env(&opts.env)?;
         }
     }
+    drop(resolve_guard);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    let out = rt.block_on(run_exec(
-        fc,
-        kernel,
-        plan,
-        resources,
-        scratch_mib,
-        opts,
-        t_total,
-    ));
+    let out = rt.block_on(
+        run_exec(fc, kernel, plan, resources, scratch_mib, opts, t_total)
+            .instrument(run_span.clone()),
+    );
     // Bound the teardown instead of letting `rt` drop implicitly.
     //
     // Dropping a runtime waits, with no timeout, for every blocking-pool thread
@@ -1465,14 +1529,19 @@ async fn run_exec(
     opts: RunOptions,
     t_total: Instant,
 ) -> Result<RunReport> {
+    let run_span = tracing::Span::current();
     // Reap any firecracker orphaned by a previous run whose CLI was killed
     // before `kill_on_drop` could fire (Ctrl-C, MCP-client timeout, SIGKILL) —
     // otherwise its held tap wedges that network slot (dogfood finding #7).
-    registry::reap_orphans();
-    // Reclaim any empty leaf cgroups left by a crashed jailed run (no-op, and no
-    // env read, unless ISOPOD_JAIL=1 — the flag-off path is unchanged).
-    if crate::jail::is_enabled() {
-        crate::jail::sweep_stale_cgroups();
+    // Spanned: a full /proc scan on every run, O(host processes).
+    {
+        let _g = tracing::debug_span!(target: obs::TARGET, "isopod.run.reap_orphans").entered();
+        registry::reap_orphans();
+        // Reclaim any empty leaf cgroups left by a crashed jailed run (no-op, and
+        // no env read, unless ISOPOD_JAIL=1 — the flag-off path is unchanged).
+        if crate::jail::is_enabled() {
+            crate::jail::sweep_stale_cgroups();
+        }
     }
 
     let vm_id = generate_vm_id()?;
@@ -1509,17 +1578,26 @@ async fn run_exec(
     // builder — which claims its own slot — and the run each need only one free
     // slot. A build failure silently disables warm for this run (cold-boot).
     let mut snapshot_built = false;
+    let mut snapshot_build_ms = None;
     let warm_key = match warm_snapshot_key(&fc, &kernel, &plan, resources, &opts) {
-        Some(key) => match ensure_snapshot(&fc, &kernel, &plan, resources, &key).await {
-            Ok(built) => {
-                snapshot_built = built;
-                Some(key)
+        Some(key) => {
+            let t_ensure = Instant::now();
+            match ensure_snapshot(&fc, &kernel, &plan, resources, &key).await {
+                Ok(built) => {
+                    snapshot_built = built;
+                    if built {
+                        // Attach the builder-VM cost only when a build actually
+                        // ran; the exists-check is a stat and stays anonymous.
+                        snapshot_build_ms = Some(t_ensure.elapsed().as_millis() as u64);
+                    }
+                    Some(key)
+                }
+                Err(e) => {
+                    eprintln!("run: warm-pool snapshot build failed ({e:#}); cold-booting");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("run: warm-pool snapshot build failed ({e:#}); cold-booting");
-                None
-            }
-        },
+        }
         None => None,
     };
 
@@ -1532,6 +1610,7 @@ async fn run_exec(
     // downgrading a policy request to unfiltered egress would be the worst
     // possible failure mode.
     let net_slot = if opts.network {
+        let _g = tracing::debug_span!(target: obs::TARGET, "isopod.run.slot_claim").entered();
         Some(if opts.egress.is_some() {
             let slot = net::claim_filtered()?;
             // Everything else about a filtered slot is provisioned by root and
@@ -1558,30 +1637,37 @@ async fn run_exec(
     // policy decision.
     let egress_broker = match (&opts.egress, &net_slot) {
         (Some(policy), Some(slot)) => {
-            let rules = parse_egress_rules(policy)?;
-            // Resolve the named credentials host-side, all or nothing. This is
-            // the last step before a VM exists, so a bad alias, an unreadable
-            // store, or a permissive mode costs no boot. The resolved secrets
-            // live only inside the broker, which dies with the run.
-            let credentials = load_run_credentials(policy)?;
-            let gateway = slot.host_ip().parse().with_context(|| {
-                format!("slot {} has an unparseable gateway address", slot.index())
-            })?;
-            // The broker dials from the host, so the packet filter's
-            // public-only-egress rule — which governs *forwarded* traffic — does
-            // not constrain it. It applies the same policy itself, reading the
-            // one authority for whether this host permits private destinations.
-            let allow_private = net::read_manifest()
-                .map(|m| m.allow_lan_egress)
-                .unwrap_or(false);
-            let broker = broker::Broker::start(
-                broker::BrokerSpec::new(gateway, rules.clone())
-                    .with_credentials(credentials)
-                    .with_private_destinations(allow_private),
-            )
-            .await
-            .context("starting the egress broker; a filtered run cannot proceed without it")?;
-            Some((broker, rules))
+            async {
+                let rules = parse_egress_rules(policy)?;
+                // Resolve the named credentials host-side, all or nothing. This is
+                // the last step before a VM exists, so a bad alias, an unreadable
+                // store, or a permissive mode costs no boot. The resolved secrets
+                // live only inside the broker, which dies with the run.
+                let credentials = load_run_credentials(policy)?;
+                let gateway = slot.host_ip().parse().with_context(|| {
+                    format!("slot {} has an unparseable gateway address", slot.index())
+                })?;
+                // The broker dials from the host, so the packet filter's
+                // public-only-egress rule — which governs *forwarded* traffic — does
+                // not constrain it. It applies the same policy itself, reading the
+                // one authority for whether this host permits private destinations.
+                let allow_private = net::read_manifest()
+                    .map(|m| m.allow_lan_egress)
+                    .unwrap_or(false);
+                let broker = broker::Broker::start(
+                    broker::BrokerSpec::new(gateway, rules.clone())
+                        .with_credentials(credentials)
+                        .with_private_destinations(allow_private),
+                )
+                .await
+                .context("starting the egress broker; a filtered run cannot proceed without it")?;
+                Ok::<_, anyhow::Error>(Some((broker, rules)))
+            }
+            .instrument(tracing::debug_span!(
+                target: obs::TARGET,
+                "isopod.run.broker_start"
+            ))
+            .await?
         }
         _ => None,
     };
@@ -1628,10 +1714,11 @@ async fn run_exec(
     // commit's wall time is measured so a committing run's `total_ms` is
     // explainable (~seconds per GiB of layer; dogfood finding #20).
     let t_commit = Instant::now();
-    let commit_outcome = match &boot.disk {
+    let commit_span = tracing::debug_span!(target: obs::TARGET, "isopod.run.commit");
+    let commit_outcome = commit_span.in_scope(|| match &boot.disk {
         Some(disk) => maybe_commit_stage(disk, &opts, &boot.exec),
         None => Ok(None),
-    };
+    });
     let commit_elapsed_ms = t_commit.elapsed().as_millis() as u64;
 
     // Remove throwaway disk(s) unless --keep; keep every log regardless.
@@ -1663,6 +1750,33 @@ async fn run_exec(
         }
     };
     let exec = boot.exec?;
+    // Record the run attributes now that everything is known. Every value is
+    // host-minted; the guest-influenced magnitudes go in as log2 buckets, and
+    // `exit_code` collapses to a bool — the local `RunReport` keeps the exact
+    // values, the span deliberately does not.
+    let mut attrs = vec![
+        Attr::VmId(&vm_id),
+        Attr::Path(boot.path),
+        Attr::Flag("isopod.exit_zero", exec.exit_code == Some(0)),
+        Attr::Flag("isopod.exec.timed_out", exec.timed_out),
+        Attr::Count("isopod.vm.vcpus", u64::from(resources.vcpus)),
+        Attr::Count("isopod.vm.mem_mib", u64::from(resources.mem_mib)),
+        Attr::Flag("isopod.run.snapshot_built", snapshot_built),
+        Attr::FlavorKind(flavor_kind(&plan)),
+        Attr::Count("isopod.stage.chain_depth", chain_depth(&plan)),
+        Attr::Bucket(
+            "isopod.exec.stdout_b2",
+            obs::log2_bucket(exec.stdout.total_bytes),
+        ),
+        Attr::Bucket(
+            "isopod.exec.stderr_b2",
+            obs::log2_bucket(exec.stderr.total_bytes),
+        ),
+    ];
+    if let Some(slot) = slot_index {
+        attrs.push(Attr::Slot(slot));
+    }
+    obs::record(&run_span, &attrs);
     Ok(RunReport {
         ok: true,
         name: vanity,
@@ -1679,9 +1793,15 @@ async fn run_exec(
         exec_ms: exec.exec_ms,
         total_ms: t_total.elapsed().as_millis() as u64,
         path: boot.path,
+        boot_ms: exec.boot_ms,
+        teardown_ms: exec.teardown_ms,
+        copy_out_ms: exec.copy_out_ms,
+        snapshot_build_ms,
         resume_ms: boot.resume_ms,
         snapshot_built,
         commit_ms: committed.as_ref().map(|_| commit_elapsed_ms),
+        commit_hash_ms: committed.as_ref().map(|(_, t)| t.hash_ms),
+        commit_copy_ms: committed.as_ref().and_then(|(_, t)| t.copy_ms),
         vcpus: resources.vcpus,
         mem_mib: resources.mem_mib,
         fc_binary: fc,
@@ -1689,8 +1809,8 @@ async fn run_exec(
         serial_log_path: console_log,
         stdout_log_path: stdout_log,
         stderr_log_path: stderr_log,
-        stage_id: committed.as_ref().map(|m| m.stage_id.clone()),
-        stage_name: committed.as_ref().map(|m| m.name.clone()),
+        stage_id: committed.as_ref().map(|(m, _)| m.stage_id.clone()),
+        stage_name: committed.as_ref().map(|(m, _)| m.name.clone()),
         commit_error,
         slot: slot_index,
         guest_ip,
@@ -1699,6 +1819,31 @@ async fn run_exec(
             .as_ref()
             .map(|(b, rules)| build_egress_report(b, rules, &vm_dir)),
     })
+}
+
+/// Normalize a boot plan to the closed flavor kind `{built, imported, stage}`.
+/// The raw slug is user-authored once OCI import is in play, so only this
+/// normalization may become a span attribute.
+fn flavor_kind(plan: &BootPlan) -> obs::FlavorKind {
+    match plan {
+        BootPlan::Stage { layer_paths, .. } if !layer_paths.is_empty() => obs::FlavorKind::Stage,
+        BootPlan::Stage { base, .. } if base.flavor.starts_with("oci:") => {
+            obs::FlavorKind::Imported
+        }
+        BootPlan::Stage { .. } => obs::FlavorKind::Built,
+        BootPlan::Flavor { flavor_slug, .. } if flavor_slug.starts_with("oci:") => {
+            obs::FlavorKind::Imported
+        }
+        BootPlan::Flavor { .. } => obs::FlavorKind::Built,
+    }
+}
+
+/// Committed-layer count under a run (bounded 0–10 by [`stage::MAX_CHAIN_DEPTH`]).
+fn chain_depth(plan: &BootPlan) -> u64 {
+    match plan {
+        BootPlan::Stage { layer_paths, .. } => layer_paths.len() as u64,
+        BootPlan::Flavor { .. } => 0,
+    }
 }
 
 /// Compute the warm-pool snapshot key for a run, or `None` when the run is not
@@ -2223,7 +2368,7 @@ fn maybe_commit_stage(
     disk: &DiskConfig,
     opts: &RunOptions,
     driven: &Result<ExecResult>,
-) -> Result<Option<StageMeta>> {
+) -> Result<Option<(StageMeta, stage::CommitTimings)>> {
     maybe_commit_stage_in(&paths::stages_dir()?, disk, opts, driven)
 }
 
@@ -2235,7 +2380,7 @@ fn maybe_commit_stage_in(
     disk: &DiskConfig,
     opts: &RunOptions,
     driven: &Result<ExecResult>,
-) -> Result<Option<StageMeta>> {
+) -> Result<Option<(StageMeta, stage::CommitTimings)>> {
     let DiskConfig::Stage {
         scratch,
         parent,
@@ -2280,7 +2425,7 @@ fn maybe_commit_stage_in(
     // fresh environment read: a run allowed to start across a rebuilt base must
     // be allowed to save what it produced, or rebasing a stage onto a new image
     // would be impossible.
-    let meta = stage::commit_in(
+    let (meta, timings) = stage::commit_in_timed(
         stages_root,
         scratch,
         label,
@@ -2292,7 +2437,7 @@ fn maybe_commit_stage_in(
         "run: committed stage {} ({}) labelled {:?}",
         meta.stage_id, meta.name, meta.label
     );
-    Ok(Some(meta))
+    Ok(Some((meta, timings)))
 }
 
 /// Everything [`boot_and_exec`] needs (bundled to keep the arg count sane).
@@ -2351,6 +2496,10 @@ struct BootedVm {
     /// Serial-drain task to await at teardown. The cold path spawns one; the
     /// warm path drains detached inside [`snapshot::resume`], so it is `None`.
     drain: Option<tokio::task::JoinHandle<()>>,
+    /// The in-flight cold-boot measurement (`None` on the warm path): the
+    /// readiness wait closes it at the first successful ping, which is where
+    /// `boot_ms` ends.
+    boot: Option<obs::BootWait>,
 }
 
 /// Outcome of [`boot_and_exec`]: the exec result plus which path served it and
@@ -2372,6 +2521,12 @@ struct ExecResult {
     stderr: StreamCapture,
     /// Files streamed out by `--copy-out` (filled by [`exec_and_teardown`]).
     copied: Vec<CopiedFile>,
+    /// Cold-boot duration (InstanceStart → first ping); `None` on warm.
+    boot_ms: Option<u64>,
+    /// `--copy-out` streaming duration (filled by [`exec_and_teardown`]).
+    copy_out_ms: Option<u64>,
+    /// Halt/kill/drain duration (filled by [`exec_and_teardown`]).
+    teardown_ms: Option<u64>,
 }
 
 /// Bring a VM up (warm resume or cold boot), run the command, and tear it down.
@@ -2396,13 +2551,20 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
     if let (Some(key), Some(slot)) = (ctx.warm_key, ctx.net) {
         let t_resume = Instant::now();
         let jail_prefix = ctx.jail.map(|j| j.prefix.clone()).unwrap_or_default();
-        match snapshot::resume(key, &ctx.fc.path, slot, ctx.vm_dir, jail_prefix, ctx.broker).await {
+        match snapshot::resume(key, &ctx.fc.path, slot, ctx.vm_dir, jail_prefix, ctx.broker)
+            .instrument(tracing::debug_span!(
+                target: obs::TARGET,
+                "isopod.run.resume"
+            ))
+            .await
+        {
             Ok((proc, agent)) => {
                 let resume_ms = t_resume.elapsed().as_millis() as u64;
                 let vm = BootedVm {
                     proc,
                     agent,
                     drain: None,
+                    boot: None,
                 };
                 let exec = exec_and_teardown(vm, &params).await;
                 return BootOutcome {
@@ -2418,19 +2580,49 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
         }
     }
 
-    // Cold path: materialize the disk, cold-boot, run.
-    let disk = match prepare_disk(ctx.plan, ctx.vm_dir, ctx.scratch_mib) {
-        Ok(d) => d,
-        Err(e) => {
-            return BootOutcome {
-                exec: Err(e),
-                path: RunPath::Cold,
-                resume_ms: None,
-                disk: None,
-            };
+    // Cold path: materialize the disk, cold-boot, run. The spans live in
+    // blocks so each closes when its phase ends, not when this function does.
+    let disk = {
+        let prepare_span = tracing::debug_span!(
+            target: obs::TARGET,
+            "isopod.run.prepare_disk",
+            isopod.disk.kind = Empty,
+        );
+        obs::record(
+            &prepare_span,
+            &[Attr::Static(
+                "isopod.disk.kind",
+                match ctx.plan {
+                    BootPlan::Flavor { .. } => "rootfs_sparse_copy",
+                    BootPlan::Stage { .. } => "scratch_mkfs",
+                },
+            )],
+        );
+        match prepare_span.in_scope(|| prepare_disk(ctx.plan, ctx.vm_dir, ctx.scratch_mib)) {
+            Ok(d) => d,
+            Err(e) => {
+                return BootOutcome {
+                    exec: Err(e),
+                    path: RunPath::Cold,
+                    resume_ms: None,
+                    disk: None,
+                };
+            }
         }
     };
-    let vm = match cold_boot(&ctx, &disk).await {
+    // After this block the only live handle rides in `BootedVm::boot`, so the
+    // boot span closes at the first successful ping (see `run_command`).
+    let booted = {
+        let boot_span = tracing::debug_span!(
+            target: obs::TARGET,
+            "isopod.run.boot",
+            isopod.boot_ms = Empty
+        );
+        cold_boot(&ctx, &disk, &boot_span)
+            .instrument(boot_span.clone())
+            .await
+    };
+    let vm = match booted {
         Ok(vm) => vm,
         Err(e) => {
             return BootOutcome {
@@ -2452,11 +2644,22 @@ async fn boot_and_exec(ctx: BootCtx<'_>) -> BootOutcome {
 
 /// Cold-boot: spawn Firecracker, tee serial to `console.log`, configure the disk
 /// topology + NIC + hybrid vsock, and start. Returns the running VM plus the
-/// serial-drain handle to await at teardown.
-async fn cold_boot(ctx: &BootCtx<'_>, disk: &DiskConfig) -> Result<BootedVm> {
+/// serial-drain handle to await at teardown. `boot_span` is the enclosing
+/// `isopod.run.boot` span: the child spans parent under it, and it rides out in
+/// [`BootedVm::boot`] so the readiness wait can close it at the first ping.
+async fn cold_boot(
+    ctx: &BootCtx<'_>,
+    disk: &DiskConfig,
+    boot_span: &tracing::Span,
+) -> Result<BootedVm> {
     let prefix = ctx.jail.map(|j| j.prefix.clone()).unwrap_or_default();
     let (proc, stdout_pipe) =
-        spawn_fc_piped(ctx.fc, ctx.api_sock, ctx.vm_id, ctx.console_log, prefix).await?;
+        spawn_fc_piped(ctx.fc, ctx.api_sock, ctx.vm_id, ctx.console_log, prefix)
+            .instrument(tracing::debug_span!(
+                target: obs::TARGET,
+                "isopod.boot.fc_spawn"
+            ))
+            .await?;
 
     // Tee guest serial to console.log (no marker channel — readiness is vsock).
     let log = tokio::fs::File::create(ctx.console_log)
@@ -2464,45 +2667,86 @@ async fn cold_boot(ctx: &BootCtx<'_>, disk: &DiskConfig) -> Result<BootedVm> {
         .with_context(|| format!("creating {}", ctx.console_log.display()))?;
     let drain = tokio::spawn(console::drain_to_log(stdout_pipe, log));
 
-    // Pre-boot configuration, including the hybrid-vsock device.
-    let client = proc.client().context("building the API client")?;
-    configure_run_boot(
-        &client,
-        ctx.kernel,
-        disk,
-        ctx.resources,
-        ctx.net,
-        ctx.broker,
-    )
+    // Pre-boot configuration, including the hybrid-vsock device, ending with
+    // the InstanceStart request itself; the guest kernel's boot is what remains
+    // after this span closes.
+    let started = async {
+        let client = proc.client().context("building the API client")?;
+        configure_run_boot(
+            &client,
+            ctx.kernel,
+            disk,
+            ctx.resources,
+            ctx.net,
+            ctx.broker,
+        )
+        .await?;
+        client
+            .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
+            .await
+            .context("PUT /vsock")?;
+        let started = Instant::now();
+        client.instance_start().await.context("InstanceStart")?;
+        Ok::<_, anyhow::Error>(started)
+    }
+    .instrument(tracing::debug_span!(
+        target: obs::TARGET,
+        "isopod.boot.api_config"
+    ))
     .await?;
-    client
-        .put_vsock(&Vsock::new(3, ctx.vsock_uds.to_string_lossy()))
-        .await
-        .context("PUT /vsock")?;
-    client.instance_start().await.context("InstanceStart")?;
 
     let agent = AgentClient::new(ctx.vsock_uds);
     Ok(BootedVm {
         proc,
         agent,
         drain: Some(drain),
+        boot: Some(obs::BootWait {
+            span: boot_span.clone(),
+            started,
+        }),
     })
 }
 
 /// Run the command against a booted-or-resumed VM, then always halt + tear the
 /// VMM down (even on error, backed by the [`FcProcess`] drop guard).
 async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<ExecResult> {
-    let mut outcome = run_command(&vm.agent, params).await;
+    let boot = vm.boot.take();
+    let mut outcome = run_command(&vm.agent, params, boot).await;
 
     // Stream requested guest files to the host before halting (finding #21).
     // Only when the exec completed without timing out — a wedged guest could
     // stall an unbounded copy. A copy failure fails the run (the caller
     // explicitly asked for the artifact), surfaced after teardown completes.
+    // Timed and spanned: it runs after the timeout budget stopped protecting
+    // the caller, so it must at least be visible.
     let mut copy_err: Option<anyhow::Error> = None;
     if let Ok(exec) = &mut outcome {
         if !exec.timed_out && !params.opts.copy_out.is_empty() {
-            match copy_out_files(&vm.agent, &params.opts.copy_out).await {
-                Ok(copied) => exec.copied = copied,
+            let copy_span = tracing::debug_span!(
+                target: obs::TARGET,
+                "isopod.run.copy_out",
+                isopod.copy.files_b2 = Empty,
+                isopod.copy.bytes_b2 = Empty,
+            );
+            let t_copy = Instant::now();
+            match copy_out_files(&vm.agent, &params.opts.copy_out)
+                .instrument(copy_span.clone())
+                .await
+            {
+                Ok(copied) => {
+                    // One aggregate span for the whole batch — never one span
+                    // per file — with count and volume as log2 buckets only.
+                    let total: u64 = copied.iter().map(|c| c.bytes).sum();
+                    obs::record(
+                        &copy_span,
+                        &[
+                            Attr::Bucket("isopod.copy.files_b2", obs::log2_bucket(copied.len() as u64)),
+                            Attr::Bucket("isopod.copy.bytes_b2", obs::log2_bucket(total)),
+                        ],
+                    );
+                    exec.copy_out_ms = Some(t_copy.elapsed().as_millis() as u64);
+                    exec.copied = copied;
+                }
                 Err(e) => copy_err = Some(e),
             }
         }
@@ -2512,17 +2756,30 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
     // `halt` is internally time-bounded (F8), so a malicious guest that accepts
     // the connection and stalls cannot wedge this teardown — the forced
     // shutdown below still runs and the slot/process drop-guards still fire.
-    let _ = vm.agent.halt(true).await;
-    match tokio::time::timeout(Duration::from_secs(3), vm.proc.wait()).await {
-        Ok(Ok(_status)) => {}
-        _ => {
-            if let Err(e) = vm.proc.shutdown(Duration::from_secs(2)).await {
-                eprintln!("run: warning: forced shutdown returned: {e}");
+    // Timed and spanned: this ladder is on the user's critical path, and a
+    // guest that ignores `halt` costs ~5 s here that used to be invisible.
+    let t_teardown = Instant::now();
+    async {
+        let _ = vm.agent.halt(true).await;
+        match tokio::time::timeout(Duration::from_secs(3), vm.proc.wait()).await {
+            Ok(Ok(_status)) => {}
+            _ => {
+                if let Err(e) = vm.proc.shutdown(Duration::from_secs(2)).await {
+                    eprintln!("run: warning: forced shutdown returned: {e}");
+                }
             }
         }
+        if let Some(drain) = vm.drain.take() {
+            let _ = drain.await;
+        }
     }
-    if let Some(drain) = vm.drain {
-        let _ = drain.await;
+    .instrument(tracing::debug_span!(
+        target: obs::TARGET,
+        "isopod.run.teardown"
+    ))
+    .await;
+    if let Ok(exec) = &mut outcome {
+        exec.teardown_ms = Some(t_teardown.elapsed().as_millis() as u64);
     }
     if let Some(e) = copy_err {
         return Err(e);
@@ -2560,27 +2817,64 @@ async fn copy_out_files(agent: &AgentClient, specs: &[CopyOutSpec]) -> Result<Ve
 /// pinged + resynced + reconfigured the network inside [`snapshot::resume`]; the
 /// redundant ping/clock-sync here are cheap and idempotent, so a single tail
 /// serves both boot paths.
-async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecResult> {
-    agent
-        .wait_ready(AGENT_READY_TIMEOUT)
-        .await
-        .with_context(|| {
-            format!(
-                "guest agent readiness check failed (vsock ping, {AGENT_READY_TIMEOUT:?} \
-                 budget); serial log at {}",
-                ctx.console_log.display()
-            )
-        })?;
-    agent
-        .sync_clock_now()
-        .await
-        .context("syncing the guest clock over vsock")?;
-    // Cosmetic, so a failure never kills the run: name the guest after the VM
-    // (finding #23). Re-applied on every resume because the snapshot bakes the
-    // builder VM's hostname, same staleness class as the clock and the NIC.
-    if let Err(e) = agent.set_hostname(ctx.vanity).await {
-        eprintln!("run: warning: could not set guest hostname: {e}");
+async fn run_command(
+    agent: &AgentClient,
+    ctx: &ExecParams<'_>,
+    boot: Option<obs::BootWait>,
+) -> Result<ExecResult> {
+    let ready_context = || {
+        format!(
+            "guest agent readiness check failed (vsock ping, {AGENT_READY_TIMEOUT:?} \
+             budget); serial log at {}",
+            ctx.console_log.display()
+        )
+    };
+    // On the cold path the first successful ping is the end of "boot": close
+    // the measurement `cold_boot` opened at InstanceStart. Readiness polls at
+    // 50 ms, so the number reads +0–50 ms high. The warm path has no boot to
+    // close (`resume_ms` covers it) and just re-pings, cheap and idempotent.
+    let boot_ms = match &boot {
+        Some(wait) => {
+            agent
+                .wait_ready(AGENT_READY_TIMEOUT)
+                .instrument(tracing::debug_span!(
+                    target: obs::TARGET,
+                    parent: &wait.span,
+                    "isopod.boot.kernel_wait"
+                ))
+                .await
+                .with_context(ready_context)?;
+            let ms = wait.started.elapsed().as_millis() as u64;
+            obs::record(&wait.span, &[Attr::Ms("isopod.boot_ms", ms)]);
+            Some(ms)
+        }
+        None => {
+            agent
+                .wait_ready(AGENT_READY_TIMEOUT)
+                .await
+                .with_context(ready_context)?;
+            None
+        }
+    };
+    drop(boot); // the guest is up: close `isopod.run.boot` now, not at exec end
+    async {
+        agent
+            .sync_clock_now()
+            .await
+            .context("syncing the guest clock over vsock")?;
+        // Cosmetic, so a failure never kills the run: name the guest after the VM
+        // (finding #23). Re-applied on every resume because the snapshot bakes the
+        // builder VM's hostname, same staleness class as the clock and the NIC.
+        if let Err(e) = agent.set_hostname(ctx.vanity).await {
+            eprintln!("run: warning: could not set guest hostname: {e}");
+        }
+        Ok::<_, anyhow::Error>(())
     }
+    .instrument(tracing::debug_span!(
+        target: obs::TARGET,
+        "isopod.run.guest_ready"
+    ))
+    .await?;
 
     let outer_ms = ctx.opts.timeout_s.saturating_mul(1000);
     let elapsed_ms = ctx.t_total.elapsed().as_millis() as u64;
@@ -2602,16 +2896,30 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
     // if the guest is wedged.
     let t_exec = Instant::now();
     let wall = Duration::from_millis(remaining_ms) + Duration::from_secs(5);
-    match tokio::time::timeout(wall, agent.exec(spec)).await {
-        Ok(Ok(o)) => Ok(ExecResult {
-            exit_code: o.exit_code,
-            signal: o.signal,
-            timed_out: o.timed_out,
-            exec_ms: o.duration_ms,
-            stdout: o.stdout,
-            stderr: o.stderr,
-            copied: Vec::new(),
-        }),
+    match tokio::time::timeout(wall, agent.exec(spec))
+        .instrument(tracing::debug_span!(target: obs::TARGET, "isopod.run.exec"))
+        .await
+    {
+        Ok(Ok(o)) => {
+            // The guest's own monotonic interval, as a synthesized marker. The
+            // host-side `isopod.run.exec` span minus this number is transport +
+            // stream-drain overhead — except that `duration_ms` itself already
+            // includes the guest's output pumps, a conflation this span
+            // inherits and does not fix.
+            obs::guest_exec_marker(o.duration_ms);
+            Ok(ExecResult {
+                exit_code: o.exit_code,
+                signal: o.signal,
+                timed_out: o.timed_out,
+                exec_ms: o.duration_ms,
+                stdout: o.stdout,
+                stderr: o.stderr,
+                copied: Vec::new(),
+                boot_ms,
+                copy_out_ms: None,
+                teardown_ms: None,
+            })
+        }
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("exec over vsock")),
         Err(_elapsed) => {
             // Host wall fired: the live stream was dropped, so recover whatever
@@ -2626,6 +2934,9 @@ async fn run_command(agent: &AgentClient, ctx: &ExecParams<'_>) -> Result<ExecRe
                 stdout,
                 stderr,
                 copied: Vec::new(),
+                boot_ms,
+                copy_out_ms: None,
+                teardown_ms: None,
             })
         }
     }
@@ -2925,9 +3236,15 @@ mod tests {
             exec_ms: 12,
             total_ms: 200,
             path: RunPath::Cold,
+            boot_ms: None,
+            teardown_ms: None,
+            copy_out_ms: None,
+            snapshot_build_ms: None,
             resume_ms: None,
             snapshot_built: false,
             commit_ms: None,
+            commit_hash_ms: None,
+            commit_copy_ms: None,
             vcpus: 1,
             mem_mib: 512,
             fc_binary: FcBinary {
@@ -2988,6 +3305,22 @@ mod tests {
         );
         // Acceptance criterion #4: an unfiltered run's JSON gains no new key.
         assert!(v.get("egress").is_none(), "egress must be absent when None");
+        // The additive phase timings are all `Option` + skip: a run they did
+        // not measure serializes without the keys, so old consumers see the
+        // exact JSON they always did.
+        for key in [
+            "boot_ms",
+            "teardown_ms",
+            "copy_out_ms",
+            "snapshot_build_ms",
+            "commit_hash_ms",
+            "commit_copy_ms",
+        ] {
+            assert!(
+                v.get(key).is_none(),
+                "phase timing {key:?} must be absent when None"
+            );
+        }
         for key in [
             "ok",
             "vm_id",
@@ -3034,9 +3367,15 @@ mod tests {
             exec_ms: 3,
             total_ms: 120,
             path: RunPath::Warm,
+            boot_ms: None,
+            teardown_ms: Some(45),
+            copy_out_ms: None,
+            snapshot_build_ms: Some(2600),
             resume_ms: Some(18),
             snapshot_built: true,
             commit_ms: Some(1450),
+            commit_hash_ms: Some(600),
+            commit_copy_ms: Some(700),
             vcpus: 2,
             mem_mib: 1024,
             fc_binary: FcBinary {
@@ -3063,6 +3402,15 @@ mod tests {
         assert_eq!(v["resume_ms"], serde_json::json!(18));
         assert_eq!(v["snapshot_built"], serde_json::json!(true));
         assert_eq!(v["commit_ms"], serde_json::json!(1450));
+        // The additive timings serialize under their field names when present.
+        assert_eq!(v["teardown_ms"], serde_json::json!(45));
+        assert_eq!(v["snapshot_build_ms"], serde_json::json!(2600));
+        assert_eq!(v["commit_hash_ms"], serde_json::json!(600));
+        assert_eq!(v["commit_copy_ms"], serde_json::json!(700));
+        assert!(
+            v.get("boot_ms").is_none(),
+            "boot_ms must be absent on the warm path"
+        );
         assert_eq!(v["stage_id"], serde_json::json!("st-0123456789abcdef"));
         assert_eq!(v["stage_name"], serde_json::json!("radiant-ghost"));
         assert_eq!(v["slot"], serde_json::json!(3));
@@ -3350,6 +3698,9 @@ mod tests {
             stdout: StreamCapture::from_bytes(b"", 0),
             stderr: StreamCapture::from_bytes(b"", 0),
             copied: Vec::new(),
+            boot_ms: None,
+            copy_out_ms: None,
+            teardown_ms: None,
         });
 
         let err = maybe_commit_stage_in(&stages, &disk(false), &opts, &ok)
@@ -3361,11 +3712,15 @@ mod tests {
             "nothing was recorded"
         );
 
-        let saved = maybe_commit_stage_in(&stages, &disk(true), &opts, &ok)
+        let (saved, timings) = maybe_commit_stage_in(&stages, &disk(true), &opts, &ok)
             .expect("with the opt-in, the work is saved")
             .expect("a stage was committed");
         assert_eq!(saved.base_sha256.as_deref(), Some("9999ffff8888eeee"));
         assert_eq!(saved.parent.as_deref(), Some(parent.stage_id.as_str()));
+        assert!(
+            timings.copy_ms.is_some(),
+            "a fresh commit writes a layer, so the copy phase must be timed"
+        );
     }
 
     /// One unstamped link used to launder every ancestor behind it: the fork

@@ -54,3 +54,7 @@ clap.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 isopod-core.workspace = true
+# The stderr trace sink for the core run-pipeline spans, opt-in via RUST_LOG.
+# No subscriber is installed when RUST_LOG is unset, so the default CLI is
+# unchanged. Already in the lockfile via isopod-mcp: no new crates.
+tracing-subscriber = { workspace = true }

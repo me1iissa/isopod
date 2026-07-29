@@ -52,6 +52,7 @@ use crate::agent::AgentClient;
 use crate::net;
 use crate::paths;
 use crate::vm::Resources;
+use tracing::Instrument as _;
 
 /// The Firecracker snapshot data-format version this build (v1.16.1) emits. Part
 /// of the cache key: a format bump is its own compatibility domain.
@@ -414,7 +415,15 @@ async fn ensure_at(
         return Ok((artifacts, false));
     }
 
-    build(ctx, &artifacts).await?;
+    // Spanned only when a build actually runs: this boots and snapshots a
+    // whole builder VM — seconds of one-time cost the first warm-shape run
+    // otherwise carries anonymously inside its `total_ms`.
+    build(ctx, &artifacts)
+        .instrument(tracing::debug_span!(
+            target: crate::obs::TARGET,
+            "isopod.run.snapshot_ensure"
+        ))
+        .await?;
     Ok((artifacts, true))
 }
 

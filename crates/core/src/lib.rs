@@ -10,6 +10,7 @@ pub mod image;
 pub mod jail;
 pub mod names;
 pub mod net;
+pub(crate) mod obs;
 pub mod paths;
 pub mod snapshot;
 pub mod stage;

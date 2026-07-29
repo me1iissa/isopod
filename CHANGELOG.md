@@ -6,6 +6,44 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.13.0] — 2026-07-29
+
+### Added — spans over the phases nobody could see, and six report fields to match
+
+Internal `tracing` instrumentation over the run path, and six additive
+`RunReport` fields: `boot_ms`, `teardown_ms`, `copy_out_ms`,
+`snapshot_build_ms`, and the split of the existing `commit_ms` into
+`commit_hash_ms` + `commit_copy_ms`. Each field is absent when its phase did
+not happen, so every existing consumer sees the exact JSON it always did.
+`resume_ms` and `commit_ms` themselves are unchanged.
+
+What the numbers showed once they existed:
+
+- **Teardown costs ~140 ms on every run** — 27% of a 509 ms cold run, second
+  only to the kernel boot — and had been folded into a "boot" figure nobody
+  computed directly. Of ~470 ms non-exec time the kernel boot proper is
+  ~210 ms: the number an operator would have read as boot was about twice the
+  real thing.
+- **Copy-out moves ~52 MB/s** over the base64-in-JSON vsock path, and runs
+  after the `timeout_s` budget has stopped protecting the caller.
+- **`commit_ms` is now split, not diagnosed.** The hash and copy passes are
+  separately visible; on real commits they are the same order of magnitude,
+  with end-to-end time dominated by writeback of the just-written scratch (see
+  0.12.5 below for the measured numbers and the buffered-read fix they led to).
+
+What this does NOT buy: it is instrumentation, not telemetry. There is no
+exporter, no network path, and no `opentelemetry` dependency in any build.
+With `RUST_LOG` unset the binaries install no subscriber and write zero bytes;
+`RUST_LOG=isopod=debug` prints the spans to stderr and nowhere else. Span
+attributes pass through a sealed `Attr` type whose only string carriers are
+`&'static str` and the host-minted `vm_id`, and guest-influenced magnitudes
+appear only as log2 buckets. `exec_ms` still folds vsock output streaming into
+compute time. The two spans written blind while the host's taps were down —
+`isopod.run.snapshot_ensure` and the warm `isopod.run.resume` — have since run
+live: a first-warm run reported `snapshot_build_ms: 4238` / `resume_ms: 72`
+with both spans on stderr, and a second run of the same shape reported
+`resume_ms: 61` with `snapshot_build_ms` correctly absent.
+
 ## [0.12.5] — 2026-07-29
 
 ### Fixed — the commit hash pass read a gigabyte 8 KiB at a time

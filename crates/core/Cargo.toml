@@ -18,6 +18,11 @@ blake3 = { workspace = true }
 # VM lifecycle (M1 dev boot): the typed FC client + an async runtime to drive it.
 isopod-fc = { workspace = true }
 tokio = { workspace = true }
+# Phase spans over the run pipeline (boot/exec/copy-out/teardown/commit). Bare
+# spans only — no subscriber here, no exporter anywhere; the binaries decide
+# whether anything reaches stderr (`RUST_LOG`). Already in the lockfile via
+# isopod-mcp, so this adds no crate to the build graph.
+tracing = { workspace = true }
 # Host<->guest RPC contract (M2 agent): async frame helpers behind the tokio feature.
 isopod-proto = { workspace = true, features = ["tokio"] }
 # The OCI extractor and layout reader. The import path adapts and packs what

@@ -884,18 +884,19 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isopod-cli"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",
  "isopod-core",
  "serde",
  "serde_json",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "isopod-core"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -915,12 +916,13 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
 ]
 
 [[package]]
 name = "isopod-fc"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "libc",
  "reqwest",
@@ -934,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-guest-agent"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "isopod-core",
  "isopod-fc",
@@ -946,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-jail"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -954,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-mcp"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "isopod-core",
@@ -970,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-registry"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "flate2",
  "hex",
@@ -987,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-unpack"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "flate2",
  "hex",
@@ -1001,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-proto"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "base64",
  "serde",

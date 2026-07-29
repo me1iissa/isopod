@@ -330,6 +330,7 @@ enum DevCommand {
 }
 
 fn main() {
+    init_tracing();
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Image { command } => run_image(command),
@@ -341,6 +342,26 @@ fn main() {
         Command::Setup(args) => run_setup(args),
     };
     std::process::exit(code);
+}
+
+/// Install the stderr trace subscriber — only when `RUST_LOG` is set.
+///
+/// Unset (the default), no subscriber exists: the core spans are inert no-ops,
+/// stdout stays the single JSON line it always was, and stderr stays warnings
+/// only. `RUST_LOG=isopod=debug` prints a span-close line per run phase (boot,
+/// exec, copy-out, teardown, commit…) with busy/idle timings — the per-run
+/// latency trace. Stderr, never stdout: stdout is the JSON protocol surface.
+fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .init();
 }
 
 /// `isopod setup [--slots N] [--iface NAME] [--remove]` — the one-time

@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use isopod_core::image::{self, RootfsFlavor};
 use isopod_core::stage::{self, StageMeta};
 use isopod_core::vm::{self, RunOptions, RunReport};
+use tracing::Instrument as _;
 
 mod hostio;
 use hostio::{Access, HostIo};
@@ -317,6 +318,22 @@ struct SandboxRunResult {
     /// Which boot path served this run: `"warm"` (snapshot resume) or `"cold"`
     /// (full boot — not warm-eligible, or the resume fell back).
     path: String,
+    /// Cold-boot duration in ms (`InstanceStart` → first agent ping); present
+    /// only on the `"cold"` path. Quantized +0–50 ms high by readiness polling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_ms: Option<u64>,
+    /// Teardown duration in ms (guest halt, VMM exit wait, log drain) — on the
+    /// caller's critical path, inside `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teardown_ms: Option<u64>,
+    /// Total `copy_out` streaming duration in ms; present only when files were
+    /// copied. Runs after the `timeout_s` budget, inside `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_out_ms: Option<u64>,
+    /// Warm-pool snapshot build cost in ms; present only when `snapshot_built`
+    /// — the one-time builder-VM cost inside this run's `total_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_build_ms: Option<u64>,
     /// Snapshot-resume duration in ms; present only on the `"warm"` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     resume_ms: Option<u64>,
@@ -328,6 +345,13 @@ struct SandboxRunResult {
     /// stage this run (roughly seconds per GiB of layer, inside `total_ms`).
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_ms: Option<u64>,
+    /// The BLAKE3 content-hash pass inside `commit_ms` (one full scratch read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_hash_ms: Option<u64>,
+    /// The sparse-copy pass inside `commit_ms` (the second full scratch read);
+    /// absent on an idempotent re-commit that wrote no new layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_copy_ms: Option<u64>,
     /// Guest vCPU count the sandbox booted with (host-validated).
     vcpus: u32,
     /// Guest memory in MiB the sandbox booted with (host-validated).
@@ -542,9 +566,15 @@ impl From<RunReport> for SandboxRunResult {
                 vm::RunPath::Cold => "cold".to_string(),
             },
             egress: r.egress.map(EgressResult::from),
+            boot_ms: r.boot_ms,
+            teardown_ms: r.teardown_ms,
+            copy_out_ms: r.copy_out_ms,
+            snapshot_build_ms: r.snapshot_build_ms,
             resume_ms: r.resume_ms,
             snapshot_built: r.snapshot_built,
             commit_ms: r.commit_ms,
+            commit_hash_ms: r.commit_hash_ms,
+            commit_copy_ms: r.commit_copy_ms,
             vcpus: r.vcpus,
             mem_mib: r.mem_mib,
             vm_id: r.vm_id,
@@ -751,16 +781,23 @@ const AUTO_GC_EVERY: u64 = 20;
 /// older than the newest ~20 eventually dangle.
 fn spawn_auto_gc(trigger: &'static str) {
     tokio::task::spawn_blocking(move || {
-        match vm::vm_gc(AUTO_GC_KEEP_LAST, Duration::from_secs(60)) {
-            Ok(r) => tracing::info!(
-                trigger,
-                removed = r.removed.len(),
-                kept = r.kept,
-                freed_bytes = r.freed_bytes,
-                "auto vm_gc"
-            ),
-            Err(e) => tracing::warn!(trigger, "auto vm_gc failed: {e:#}"),
-        }
+        // Its own root span (there is no request to parent under): the sweep
+        // is O(vm dirs) of stat + unlink and competes with runs for disk. The
+        // events inside are kept — they are the default-visible record; the
+        // span adds the duration an operator asks for with RUST_LOG.
+        let span = tracing::debug_span!(target: "isopod", "isopod.gc", trigger);
+        span.in_scope(
+            || match vm::vm_gc(AUTO_GC_KEEP_LAST, Duration::from_secs(60)) {
+                Ok(r) => tracing::info!(
+                    trigger,
+                    removed = r.removed.len(),
+                    kept = r.kept,
+                    freed_bytes = r.freed_bytes,
+                    "auto vm_gc"
+                ),
+                Err(e) => tracing::warn!(trigger, "auto vm_gc failed: {e:#}"),
+            },
+        )
     });
 }
 
@@ -814,7 +851,29 @@ issue calls from separate agents.",
         meta: Meta,
         peer: Peer<RoleServer>,
     ) -> Result<Json<SandboxRunResult>, ErrorData> {
+        // The MCP-side root span: everything the server does before and after
+        // the run itself (host-I/O checks, stdin read, blocking-pool queue)
+        // parents under it, so handler overhead is separable from run time.
+        let span = tracing::debug_span!(
+            target: "isopod",
+            "mcp.request",
+            rpc.system = "mcp",
+            rpc.method = "tools/call",
+            mcp.tool.name = "sandbox_run",
+        );
+        self.sandbox_run_impl(params, meta, peer)
+            .instrument(span)
+            .await
+    }
+
+    async fn sandbox_run_impl(
+        &self,
+        params: Parameters<SandboxRunParams>,
+        meta: Meta,
+        peer: Peer<RoleServer>,
+    ) -> Result<Json<SandboxRunResult>, ErrorData> {
         let p = params.0;
+        let hostio_span = tracing::debug_span!(target: "isopod", "isopod.mcp.hostio_check");
 
         // Resolve the base flavor (only used for a fresh `base` run; forks reuse
         // the stage's recorded base). Default to the toolchain image via MCP.
@@ -865,9 +924,8 @@ issue calls from separate agents.",
                 // window between the two. Unconstrained, this argument was an
                 // arbitrary host-file read whose contents come back to the
                 // caller in `stdout`; see the `hostio` module docs.
-                let checked = self
-                    .host_io
-                    .check(&path, Access::Read)
+                let checked = hostio_span
+                    .in_scope(|| self.host_io.check(&path, Access::Read))
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let bytes = read_stdin_file(&checked).await.map_err(|e| {
                     ErrorData::invalid_params(format!("stdin_file {path:?}: {e}"), None)
@@ -933,9 +991,8 @@ issue calls from separate agents.",
                     // way. Unconstrained it was a host-persistence primitive
                     // (an `authorized_keys`, a shell rc, or isopod's own
                     // credential store) driven by whatever the sandbox produced.
-                    let host = self
-                        .host_io
-                        .check(&c.host, Access::Write)
+                    let host = hostio_span
+                        .in_scope(|| self.host_io.check(&c.host, Access::Write))
                         .map_err(|e| ErrorData::invalid_params(e, None))?;
                     Ok(vm::CopyOutSpec {
                         guest: c.guest,
@@ -944,6 +1001,9 @@ issue calls from separate agents.",
                 })
                 .collect::<Result<Vec<_>, ErrorData>>()?,
         };
+        // Close the host-I/O span here: its busy time is the checks themselves,
+        // and holding it open across the run would just report idle time.
+        drop(hostio_span);
 
         // Best-effort idle-timeout keepalive: if the client sent a progressToken,
         // emit a progress notification every ~10 s while the (blocking) run is in
@@ -971,7 +1031,13 @@ issue calls from separate agents.",
 
         // `run_ephemeral` builds its own tokio runtime, so it MUST run on the
         // blocking pool — calling it inline would panic (runtime-in-runtime).
-        let outcome = tokio::task::spawn_blocking(move || vm::run_ephemeral(opts)).await;
+        // The queue span is created at dispatch and entered inside the closure,
+        // so its idle time is the blocking-pool wait and its busy time is the
+        // run — and `isopod.run` parents under this request's span tree.
+        let queue_span = tracing::debug_span!(target: "isopod", "isopod.mcp.queue");
+        let outcome =
+            tokio::task::spawn_blocking(move || queue_span.in_scope(|| vm::run_ephemeral(opts)))
+                .await;
 
         if let Some(handle) = keepalive {
             handle.abort();
@@ -1008,7 +1074,16 @@ size, chain. Stages are the persistent, forkable filesystem layers a `sandbox_ru
 `commit_as` leaves behind."
     )]
     async fn stage_list(&self) -> Result<Json<StageListResult>, ErrorData> {
-        let stages = tokio::task::spawn_blocking(stage::list)
+        let span = tracing::debug_span!(
+            target: "isopod",
+            "mcp.request",
+            rpc.system = "mcp",
+            rpc.method = "tools/call",
+            mcp.tool.name = "stage_list",
+        );
+        let scan = tracing::debug_span!(target: "isopod", parent: &span, "isopod.stage.scan");
+        let stages = tokio::task::spawn_blocking(move || scan.in_scope(stage::list))
+            .instrument(span)
             .await
             .map_err(|join| {
                 ErrorData::internal_error(format!("stage_list task panicked: {join}"), None)
@@ -1032,7 +1107,16 @@ size, chain. Stages are the persistent, forkable filesystem layers a `sandbox_ru
         params: Parameters<StageRefParams>,
     ) -> Result<Json<StageInfoResult>, ErrorData> {
         let reference = params.0.reference;
+        let span = tracing::debug_span!(
+            target: "isopod",
+            "mcp.request",
+            rpc.system = "mcp",
+            rpc.method = "tools/call",
+            mcp.tool.name = "stage_info",
+        );
+        let scan = tracing::debug_span!(target: "isopod", parent: &span, "isopod.stage.scan");
         let info = tokio::task::spawn_blocking(move || -> anyhow::Result<StageInfoResult> {
+            let _g = scan.entered();
             let meta = stage::resolve(&reference)?;
             let layer_paths = stage::chain_paths(&meta)?
                 .into_iter()
@@ -1043,6 +1127,7 @@ size, chain. Stages are the persistent, forkable filesystem layers a `sandbox_ru
                 layer_paths,
             })
         })
+        .instrument(span)
         .await
         .map_err(|join| {
             ErrorData::internal_error(format!("stage_info task panicked: {join}"), None)
@@ -1195,9 +1280,19 @@ impl ServerHandler for Isopod {
 async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Span-close lines (with busy/idle timings) for the run-pipeline phase
+    // spans — but only when the operator set `RUST_LOG` (e.g. `isopod=debug`).
+    // Unset, the writer prints events only, so the server's default stderr is
+    // byte-identical to before the spans existed.
+    let span_events = if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt::format::FmtSpan::CLOSE
+    } else {
+        tracing_subscriber::fmt::format::FmtSpan::NONE
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
+        .with_span_events(span_events)
         .init();
 
     tracing::info!("isopod-mcp starting (rmcp stdio transport)");
