@@ -215,3 +215,33 @@ jobs:
           echo "${SHA256}  actionlint_${VERSION}_linux_amd64.tar.gz" | sha256sum -c -
           tar xzf "actionlint_${VERSION}_linux_amd64.tar.gz" actionlint
           ./actionlint -color
+
+  # The single context the branch ruleset requires. Naming individual jobs in
+  # the ruleset means editing repository settings every time a job is added,
+  # and a RENAMED job leaves a phantom required check that blocks every merge
+  # forever with no way to satisfy it. This job is the seam: adding a gate is a
+  # one-line `needs:` edit, reviewed like any other change.
+  #
+  # `if: !cancelled()` is load-bearing. Without it this job is SKIPPED whenever
+  # a dependency fails — and to GitHub a skipped required check is not a
+  # failure, it is nothing, so a red build would sail through the ruleset.
+  # For the same reason a skipped dependency is treated as failure below: no
+  # job here is path-filtered, so a skip can only mean the wiring is wrong.
+  ci-ok:
+    name: CI ok
+    if: ${{ !cancelled() }}
+    needs: [version-guard, build-test, deny, workflow-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All gating jobs succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failing="$(echo "$NEEDS_JSON" | jq -r 'to_entries[]
+            | select(.value.result != "success") | "\(.key): \(.value.result)"')"
+          if [ -n "$failing" ]; then
+            echo "::error::gating jobs did not succeed:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "all gating jobs succeeded"
