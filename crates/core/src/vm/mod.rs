@@ -2740,7 +2740,10 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
                     obs::record(
                         &copy_span,
                         &[
-                            Attr::Bucket("isopod.copy.files_b2", obs::log2_bucket(copied.len() as u64)),
+                            Attr::Bucket(
+                                "isopod.copy.files_b2",
+                                obs::log2_bucket(copied.len() as u64),
+                            ),
                             Attr::Bucket("isopod.copy.bytes_b2", obs::log2_bucket(total)),
                         ],
                     );

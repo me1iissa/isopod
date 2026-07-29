@@ -6,6 +6,21 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.13.1] — 2026-07-29
+
+### Fixed — 0.13.0 shipped unformatted
+
+One `Attr::Bucket` call in the new copy-out instrumentation exceeded the line
+width, so `cargo fmt --check` failed on the release commit. The tag built and
+released green — `Release` and `CI` are separate workflows, and formatting has
+no bearing on a binary — but `main` was red from the moment 0.13.0 landed.
+
+The gap was procedural: the branch was rebased onto a `main` that had moved, and
+the merge was verified with clippy and the test suite but not with
+`cargo fmt --check`. Rebasing reflows nothing by itself; the offending line was
+inside a hunk the rebase carried across, and only the formatter's line-width
+rule noticed.
+
 ## [0.13.0] — 2026-07-29
 
 ### Added — spans over the phases nobody could see, and six report fields to match
