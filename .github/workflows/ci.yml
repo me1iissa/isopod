@@ -100,6 +100,19 @@ jobs:
           fi
           if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
             tagged="$(git rev-list -n1 "v$ver")"
+            # A tag on the WRONG COMMIT is the failure this check exists to name
+            # directly. `git tag -a vX.Y.Z` with no commit tags whatever HEAD
+            # happens to be — which, when work spans git worktrees, is often a
+            # different branch. That happened to v0.13.1: it landed on v0.13.0's
+            # commit, so the release shipped .deb and .rpm packages declaring the
+            # previous version, and this job then failed four times running with
+            # "code changed but the version was not bumped" — true, useless, and
+            # pointing at a bump that had already been made.
+            tagged_ver="$(git show "$tagged:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)"
+            if [ "$tagged_ver" != "$ver" ]; then
+              echo "::error file=Cargo.toml::tag v$ver points at $tagged, whose Cargo.toml declares $tagged_ver — the tag is on the wrong commit. Re-tag with an explicit sha: git tag -f -a v$ver <sha-of-the-bump>"
+              exit 1
+            fi
             # CODE_PATHS is a space-separated pathspec list and MUST word-split
             # here. Quoting it hands git one path literally named
             # "crates/ Cargo.toml Cargo.lock vendor/ scripts/", which matches

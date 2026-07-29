@@ -6,6 +6,49 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.13.2] — 2026-07-29
+
+### Fixed — a tag on the wrong commit published packages declaring the wrong version
+
+`v0.13.1` was created with a bare `git tag -a v0.13.1`, which tags whatever `HEAD`
+happens to be. Work at the time spanned several git worktrees and the primary
+checkout was on another branch, so the tag landed on `v0.13.0`'s commit. The
+release built from that tree and published `isopod_0.13.0-1_amd64.deb` and
+`isopod-0.13.0-1.x86_64.rpm` inside a tarball named `isopod-0.13.1`. A binary
+that reports a version it is not is a support problem, so the release and the
+tag were deleted and re-cut at the commit carrying the bump.
+
+**The Version guard was right and was disbelieved.** It failed four consecutive
+pushes with "code changed since v0.13.1 but the workspace version was not
+bumped", which was true — it diffs against the *tag's* commit, and the tag was a
+commit early. The message sent the reader looking for a missing bump that had
+already been made. The guard now checks tag placement directly: if the workspace
+version is already tagged, the tagged commit's own `Cargo.toml` must declare that
+version, and the failure names the offending sha and what it actually declares.
+
+### Added — `scripts/bump-version.py` and a `release` skill, so this is mechanical
+
+Three things the guard enforces were being done by hand and by memory: the
+workspace version and `.claude-plugin/plugin.json` moving together, the version
+going up by one step of the right level, and the tag landing on the commit that
+carries the bump.
+
+`scripts/bump-version.py patch|minor|major` performs the first two and refreshes
+`Cargo.lock`. `--tag` performs the third: it refuses unless `HEAD`'s own
+`Cargo.toml` declares the version being tagged, passes an explicit sha rather
+than relying on `HEAD`, and re-reads the tag afterwards to confirm where it
+landed. `--check` verifies the whole state, including tag placement, and is what
+to run first when the guard goes red.
+
+A pre-release resolves to its own release rather than stepping past it —
+`0.13.0-preview.1 --patch` gives `0.13.0`, not `0.13.1` — because the preview
+line depends on that and anything else skips the version it was previewing.
+
+The `release` skill in `.claude/skills/` documents the sequence, which level to
+pick, and the two commands that diagnose a red Version guard. What neither buys:
+the script does not commit, does not push, and does not write the changelog
+entry — those stay deliberate.
+
 ## [0.13.1] — 2026-07-29
 
 ### Fixed — 0.13.0 shipped unformatted
