@@ -1,0 +1,26 @@
+# Dependabot keeps the hash-pinned actions in .github/workflows/ current: one
+# grouped PR a week at most, moving SHA pins with the version comment updated.
+# Pinning without an update mechanism rots; this is the mechanism. A pin bump
+# PR still executes third-party code once merged — the diff has to be read,
+# not just merged.
+#
+# The `cargo` ecosystem is deliberately absent. The Version guard treats
+# Cargo.lock as code and demands a workspace version bump alongside any change
+# to it; Dependabot cannot author that bump, so every cargo update PR would
+# arrive permanently red. Actions PRs pass because .github/ is exempt from the
+# guard. Cargo *security* updates are covered instead by Dependabot alerts +
+# security updates — a repo-settings toggle, not a line in this file — where
+# each rare security PR genuinely is a code wave for the maintainer to
+# version-bump by hand. `gitsubmodule` is also deliberately absent: the
+# vendor/firecracker pin is load-bearing and release-gated, and an auto-PR
+# proposing the next Firecracker the day it tags would be noise with a red
+# version guard attached.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

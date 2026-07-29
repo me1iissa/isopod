@@ -1,0 +1,33 @@
+name: Advisories
+
+# RustSec advisories and yanked releases across the locked crate graph. This
+# check is deliberately NOT on the PR path: its input is the advisory
+# database, so a new CVE flips it with no code change, and a gate that can
+# redden an innocent PR trains people to ignore red. On a cron, a red run
+# means exactly one thing — a crate in Cargo.lock has a known advisory — and
+# the badge in README.md keeps that visible on the front page rather than
+# buried in the Actions tab. A cron is only worth what its reader gives it.
+on:
+  schedule:
+    - cron: "31 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time; a manual dispatch supersedes an in-flight cron run.
+concurrency:
+  group: advisories
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories

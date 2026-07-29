@@ -76,6 +76,41 @@ A few notes on the test suite:
 
 ---
 
+## What CI enforces
+
+```mermaid
+flowchart LR
+    PR["pull request"] --> VG["Version guard"]
+    PR --> BT["Build and test"]
+    PR --> DP["Dependency policy<br/>cargo-deny licenses, bans, sources"]
+    PR --> WL["Workflow lint<br/>zizmor and actionlint"]
+    CRON["daily cron"] --> ADV["RustSec advisories<br/>cargo-deny"]
+    BOT["weekly Dependabot"] --> PIN["grouped PR bumping<br/>action hash pins"]
+    MAIN["push to main"] --> COV["Coverage report<br/>advisory, never a gate"]
+    TAG["tag push"] --> REL["Release packages"]
+    REL --> SUM["SHA256SUMS"]
+    REL --> ATT["provenance attestation"]
+```
+
+Every PR runs four independent gates ([`ci.yml`](.github/workflows/ci.yml)); all four are deterministic — the same tree gives the same answer forever:
+
+- **Version guard** — the versioning contract below, enforced mechanically.
+- **Build and test** — `cargo fmt --check`; clippy over all targets and features at `-D warnings`; workspace build and tests `--locked`; a `--no-run` compile of the KVM-gated tests so they cannot rot silently; `cargo doc` at `-D warnings`; and the mutation harness (`scripts/mutation-check.py`).
+- **Dependency policy** — `cargo deny check licenses bans sources` against [`deny.toml`](deny.toml). Every crate in `Cargo.lock` must carry an allowed permissive license and come from crates.io. A dependency arriving under a new license fails this gate; the fix is a reviewed addition to the allow list, not a workaround.
+- **Workflow lint** — zizmor and actionlint over `.github/workflows/`. Every `uses:` is pinned to a full commit SHA with the version as a trailing comment; tags are mutable, hashes are not, and zizmor enforces the policy from then on.
+
+Off the PR path:
+
+- **Advisories** ([`advisories.yml`](.github/workflows/advisories.yml), daily cron) — `cargo deny check advisories`: RustSec advisories and yanked releases across `Cargo.lock`. It runs on a clock, not on PRs, because a new CVE flips it with no code change — a red run means a locked crate has a known advisory, never that your PR broke something. The badge in README.md is the visibility mechanism.
+- **Coverage** ([`coverage.yml`](.github/workflows/coverage.yml), pushes to `main`) — `cargo llvm-cov`, advisory only: no threshold, no service, `continue-on-error`, and it must stay that way. The `#[ignore]`d /dev/kvm suite cannot run on hosted runners, so the percentage systematically undercounts the best-defended paths (jail, VM lifecycle, network enforcement). The report exists to find modules no test executes, not to grade the tree.
+- **Dependabot** ([`dependabot.yml`](.github/dependabot.yml)) — weekly grouped PRs bumping action hash pins. The `github-actions` ecosystem only: a cargo update PR would touch `Cargo.lock` without the version bump the guard demands and arrive permanently red. Cargo security coverage comes from Dependabot alerts and security updates (a repo-settings toggle) plus the advisories cron.
+- **Release provenance** ([`release.yml`](.github/workflows/release.yml)) — every asset a release ships carries a Sigstore-signed build attestation (SLSA v1.0 Build L2) tying it to this repository, workflow, and commit. Verify any downloaded asset with `gh attestation verify <asset> -R me1iissa/isopod`. The checksums in `SHA256SUMS` prove a download is intact; the attestation proves where the build came from.
+- **CodeQL** runs through GitHub's default setup, configured in repository settings — there is deliberately no CodeQL workflow file to edit.
+
+None of this runs the live suite. GitHub runners have no /dev/kvm, so the real-boot and egress-ledger tests still run only by hand — green CI proves the build, the dependencies, and the workflows, not that the sandbox holds.
+
+---
+
 ## Crate map
 
 isopod is a Cargo workspace of eight crates. Solid arrows are Cargo
@@ -158,7 +193,7 @@ the manifests at those commits still read `0.1.0`.
 
 1. **Branch** off `main`. Do not commit directly to `main`.
 2. **Keep changes focused.** Solve the stated problem; avoid unrelated refactors in the same change. Update tests and any affected docs (`README.md`, `docs/`, `PLAN.md` milestone notes) in the same change.
-3. **Run the checks locally** before opening a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features`, `cargo test`.
+3. **Run the checks locally** before opening a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features`, `cargo test`. If the change adds or updates a dependency, also run `cargo deny check licenses bans sources` (`cargo install cargo-deny`).
 4. **Write a clear PR description** explaining what changed and why, how you verified it (including any live VM/dogfood testing), and any follow-ups you are deliberately leaving out of scope.
 5. Reference the relevant [PLAN.md](PLAN.md) milestone or backlog item where applicable, so reviewers can place the change in the roadmap.
 

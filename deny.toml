@@ -1,0 +1,54 @@
+# cargo-deny configuration — the machine-checked policy for the crate half of
+# the supply chain. CI runs the deterministic checks (licenses, bans, sources)
+# on every PR and the advisories check on a daily cron; see
+# .github/workflows/ci.yml and .github/workflows/advisories.yml.
+#
+# What this does NOT buy: cargo-deny reads metadata — license declarations,
+# the RustSec database, Cargo.lock sources. It does not read code, so a
+# malicious crate with a clean license and no advisory passes. It also says
+# nothing about the vendored Firecracker submodule; that pin is policed by the
+# version guard and by hand.
+
+[licenses]
+# Permissive licenses this Apache-2.0 project can carry. A dependency arriving
+# under anything else fails the PR gate — adding to this list is a decision,
+# not a default.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+    "0BSD",
+    "CC0-1.0",
+    "MIT-0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+exceptions = [
+    # dirs -> dirs-sys -> option-ext. MPL-2.0 is file-level copyleft; carrying
+    # it unmodified is fine. Named so the next copyleft license is a decision.
+    { name = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[bans]
+# Duplicate versions today: 4 crates. Warn, don't gate — duplicate versions
+# are a compile-time and audit cost, not a defect.
+multiple-versions = "warn"
+
+[sources]
+# Every dependency comes from crates.io. A crate arriving from any other
+# registry or from a git URL fails the PR gate.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# A yanked release is its author saying "do not use this"; treat that as an
+# error. RustSec advisories are checked by the same command — on a daily cron,
+# not on PRs, because a new CVE flips the answer with no code change and a
+# gate that reddens an innocent PR trains people to ignore it.
+yanked = "deny"

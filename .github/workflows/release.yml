@@ -4,17 +4,26 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write
+permissions: {}
+
+# A tag build is never cancelled by a later one; it queues.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   package:
     name: Build & publish packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create publishes the release and its assets
+      id-token: write # OIDC identity attest-build-provenance presents to Sigstore
+      attestations: write # stores the signed attestation against the repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -83,6 +92,30 @@ jobs:
 
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS
+
+      # SHA256SUMS above proves a download matches what the workflow uploaded;
+      # it proves nothing about where the build came from — an attacker with
+      # `contents: write` regenerates the checksums along with the binaries.
+      # The attestation is signed with the runner's OIDC identity via Sigstore
+      # and recorded in a public transparency log, tying every shipped asset
+      # to this repository, this workflow file, this commit, this trigger
+      # (SLSA v1.0 Build L2). Verify with:
+      #   gh attestation verify <asset> -R me1iissa/isopod
+      # What it does NOT buy: it attests that this workflow built the
+      # artifact; it does not audit the workflow. A compromised pinned action
+      # would produce a perfectly attested compromised binary — the workflow
+      # lint and the no-cache rule above are what defend the build itself.
+      # A failed attestation blocks the release: no external inputs beyond
+      # Sigstore availability, and a release is a manual, retryable event.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/firecracker
+            dist/isopod-guest-agent
 
       - name: Release notes from CHANGELOG
         run: |

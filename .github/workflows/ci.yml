@@ -29,9 +29,10 @@ jobs:
     name: Version guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Extract workspace version
         id: ver
@@ -44,20 +45,29 @@ jobs:
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "workspace version: $ver"
 
+      # The version below is grep-cut from the PR author's Cargo.toml, so it is
+      # attacker-chosen bytes. It reaches the shell through `env`, never by
+      # template expansion inside `run:` — expansion would let a hostile
+      # version string inject shell into a job that holds the workflow token.
       - name: Plugin manifest is in lockstep
+        env:
+          HEAD_VER: ${{ steps.ver.outputs.version }}
         run: |
           plugin="$(jq -r .version .claude-plugin/plugin.json)"
-          if [ "$plugin" != "${{ steps.ver.outputs.version }}" ]; then
-            echo "::error file=.claude-plugin/plugin.json::plugin version ($plugin) != workspace version (${{ steps.ver.outputs.version }}) — bump them together"
+          if [ "$plugin" != "$HEAD_VER" ]; then
+            echo "::error file=.claude-plugin/plugin.json::plugin version ($plugin) != workspace version ($HEAD_VER) — bump them together"
             exit 1
           fi
 
       - name: Incoming version must be newer than the current one (PR)
         if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_VER: ${{ steps.ver.outputs.version }}
         run: |
-          base_sha="${{ github.event.pull_request.base.sha }}"
+          base_sha="$BASE_SHA"
           base_ver="$(git show "$base_sha:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)"
-          head_ver="${{ steps.ver.outputs.version }}"
+          head_ver="$HEAD_VER"
           echo "current (base): $base_ver -> incoming (head): $head_ver"
           if [ "$head_ver" = "$base_ver" ]; then
             if git diff --name-only "$base_sha"...HEAD -- $CODE_PATHS | grep -q .; then
@@ -72,8 +82,10 @@ jobs:
 
       - name: Version must describe the tree (main)
         if: github.event_name == 'push'
+        env:
+          HEAD_VER: ${{ steps.ver.outputs.version }}
         run: |
-          ver="${{ steps.ver.outputs.version }}"
+          ver="$HEAD_VER"
           latest="$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)"
           if [ -n "$latest" ] && [ "$ver" != "$latest" ] && \
              [ "$(printf '%s\n%s\n' "$latest" "$ver" | sort -V | tail -1)" != "$ver" ]; then
@@ -95,14 +107,16 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Format
         run: cargo fmt --all --check
@@ -139,3 +153,53 @@ jobs:
       # already worked; this is the gate for that class.
       - name: Mutations
         run: python3 scripts/mutation-check.py
+
+  # Dependency policy over the locked crate graph, against deny.toml at the
+  # repo root: licenses, banned duplicates, and source provenance. These three
+  # checks are deterministic — the same tree gives the same answer forever, so
+  # they can gate PRs. The advisories check is NOT here: a new RustSec entry
+  # flips it with no code change, so it runs on a daily cron instead
+  # (advisories.yml). cargo-deny reads metadata, not code — a malicious crate
+  # with a clean license and no advisory passes.
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses bans sources
+
+  # Supply-chain lint over the workflow files themselves: zizmor catches
+  # credential leaks, permission creep, cache poisoning, template injection,
+  # and unpinned actions; actionlint catches expression type errors, broken
+  # job wiring, and (via shellcheck) defects in the run: blocks — this CI is
+  # bash-heavy and nothing else lints that bash. Both tools are version-pinned:
+  # an unpinned linter is a gate that turns red on someone else's schedule.
+  # Static analysis only — neither tool sees what a pinned action does at
+  # runtime, and neither polices repo settings.
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.28.0 --min-severity medium --min-confidence high .github/workflows/
+      # actionlint's documented installer is `curl | bash`; this project does
+      # not run that in CI. The release tarball is fetched and verified against
+      # a checksum recorded here from the release's checksums file.
+      - name: actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint_${VERSION}_linux_amd64.tar.gz" | sha256sum -c -
+          tar xzf "actionlint_${VERSION}_linux_amd64.tar.gz" actionlint
+          ./actionlint -color

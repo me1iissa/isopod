@@ -1,0 +1,57 @@
+name: Coverage
+
+# Advisory line coverage on pushes to main: a summary table on the run page
+# and an lcov artifact for local drill-down. No hosted service, no token, no
+# threshold, no gate — `continue-on-error` below means a failure here never
+# reddens a build, and nothing may ever be made to depend on this number.
+#
+# The number systematically undercounts, and gating on it would punish the
+# wrong code: the `#[ignore]`d /dev/kvm suite — real boots, the jail, VM
+# lifecycle, the egress-enforcement ledger — cannot run on GitHub-hosted
+# runners, so the best-defended paths in the tree are absent from every
+# percentage this workflow prints. What the report is for: finding the module
+# or branch that NO test executes — the one question the mutation harness
+# does not ask, because it only interrogates code it has a mutation for.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded coverage run is worthless; cancel it.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    # Advisory means advisory: a red coverage job must not mark the push red.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add llvm-tools
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-llvm-cov
+      # Caching here is fine, unlike in release.yml: nothing this job produces
+      # is shipped, signed, or attested — a poisoned cache can only corrupt a
+      # number that gates nothing.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Coverage
+        run: |
+          cargo llvm-cov --workspace --locked --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14

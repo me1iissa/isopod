@@ -1,6 +1,7 @@
 # isopod
 
 [![CI](https://github.com/me1iissa/isopod/actions/workflows/ci.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/ci.yml)
+[![Advisories](https://github.com/me1iissa/isopod/actions/workflows/advisories.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/advisories.yml)
 
 **Run untrusted code in a real microVM. Boots in ~0.4 s, destroyed after every call.**
 
