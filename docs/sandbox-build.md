@@ -85,6 +85,34 @@ For Claude sessions: `sandbox_run` with `stage: "isopod-build/0.12.0-tested"`, `
 `/dev/kvm` or live host state (taps, a real `~/.isopod`) stay on the host (they are
 `#[ignore]`d live tests anyway).
 
+## Running the mutation harness in-guest
+
+`scripts/mutation-check.py` is destructive by design — it edits source to prove the
+suite notices — so a sandbox is where it belongs, and the host tree never has to be
+trusted back. It works from `git archive HEAD`, so the overlaid source needs a repo:
+
+```sh
+cd /root/src
+git init -q .
+printf 'target/\n.git/\n' > .git/info/exclude   # ← the trap; see below
+git config user.email t@t.invalid && git config user.name t
+git add -A && git commit -qm 'tree under test'
+python3 scripts/mutation-check.py --only <mutation-name>
+```
+
+**`target/` must be excluded before `git add -A`, and nothing in the tarball does it
+for you.** The stage already carries the previous build's `target/` (≈1.5 GiB) at
+`/root/src/target`, and a source tarball built from `Cargo.toml Cargo.lock crates
+scripts` contains no `.gitignore` — so `git add -A` sweeps all of it into the index and
+`git archive HEAD` then tries to export it. What that looks like is a VM killed by the
+OOM reaper seconds after `exporting HEAD to …`, with no other diagnostic, which reads
+like a memory shortage and is not one: it survives unchanged at the host's memory cap
+and disappears entirely once `target/` is excluded. The check that tells them apart is
+`git ls-files | wc -l` — the workspace is ~94 files.
+
+One mutation runs in ~2.5 min at 4 vcpu / 3072 MiB / 16384 MiB scratch, most of it the
+cold `warming the build cache` pass over the exported tree.
+
 ## Getting binaries out
 
 Use `--copy-out GUEST:HOST` (CLI) or `copy_out: [{guest, host}]` (MCP) — the streamed,
