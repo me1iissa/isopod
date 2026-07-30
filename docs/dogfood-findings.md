@@ -893,7 +893,7 @@ flowchart LR
     C --> T
 ```
 
-49. **[open] MEDIUM — `network: false` leaves the loopback interface DOWN, so a
+49. **[fixed in 0.12.3] MEDIUM — `network: false` leaves the loopback interface DOWN, so a
     guest cannot talk to itself.** Booted with `network: false`, the guest has
     exactly one interface and it is down: `1: lo: <LOOPBACK> mtu 65536 qdisc noop
     state DOWN`. The failure mode is bad because it is *partial* — `bind()` on
@@ -923,6 +923,48 @@ flowchart LR
     The deeper issue is that a mutable-looking label pinned to an immutable stage
     silently rots; label-reuse semantics are still untested (noted in
     `docs/sandbox-build.md`).
+
+51. **[open] HIGH — a coexisting Docker install silently breaks all NAT egress,
+    because its `FORWARD` policy drops every guest packet.** Found by running
+    isopod in CI, and it is not a CI problem: any host with Docker on it is
+    affected. Docker sets the iptables `ip filter` FORWARD chain policy to DROP
+    and jumps to a `DOCKER-USER` chain that, by default, contains only `RETURN`
+    — so guest→WAN traffic falls straight through to the drop. `isopod setup`
+    reports complete success: 12 taps, an `inet isopod` table, `ip_forward=1`,
+    and the guest gets an address. Then nothing works, and the error the
+    workload sees is whatever its own first network call happens to be. Measured
+    on a hosted runner: a guest handed a **literal IP** — no DNS anywhere in the
+    path — could not open TLS to it, while the host reached both `1.1.1.1` and
+    `8.8.8.8` successfully. Host traffic goes through OUTPUT; guest traffic goes
+    through FORWARD, and only one of those is dropped.
+
+    The failure mode is bad in a specific way: **it is invisible to isopod.**
+    Nothing in `setup` looks at whether another tool has already claimed the
+    forward hook, so every diagnostic isopod prints says the network is fine.
+    The first symptom is a DNS timeout inside a guest, which reads as a
+    resolver problem — and did: this was diagnosed as a resolver bug first,
+    confidently and wrongly, before the literal-IP control ruled DNS out.
+
+    Reproduced and settled in throwaway network namespaces
+    (`target/lint/nfprobe-forward.sh`), three namespaces wired client → router →
+    server so traffic is genuinely forwarded both ways:
+
+    | case | result |
+    |---|---|
+    | plain forwarding (harness control) | REACHED |
+    | Docker shape: `FORWARD` policy DROP | BLOCKED |
+    | + isopod `ACCEPT` in `DOCKER-USER` | REACHED |
+    | isopod's own nft DROP alone | BLOCKED |
+    | + isopod's nft DROP on top of the ACCEPT | BLOCKED |
+
+    The last row is the one that decides whether the fix is allowed to exist. An
+    `ACCEPT` verdict ends traversal of **that base chain only**; every other base
+    chain registered at the hook still runs. So inserting an accept rule into
+    Docker's chain removes Docker's drop *without* bypassing isopod's own egress
+    enforcement, which stays authoritative. → FIX: `isopod setup` inserts an
+    accept rule for `isopod-tap*` into `DOCKER-USER` when that chain exists.
+    Untested residue: what happens when the Docker daemon restarts and recreates
+    the chain.
 
 **Checked and found sound**: the tap teardown was reported exactly right — the
 error named WSL2 as the likely cause, named `sudo isopod setup` as the fix, and
