@@ -8,3 +8,6 @@ vmlinux*
 
 # Rendered documentation site (built by scripts/build-docs-site.py)
 _site/
+
+# Python bytecode from scripts/ — never a build product worth keeping.
+__pycache__/
