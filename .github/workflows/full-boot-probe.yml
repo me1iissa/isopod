@@ -1,23 +1,36 @@
 name: Full boot probe
 
-# Whether a GitHub-hosted runner can boot a real isopod microVM, end to end.
+# isopod's live suite, on a GitHub-hosted runner — and the probe that earned it
+# the right to run there.
 #
-# The KVM probe established that /dev/kvm is present and that KVM_CREATE_VM
-# returns a file descriptor once the runner is in the kvm group. That is
-# necessary and NOT sufficient. isopod also needs a vendored Firecracker build,
-# guest images, and — for anything beyond --no-network — tap devices and an
-# nftables ruleset installed by `isopod setup`, which is the one privileged
-# step. None of that has been shown to work on a hosted runner.
+# It started as a question. A hosted runner had to be shown to give us /dev/kvm,
+# then to let something open it, then to build a vendored Firecracker and four
+# guest images, then to survive the one privileged step (`isopod setup`, which
+# creates taps in the root netns and installs an nftables table), and finally to
+# actually move packets. Run 30542332477 closed the last of it on a free
+# ubuntu-latest: a guest booted in 84 ms, reached a literal IP over TLS with no
+# DNS anywhere in the path, resolved names — and, the part that matters, had an
+# allowlisted host allowed with byte counts recorded and a non-allowlisted one
+# refused with `reason: "not_allowed"`. Policy, not a timeout dressed up as one.
 #
-# This probe answers it. It is workflow_dispatch only, deliberately: it builds
-# Firecracker from the vendored submodule and is far too slow for the PR path.
-# Its output decides whether the #[ignore]d live suite — the jail, VM lifecycle
-# and network enforcement tests, which today run nowhere but a maintainer's
-# laptop — can run in CI at all.
+# It took four attempts to get an honest answer, and every failure was a control
+# that could not fail: an egress step that printed `denied-ok` when BOTH requests
+# failed; a NAT step that exited 0 on a trailing `echo`; a DNS diagnosis that was
+# confidently wrong until a literal-IP test with no resolver involved failed too
+# (the real cause was Docker's FORWARD policy DROP — finding #51). Hence the
+# structure below: the assertions carry `continue-on-error` and a gate at the end
+# enforces them together, so a red step can never skip the diagnostics that
+# explain it, and every check is one that has been seen to produce BOTH answers.
 #
-# Every step reports what it did rather than only succeeding, because a failure
-# here is a finding, not a defect.
+# So the suite now runs nightly rather than nowhere but a maintainer's laptop.
+# Nightly and not per-PR: twenty minutes of Firecracker and image builds does not
+# belong on the pull-request path, and on a one-maintainer project a regression
+# caught by morning is caught early enough.
 on:
+  schedule:
+    # 04:17 UTC — off the hour, because everyone's cron is on the hour and
+    # GitHub's shared scheduler drifts most when it is busiest.
+    - cron: "17 4 * * *"
   workflow_dispatch:
     inputs:
       run_live_suite:
@@ -26,6 +39,12 @@ on:
         default: false
 
 permissions: {}
+
+# Twenty-minute runs must not stack up. A superseded probe is worthless, but
+# never cancel one that is already establishing something.
+concurrency:
+  group: full-boot-probe
+  cancel-in-progress: false
 
 jobs:
   boot:
@@ -342,8 +361,18 @@ jobs:
           fi
           echo "every assertion held"
 
+      # `inputs` is empty on a scheduled run — workflow_dispatch inputs simply do
+      # not exist there — so the schedule must be named explicitly. Without the
+      # second clause the nightly run would do all twenty minutes of building and
+      # then quietly skip the tests it exists to run, which is precisely the
+      # shape of "green and proving nothing" this file has been rewritten three
+      # times to eliminate.
+      #
+      # --test-threads=1 because these tests claim real network slots and boot
+      # real VMs; running them concurrently makes them fight over the pool.
       - name: Live suite
-        if: inputs.run_live_suite
+        id: live
+        if: ${{ inputs.run_live_suite || github.event_name == 'schedule' }}
         run: cargo test --workspace --locked -- --ignored --test-threads=1
 
       # Expansions go through env, not into the script body — the same rule the
@@ -359,6 +388,7 @@ jobs:
           DNS_HOST: ${{ steps.dns_host.outcome }}
           FILTERED_OUTCOME: ${{ steps.filtered.outcome }}
           FILTERED_DNS: ${{ steps.filtered_dns.outcome }}
+          LIVE: ${{ steps.live.outcome }}
           JOB_STATUS: ${{ job.status }}
         run: |
           {
@@ -374,6 +404,7 @@ jobs:
             echo "| guest DNS, host upstream | $DNS_HOST |"
             echo "| filtered egress, both halves | $FILTERED_OUTCOME |"
             echo "| filtered DNS hits the broker | $FILTERED_DNS |"
+            echo "| live suite (#[ignore]d) | ${LIVE:-not run} |"
             echo "| job | $JOB_STATUS |"
             echo ""
             echo "The two DNS rows are diagnostics and never fail the job — read"
