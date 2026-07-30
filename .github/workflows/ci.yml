@@ -155,12 +155,16 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      # GitHub-hosted runners have no /dev/kvm, so the `#[ignore]`d live tests
-      # (real boots, the egress bypass ledger) cannot RUN here. Compiling them
-      # is still worth doing: without it they rot silently against API changes
-      # and only break when someone next runs the ledger by hand, long after the
-      # change that broke them. `--no-run` builds every test target, ignored
-      # ones included.
+      # The `#[ignore]`d live tests (real boots, the egress bypass ledger) do
+      # not RUN in this job. Not for want of /dev/kvm — this comment used to say
+      # hosted runners have none, which is false: the full-boot probe granted
+      # itself kvm-group access and booted a guest in 84 ms on ubuntu-latest.
+      # They are absent because reaching them costs a vendored Firecracker
+      # build and four guest images, some twenty minutes, which does not belong
+      # on the PR path. Compiling them is still worth doing: without it they rot
+      # silently against API changes and only break when someone next runs the
+      # ledger by hand, long after the change that broke them. `--no-run` builds
+      # every test target, ignored ones included.
       - name: Compile the live (/dev/kvm) tests
         run: cargo test --workspace --locked --no-run
 
