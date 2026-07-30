@@ -22,12 +22,20 @@
 //! route before installing the new one, and rewrites `/etc/resolv.conf`. Applying
 //! the same config twice is therefore idempotent.
 //!
-//! Boot-time application is best-effort: every failure is logged to serial and
-//! swallowed. A broken or absent NIC must never stop the agent from serving exec
-//! over vsock — the whole point of the vsock control plane is that it works with
-//! networking off. Absent the `isopod.net` token (e.g. `--no-network`) this is a
-//! no-op. The runtime [`configure`] instead surfaces failures to the caller so
-//! the host learns the reconfiguration did not take.
+//! Boot-time application is best-effort, with one exception. A broken or absent
+//! NIC must never stop the agent from serving exec over vsock — the whole point
+//! of the vsock control plane is that it works with networking off — so
+//! addressing and routing failures are logged and swallowed. Absent the
+//! `isopod.net` token (e.g. `--no-network`) this is a no-op. The runtime
+//! [`configure`] instead surfaces failures to the caller so the host learns the
+//! reconfiguration did not take.
+//!
+//! **The exception is the resolver.** A failed `/etc/resolv.conf` write leaves
+//! the guest resolving successfully through whatever its image or stage layer
+//! carried, so unlike every other failure here it is invisible: nothing breaks,
+//! and the answers come from somewhere nobody chose. [`apply`] therefore
+//! propagates that one error, and the boot path records it in [`resolv_error`]
+//! for reporting in every `Pong`.
 //!
 //! **Loopback is not network configuration.** [`ensure_loopback_up`] lives here
 //! because the ioctl plumbing does, but it is a boot duty `main()` performs
@@ -35,7 +43,7 @@
 //! guest with no NIC still needs `127.0.0.1` to work (finding #49).
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::cmdline;
 use crate::server::log;
@@ -43,6 +51,43 @@ use crate::sys;
 
 /// Where the guest resolver config is written.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Set iff the BOOT-TIME resolver write failed (the guest is running on whatever
+/// `/etc/resolv.conf` its image or stage layer carried).
+///
+/// The boot path is best-effort by design — a missing NIC must not stop exec
+/// over vsock — so it swallows [`apply`]'s error. That is right for addressing
+/// and routing, whose failure is immediately visible to the workload, and wrong
+/// for the resolver: the guest goes on resolving successfully through a file
+/// nobody chose, and nothing looks broken. Recorded here and reported in every
+/// `Pong` so the host can say so, exactly as an overlay-assembly failure is
+/// ([`crate::overlay::assembly_error`]).
+static RESOLV_ERROR: OnceLock<String> = OnceLock::new();
+
+/// The boot-time resolver-write failure, if there was one.
+#[must_use]
+pub fn resolv_error() -> Option<&'static str> {
+    RESOLV_ERROR.get().map(String::as_str)
+}
+
+/// Does `/etc/resolv.conf` already name exactly `want`, in order?
+///
+/// Read back rather than inferred, because [`apply`] returns one error type for
+/// several steps: a no-NIC boot fails at the address ioctl long before the
+/// resolver is touched, and reporting a resolver problem there would be a lie
+/// pointing at the wrong subsystem. Only a file that does not say what this run
+/// asked for is worth telling the host about.
+fn resolv_conf_matches(want: &[String]) -> bool {
+    let Ok(text) = std::fs::read_to_string(RESOLV_CONF) else {
+        return false;
+    };
+    let have: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver "))
+        .map(str::trim)
+        .collect();
+    have == want.iter().map(String::as_str).collect::<Vec<_>>()
+}
 
 /// Proxy environment exported into every exec, or empty for an unfiltered run.
 ///
@@ -214,7 +259,20 @@ pub fn configure_if_requested() {
         // Boot-time application is best-effort: a missing/broken NIC must not
         // stop exec-over-vsock, so the error (already logged) is swallowed.
         Ok(cfg) => {
-            let _ = apply(&cfg);
+            // Still best-effort for addressing — a no-NIC boot is expected and
+            // must not stop exec over vsock. But a resolver that was asked for
+            // and not written is recorded, so the host is told rather than left
+            // to infer it from a guest that resolves perfectly well through the
+            // wrong file.
+            let wanted_dns = !cfg.dns.is_empty();
+            if apply(&cfg).is_err() && wanted_dns && !resolv_conf_matches(&cfg.dns) {
+                let _ = RESOLV_ERROR.set(format!(
+                    "{RESOLV_CONF} was not written; the guest is resolving through \
+                     whatever its image or stage layer carried, not through the \
+                     resolver this run was given ({})",
+                    cfg.dns.join(",")
+                ));
+            }
         }
         Err(e) => log(&format!(
             "net: invalid network config on the kernel command line: {e}; skipping"
@@ -316,10 +374,32 @@ fn apply(cfg: &NetConfig) -> io::Result<()> {
         }
     }
 
+    // THE ONE SECONDARY STEP THAT IS NOT BEST-EFFORT.
+    //
+    // The route and address failures above are logged and survived because a
+    // guest with a broken route has visibly no network — the workload's first
+    // call fails and the cause is in front of whoever reads the log. A failed
+    // resolver write is the opposite: the guest keeps whatever `/etc/resolv.conf`
+    // its image or its stage layer happened to carry, and RESOLVES SUCCESSFULLY
+    // through it. Nothing looks wrong anywhere.
+    //
+    // That was survivable while the baked value was the same public resolvers
+    // the host would have sent. It stops being survivable once the host sends a
+    // gateway address instead: the guest silently keeps resolving through a
+    // third party while the host, the operator and the run's own egress record
+    // all report that gateway DNS policy is in force. The public-slot redirect
+    // is deliberately pinned to the gateway address so a guest querying a public
+    // resolver directly keeps its own path — which is exactly the path an
+    // unconfigured guest then takes.
+    //
+    // So this one propagates. A run that cannot be given its resolver is a run
+    // whose DNS policy is not in force, and it must say so rather than quietly
+    // resolve somewhere else.
     if !cfg.dns.is_empty() {
-        if let Err(e) = write_resolv_conf(&cfg.dns) {
+        write_resolv_conf(&cfg.dns).map_err(|e| {
             log(&format!("net: writing {RESOLV_CONF} failed: {e}"));
-        }
+            e
+        })?;
     }
 
     log(&format!(

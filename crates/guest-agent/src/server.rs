@@ -80,6 +80,7 @@ fn dispatch(conn: &Conn, req: Request, reaper: &Reaper) {
                     proto_version: PROTO_VERSION,
                     uptime_s: read_uptime(),
                     overlay_error: crate::overlay::assembly_error().map(str::to_string),
+                    resolv_error: crate::net::resolv_error().map(str::to_string),
                 },
             });
         }

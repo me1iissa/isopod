@@ -102,9 +102,43 @@ const ALPINE_PACKAGES: &[&str] = &[
     "cmake",
 ];
 
-/// Public DNS resolvers baked into the guest `/etc/resolv.conf` (PLAN: DNS is
-/// public resolvers, not host-derived).
-const RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+/// A tombstone baked into the guest `/etc/resolv.conf`.
+///
+/// The guest agent overwrites this file at boot with the resolver the host
+/// chose for the run, so these bytes are only ever in force when that write did
+/// not happen. They are chosen entirely for how that failure behaves.
+///
+/// **Why a loopback address.** Anything in `127/8` terminates on the guest's own
+/// loopback interface, which the agent raises unconditionally before any network
+/// decision. So in the failure state not one DNS packet leaves the VM — stronger
+/// than any answer the host could give, and the only reading of "never silently
+/// route a lookup to a third party" that survives a regression nobody predicted.
+/// The previous value was `1.1.1.1` and `8.8.8.8`, which meant a guest that
+/// never took its configured resolver quietly resolved everything through
+/// Cloudflare while the host believed otherwise.
+///
+/// **Why not `127.0.0.1`.** It is indistinguishable from what a libc does with a
+/// missing or empty file, so it would tell a reader nothing. Worse, a workload
+/// that installs `dnsmasq` or `unbound` binds exactly there — and would forward
+/// these queries to its own public upstream, rebuilding the leak inside the
+/// sentinel meant to expose it. `127.53.53.53` can only mean one thing, and
+/// greps straight to this comment.
+///
+/// **Why the `options` line.** Measured in a real musl guest: without it a
+/// lookup against an unreachable resolver takes ~5 s, because musl's resolver
+/// uses an unconnected socket and never sees the ICMP refusal. With it, ~1 s.
+/// A sandbox that boots in 0.4 s should not spend five seconds failing.
+const RESOLV_CONF: &str = "\
+# Managed by isopod. The guest agent rewrites this file at boot with the
+# resolver the host configured for this run.
+#
+# IF YOU ARE READING THIS INSIDE A RUNNING SANDBOX, THAT REWRITE DID NOT HAPPEN.
+# Nothing here resolves — 127.53.53.53 is a deliberate dead end, so no lookup
+# leaves the VM to a resolver nobody chose. Check the serial log for:
+#     net: writing /etc/resolv.conf failed
+nameserver 127.53.53.53
+options timeout:1 attempts:1
+";
 
 /// Which rootfs to build.
 ///
@@ -2147,12 +2181,28 @@ mod tests {
         assert!(ilink.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_link(&ilink).unwrap(), Path::new("sbin/init"));
 
-        // Runtime config: resolv.conf (public resolvers) + apk/repositories.
+        // Runtime config: the resolv.conf tombstone + apk/repositories.
         write_alpine_runtime_config(root).unwrap();
         let resolv = std::fs::read_to_string(root.join("etc/resolv.conf")).unwrap();
+        // Pinned, not merely "has a nameserver" — that assertion passed just as
+        // happily on the public resolvers this replaced, which is to say it
+        // never checked the thing that matters.
         assert!(
-            resolv.contains("nameserver "),
-            "resolv.conf has a nameserver"
+            resolv.contains("nameserver 127.53.53.53"),
+            "the baked resolver must be the loopback tombstone, so a guest that \
+             never took its configured resolver leaks nothing: {resolv}"
+        );
+        assert!(
+            resolv.contains("options timeout:1 attempts:1"),
+            "without the options line a failed lookup stalls ~5 s on musl"
+        );
+        assert!(
+            !resolv.contains("1.1.1.1") && !resolv.contains("8.8.8.8"),
+            "a public resolver in the image is a silent third-party fallback"
+        );
+        assert!(
+            resolv.contains("net: writing /etc/resolv.conf failed"),
+            "the file must name the serial line that explains it"
         );
         let repos = std::fs::read_to_string(root.join("etc/apk/repositories")).unwrap();
         assert!(

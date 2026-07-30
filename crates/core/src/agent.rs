@@ -65,6 +65,18 @@ pub enum AgentError {
          on the read-only base root, refusing to run on the wrong rootfs"
     )]
     OverlayDegraded(String),
+    /// The guest never took the resolver this run was given.
+    ///
+    /// Fatal for the same reason a degraded overlay is: the run that would
+    /// proceed is not the run that was asked for. A guest resolving through its
+    /// image's baked resolvers instead of the one configured for it still
+    /// resolves — successfully, silently, and through whatever third party the
+    /// image happened to name. Failing here is the only way that ever surfaces.
+    #[error(
+        "guest did not take this run's resolver ({0}); refusing to proceed with \
+         DNS policy that is not in force"
+    )]
+    ResolverNotApplied(String),
     /// The guest returned a response that does not fit the operation.
     #[error("guest agent returned an unexpected response: {0}")]
     Unexpected(String),
@@ -334,6 +346,7 @@ impl AgentClient {
                 proto_version,
                 uptime_s,
                 overlay_error,
+                resolv_error,
             } => {
                 if proto_version != PROTO_VERSION {
                     return Err(AgentError::ProtoMismatch {
@@ -343,6 +356,9 @@ impl AgentClient {
                 }
                 if let Some(message) = overlay_error {
                     return Err(AgentError::OverlayDegraded(message));
+                }
+                if let Some(message) = resolv_error {
+                    return Err(AgentError::ResolverNotApplied(message));
                 }
                 Ok(Pong {
                     agent_version,
@@ -1321,6 +1337,7 @@ mod tests {
                     proto_version: PROTO_VERSION,
                     uptime_s: 1.5,
                     overlay_error: None,
+                    resolv_error: None,
                 },
             )
             .await;
@@ -1350,6 +1367,7 @@ mod tests {
                     proto_version: bad,
                     uptime_s: 0.0,
                     overlay_error: None,
+                    resolv_error: None,
                 },
             )
             .await;
@@ -1382,6 +1400,7 @@ mod tests {
                     proto_version: PROTO_VERSION,
                     uptime_s: 0.4,
                     overlay_error: Some("mount layer /dev/vdk at /layers/10: ENOENT".into()),
+                    resolv_error: None,
                 },
             )
             .await;
@@ -1415,6 +1434,7 @@ mod tests {
                     proto_version: PROTO_VERSION,
                     uptime_s: 0.1,
                     overlay_error: None,
+                    resolv_error: None,
                 },
             )
             .await;

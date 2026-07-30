@@ -6,6 +6,72 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.17.0] — 2026-07-30
+
+### Fixed — a guest that never took its resolver said nothing about it
+
+The guest agent logged a failed `/etc/resolv.conf` write and carried on, then
+logged `net: eth0 up … dns [1.1.1.1,8.8.8.8]` on the next line. So the failure did
+not merely go unnoticed — **it reported success.** The guest went on resolving
+perfectly well through whatever its image or stage layer happened to carry.
+
+That was survivable while the baked value was the same public resolvers the host
+would have sent. It stops being survivable now that the host sends a gateway
+address instead: the public-slot redirect is deliberately pinned to the gateway,
+so a guest that kept its baked resolvers takes its own masqueraded path and
+resolves everything through a third party — while the host, the operator and the
+run's own egress record all report that gateway DNS policy is in force.
+
+The resolver write now propagates. It is the one secondary step in `apply` that is
+not best-effort, and the reason is that it is the only one whose failure is
+invisible: a broken route or a missing NIC breaks the workload's first call in
+front of whoever reads the log, and a wrong resolver breaks nothing at all.
+
+### Added — `Pong` reports a resolver the guest never took, and the host refuses the run
+
+Boot-time application stays best-effort for addressing — a no-NIC boot must not
+stop exec over vsock — so the failure is recorded and surfaced in every `Pong` as
+an additive `resolv_error`, exactly as a failed overlay assembly already is. The
+host treats it as fatal: a run whose DNS policy is not in force is not the run
+that was asked for.
+
+The record is made by reading the file back, not inferred from the error. `apply`
+returns one error type for several steps, and a no-NIC boot fails at the address
+ioctl long before the resolver is touched — reporting a resolver problem there
+would point at the wrong subsystem.
+
+### Changed — guest images bake a loopback tombstone instead of public resolvers
+
+`/etc/resolv.conf` now ships as `nameserver 127.53.53.53` with
+`options timeout:1 attempts:1` and a header comment naming the serial line to grep
+for. Anything in `127/8` terminates on the guest's own loopback, which the agent
+raises unconditionally — so in the failure state **not one DNS packet leaves the
+VM**, even for a regression nobody has predicted.
+
+Not `127.0.0.1`: that is indistinguishable from what a libc does with a missing
+file, and it collides with a workload-installed `dnsmasq` or `unbound`, which
+would forward the queries to its own public upstream — rebuilding the leak inside
+the sentinel meant to expose it.
+
+The `options` line is doing real work. Measured in a musl guest: a lookup against
+an unreachable resolver takes ~5 s without it and ~1 s with it, because musl's
+resolver uses an unconnected socket and never sees the ICMP refusal.
+
+**This needs a guest image rebuild** (`isopod image build-all --force`) to take
+effect. Existing committed stages carry their own frozen copy of the file and are
+unaffected either way.
+
+The test that covered this asserted only that the file "has a nameserver", which
+passed just as happily on the public resolvers it was meant to guard.
+
+### Added — `scripts/diagnose-forward-hook.sh`
+
+The experiment that established finding #51 and the fix for it, now shipped rather
+than cited from a path outside the repository. If isopod is installed alongside
+Docker and guests cannot reach the network, run it: it reproduces the failure and
+verifies isopod's own enforcement still applies, entirely inside throwaway network
+namespaces.
+
 ## [0.16.0] — 2026-07-30
 
 Part two of the gateway DNS resolver; 0.15.0 provisioned the rules, this builds

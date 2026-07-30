@@ -231,6 +231,7 @@ async fn live_agent_exec_rpc() {
         uptime_s,
         agent_version,
         overlay_error,
+        resolv_error,
     } = &pong.body
     else {
         panic!("expected Pong, got {:?}", pong.body);
@@ -240,6 +241,10 @@ async fn live_agent_exec_rpc() {
     assert_eq!(
         *overlay_error, None,
         "a healthy boot must report no overlay-assembly error"
+    );
+    assert_eq!(
+        *resolv_error, None,
+        "a healthy boot must have taken the resolver it was given"
     );
     assert!(
         *uptime_s > 0.0 && *uptime_s < 120.0,

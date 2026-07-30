@@ -500,6 +500,26 @@ MUTATIONS = [
         package="isopod-core",
         filter="net::broker",
     ),
+    Mutation(
+        name="a-guest-that-never-took-its-resolver-says-nothing",
+        file="crates/core/src/image/rootfs.rs",
+        old='nameserver 127.53.53.53\n',
+        new='nameserver 1.1.1.1\n',
+        defect=(
+            "The image goes back to baking a public resolver. On its own that "
+            "reads harmless — the agent overwrites the file at boot — but it is "
+            "the difference between a guest that resolves NOTHING when that "
+            "write fails and one that resolves EVERYTHING through Cloudflare "
+            "while the host, the operator and the run's egress record all "
+            "report that gateway DNS policy is in force. The public-slot "
+            "redirect is deliberately pinned to the gateway address, so traffic "
+            "aimed at a public resolver keeps its own masqueraded path: exactly "
+            "the path an unconfigured guest takes. A loopback tombstone cannot "
+            "leave the VM at all."
+        ),
+        package="isopod-core",
+        filter="image::rootfs",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

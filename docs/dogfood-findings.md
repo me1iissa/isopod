@@ -946,7 +946,7 @@ flowchart LR
     confidently and wrongly, before the literal-IP control ruled DNS out.
 
     Reproduced and settled in throwaway network namespaces
-    (`target/lint/nfprobe-forward.sh`), three namespaces wired client → router →
+    (`scripts/diagnose-forward-hook.sh`), three namespaces wired client → router →
     server so traffic is genuinely forwarded both ways:
 
     | case | result |
