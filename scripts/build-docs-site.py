@@ -93,6 +93,8 @@ PAGES: list[Page] = [
          "Release history: what landed in each version and why."),
     Page("docs/dogfood-findings.md", "dogfood-findings", "Dogfood findings", "Project",
          "The running ledger of issues found by using isopod for real work."),
+    Page("docs/coverage.md", "coverage", "Coverage", "Project",
+         "What the coverage badge measures, the fifteen tests it leaves out, and why nothing gates on it."),
     Page("docs/feasibility.md", "feasibility", "Feasibility spike", "Project",
          "The M0 spike results."),
     Page("docs/m4-verify.md", "m4-verify", "Network verification", "Project",

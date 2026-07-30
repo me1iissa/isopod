@@ -6,6 +6,48 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.13.3] — 2026-07-30
+
+### Added — CI reports what it learned, on the pull request, while it can still matter
+
+Every pull request now gets a single digest comment, rewritten in place rather
+than appended to: the version-guard verdict in words, the third-party dependency
+delta, and line coverage. Coverage previously ran only on pushes to `main` — a
+number nobody saw until after the merge cannot inform the merge.
+
+The digest is written to the run summary first and mirrored into the comment
+second, so it still renders for pull requests from forks, whose tokens are
+read-only by design. It is deliberately absent from `ci-ok`'s `needs`: a report
+must not be able to block a merge whose code is fine.
+
+Workspace crates are excluded from the dependency delta. They carry the
+workspace version, so without that filter every release bump reported nine
+"dependency changes" and buried the one line that mattered.
+
+### Added — a coverage badge, labelled for what it actually measures
+
+`coverage (unit)`, not `coverage`. A badge cannot carry a caveat, so the
+qualification lives in the label where it cannot be separated from the number.
+`docs/coverage.md` is new and says the rest: which fifteen `#[ignore]`d tests are
+excluded, why the number is lowest exactly where the code is most
+security-relevant, and why nothing gates on it.
+
+The badge endpoint is rendered by the same parser that produces the digest, so
+the two cannot disagree, and it is written only when the summary actually parsed
+— a failed coverage run leaves the previous badge standing rather than replacing
+a real number with a wrong one.
+
+### Fixed — a false claim about hosted runners, in four places
+
+`coverage.yml`, `ci.yml`, and the CI research notes all stated that the
+`#[ignore]`d suite *cannot run on GitHub-hosted runners*. That was false when
+written: it repeated a pre-April-2024 assumption without checking one. A free
+`ubuntu-latest` runner has `/dev/kvm`, and the full-boot probe booted a real
+guest on one in 84 ms and completed a privileged `isopod setup`. The suite is
+absent from the pull-request path because reaching it costs a vendored
+Firecracker build and four guest images — a scheduling constraint, not a
+capability one.
+
 ## [0.13.2] — 2026-07-29
 
 ### Fixed — a tag on the wrong commit published packages declaring the wrong version

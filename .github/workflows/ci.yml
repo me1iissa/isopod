@@ -229,6 +229,116 @@ jobs:
           tar xzf "actionlint_${VERSION}_linux_amd64.tar.gz" actionlint
           ./actionlint -color
 
+  # Everything a reviewer would otherwise have to open three job logs to learn,
+  # written once into the run summary and mirrored into a single pull-request
+  # comment that is rewritten in place rather than appended to.
+  #
+  # It is NOT in ci-ok's `needs`, deliberately. A digest is a report, and a
+  # broken report must not be able to block a merge whose code is fine. If this
+  # job goes red, the PR still merges and the digest is simply absent.
+  #
+  # Coverage runs here rather than only on main because a percentage nobody
+  # sees until after the merge cannot inform the merge. It is skipped outright
+  # when a pull request touches no code, which is most of them.
+  digest:
+    name: PR digest
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Scoped to this job alone. Nothing else in this workflow may write to a
+      # pull request, and this job builds nothing that ships.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Facts about this pull request
+        id: facts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base_ver="$(git show "$BASE_SHA:Cargo.toml" | grep -m1 '^version = ' | cut -d'"' -f2)"
+          head_ver="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "base_version=$base_ver" >> "$GITHUB_OUTPUT"
+          echo "head_version=$head_ver" >> "$GITHUB_OUTPUT"
+          # Same pathspec, and the same word-splitting requirement, as the
+          # version guard above: quoting it matches nothing and every answer
+          # becomes "no code changed".
+          # shellcheck disable=SC2086
+          if git diff --name-only "$BASE_SHA"...HEAD -- $CODE_PATHS | grep -q .; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The base lockfile has to come out of git: the working tree only ever
+          # holds the head's.
+          git show "$BASE_SHA:Cargo.lock" > /tmp/base.lock 2>/dev/null || true
+
+      - name: Install pinned toolchain
+        if: steps.facts.outputs.code_changed == 'true'
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add llvm-tools
+
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        if: steps.facts.outputs.code_changed == 'true'
+        with:
+          tool: cargo-llvm-cov
+
+      # Same reasoning as coverage.yml: a poisoned cache here can only corrupt a
+      # number that gates nothing, and nothing this job produces is shipped.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.facts.outputs.code_changed == 'true'
+
+      # continue-on-error: coverage failing is a missing section in the digest,
+      # not a failed pull request.
+      - name: Coverage
+        if: steps.facts.outputs.code_changed == 'true'
+        continue-on-error: true
+        run: cargo llvm-cov --workspace --locked --summary-only | tee /tmp/coverage.txt
+
+      - name: Assemble
+        env:
+          BASE_VERSION: ${{ steps.facts.outputs.base_version }}
+          HEAD_VERSION: ${{ steps.facts.outputs.head_version }}
+          CODE_CHANGED: ${{ steps.facts.outputs.code_changed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/ci-digest.py \
+            --base-lock /tmp/base.lock \
+            --head-lock Cargo.lock \
+            --base-version "$BASE_VERSION" \
+            --head-version "$HEAD_VERSION" \
+            --coverage /tmp/coverage.txt \
+            --code-changed "$CODE_CHANGED" \
+            --run-url "$RUN_URL" > /tmp/digest.md
+          cat /tmp/digest.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Only for pull requests from this repository. A fork's token is read-only
+      # by design, so posting would fail; the run summary above still renders
+      # for everyone, which is why the digest is written there first and
+      # mirrored here second rather than the other way round.
+      - name: Post or update the comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          jq -n --rawfile body /tmp/digest.md '{body: $body}' > /tmp/payload.json
+          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- isopod-ci-digest -->")) | .id] | first')"
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$existing" --input /tmp/payload.json --silent
+            echo "updated comment $existing"
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" --input /tmp/payload.json --silent
+            echo "posted a new digest comment"
+          fi
+
   # The single context the branch ruleset requires. Naming individual jobs in
   # the ruleset means editing repository settings every time a job is added,
   # and a RENAMED job leaves a phantom required check that blocks every merge
