@@ -143,6 +143,24 @@ jobs:
       # EAI_AGAIN, because the host resolves through OUTPUT and the guest
       # through FORWARD. DOCKER-USER is the chain Docker provides for exactly
       # this coexistence problem.
+      # The jail's whole isolation model is an unprivileged user namespace, and
+      # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which
+      # refuses one to an unconfined process. Recorded BEFORE anything relaxes
+      # it, so a future reader can tell "the runner forbade it" from "our jail
+      # broke" — the first live-suite run in CI failed here and the two were
+      # indistinguishable from the exit code alone.
+      - name: User-namespace policy
+        run: |
+          for k in kernel/apparmor_restrict_unprivileged_userns user/max_user_namespaces \
+                   kernel/unprivileged_userns_clone; do
+            printf '%-46s %s\n' "$k" "$(cat "/proc/sys/$k" 2>/dev/null || echo '(absent)')"
+          done
+          if unshare --user --map-root-user true 2>/dev/null; then
+            echo "unshare(CLONE_NEWUSER): permitted"
+          else
+            echo "unshare(CLONE_NEWUSER): REFUSED — the jail suite cannot pass as-is"
+          fi
+
       - name: Packet-filter shape
         run: |
           echo "--- iptables FORWARD policy ---"
@@ -370,6 +388,23 @@ jobs:
       #
       # --test-threads=1 because these tests claim real network slots and boot
       # real VMs; running them concurrently makes them fight over the pool.
+      # Relax it only for the live suite, and only on the runner. isopod does not
+      # ask users to do this: the jail is a hardening opt-in, and a host that
+      # refuses unprivileged user namespaces is entitled to. But a CI run that
+      # skipped the jail tests for an environment reason would be quietly
+      # covering less than it appears to, so the runner is made able to run them
+      # rather than the tests being excused.
+      - name: Permit unprivileged user namespaces
+        if: ${{ inputs.run_live_suite || github.event_name == 'schedule' }}
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null \
+            || echo "no apparmor userns knob on this runner; nothing to relax"
+          if unshare --user --map-root-user true 2>/dev/null; then
+            echo "unshare(CLONE_NEWUSER): permitted"
+          else
+            echo "::warning::user namespaces are still refused; the jail tests will fail for an environment reason, not a code one"
+          fi
+
       - name: Live suite
         id: live
         if: ${{ inputs.run_live_suite || github.event_name == 'schedule' }}
