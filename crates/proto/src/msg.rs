@@ -170,6 +170,16 @@ pub enum ResponseBody {
         /// finding #26). Absent/`None` = healthy (additive within proto v3).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overlay_error: Option<String>,
+        /// Present iff the guest was given a resolver at boot and FAILED to
+        /// write it — it is resolving through whatever `/etc/resolv.conf` its
+        /// image or stage layer carried, not through the resolver this run was
+        /// configured with.
+        ///
+        /// Reported because, unlike every other network failure, this one is
+        /// invisible: the guest resolves perfectly well, just somewhere nobody
+        /// chose. Absent/`None` = healthy (additive within proto v3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolv_error: Option<String>,
     },
     /// One chunk of exec output.
     ExecStream {
@@ -365,6 +375,7 @@ mod tests {
                 proto_version: 3,
                 uptime_s: 2.5,
                 overlay_error: None,
+                resolv_error: None,
             },
         };
         let json = serde_json::to_string(&healthy).unwrap();
@@ -383,6 +394,7 @@ mod tests {
                 proto_version: 3,
                 uptime_s: 2.5,
                 overlay_error: Some("mount layer /dev/vdk at /layers/10: ENOENT".into()),
+                resolv_error: None,
             },
         };
         let json = serde_json::to_string(&degraded).unwrap();
