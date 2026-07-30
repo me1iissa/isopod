@@ -924,7 +924,7 @@ flowchart LR
     silently rots; label-reuse semantics are still untested (noted in
     `docs/sandbox-build.md`).
 
-51. **[open] HIGH — a coexisting Docker install silently breaks all NAT egress,
+51. **[fixed in 0.14.0] HIGH — a coexisting Docker install silently breaks all NAT egress,
     because its `FORWARD` policy drops every guest packet.** Found by running
     isopod in CI, and it is not a CI problem: any host with Docker on it is
     affected. Docker sets the iptables `ip filter` FORWARD chain policy to DROP
@@ -962,9 +962,18 @@ flowchart LR
     chain registered at the hook still runs. So inserting an accept rule into
     Docker's chain removes Docker's drop *without* bypassing isopod's own egress
     enforcement, which stays authoritative. → FIX: `isopod setup` inserts an
-    accept rule for `isopod-tap*` into `DOCKER-USER` when that chain exists.
-    Untested residue: what happens when the Docker daemon restarts and recreates
-    the chain.
+    accept rule for `isopod-tap*` into `DOCKER-USER` when that chain exists —
+    two rules in fact, because a single inbound accept leaves the reply to die on
+    the same policy DROP, so not even a handshake completes. `setup` now reports
+    a `docker_user` field so the answer is visible instead of inferred from
+    whether the network happens to work, and `--no-docker-user` opts out for
+    anyone curating that chain themselves.
+
+    Known residue, documented rather than fixed: Docker offers no persistence
+    contract for DOCKER-USER, and a daemon restart or network creation may flush
+    or reorder it. The failure is fail-closed — guest egress stops, nothing
+    opens — and the remedy is re-running `sudo isopod setup`, which is the same
+    doctrine already published for a flushed nftables ruleset.
 
 **Checked and found sound**: the tap teardown was reported exactly right — the
 error named WSL2 as the likely cause, named `sudo isopod setup` as the fix, and

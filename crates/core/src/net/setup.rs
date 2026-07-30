@@ -81,6 +81,13 @@ pub struct SetupOptions {
     /// broker on their own gateway. `0` provisions none, reproducing the pre-0.9
     /// ruleset exactly.
     pub filtered_slots: usize,
+    /// Insert isopod's accept rules into Docker's `DOCKER-USER` chain when that
+    /// chain exists, so a Docker install's `FORWARD` policy DROP does not
+    /// silently swallow all guest egress. On by default: without it, isopod is
+    /// simply broken on any host running Docker, and broken invisibly.
+    ///
+    /// Set false (`--no-docker-user`) if you curate that chain yourself.
+    pub manage_docker_user: bool,
 }
 
 impl Default for SetupOptions {
@@ -91,6 +98,7 @@ impl Default for SetupOptions {
             iface: None,
             allow_lan_egress: false,
             filtered_slots: DEFAULT_FILTERED_SLOTS,
+            manage_docker_user: true,
         }
     }
 }
@@ -117,6 +125,11 @@ pub struct SetupReport {
     pub ip_forward: u8,
     /// The default-route interface NAT masquerades out of.
     pub default_iface: String,
+    /// What was done about another tool owning the forward hook (see
+    /// [`DockerUserStatus`]). Reported rather than left to be inferred from
+    /// whether the network happens to work, because the failure it addresses is
+    /// invisible to every other field here.
+    pub docker_user: DockerUserStatus,
 }
 
 /// Run `isopod setup` (or `--remove`). Must be invoked as root via `sudo`.
@@ -185,6 +198,15 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         filtered_from,
     ))?;
 
+    // 2b. Coexistence with whoever else owns the forward hook. MUST follow
+    //     apply_nft: this widens Docker's ip filter table, and that widening
+    //     must never exist without `inet isopod`'s drops already in force.
+    let docker_user = if opts.manage_docker_user {
+        ensure_docker_user_accepts()?
+    } else {
+        DockerUserStatus::Skipped
+    };
+
     // 3. ip_forward — live now, persisted for reboots.
     set_ip_forward(true)?;
     std::fs::write(SYSCTL_CONF, sysctl_conf_body())
@@ -226,6 +248,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
         nft_table: NFT_TABLE.to_string(),
         ip_forward: read_ip_forward(),
         default_iface: iface,
+        docker_user,
     })
 }
 
@@ -242,6 +265,11 @@ fn teardown() -> Result<SetupReport> {
     let default_iface = super::read_manifest_in(&root)
         .map(|m| m.default_iface)
         .unwrap_or_default();
+
+    // Coexistence rules FIRST, before isopod's own enforcement goes: the mirror
+    // of the provision ordering, so the ip-filter widening never outlives the
+    // drops that made it safe.
+    let docker_user = remove_docker_user_accepts()?;
 
     // nftables table (tolerate absence — a partial or repeated teardown).
     run_tolerating("nft", &["delete", "table", "inet", "isopod"], &ALREADY_GONE)?;
@@ -268,7 +296,305 @@ fn teardown() -> Result<SetupReport> {
         nft_table: NFT_TABLE.to_string(),
         ip_forward: read_ip_forward(),
         default_iface,
+        docker_user,
     })
+}
+
+// ===========================================================================
+// Coexistence with another tool that owns the forward hook (Docker).
+// ===========================================================================
+//
+// Docker sets the iptables `ip filter` FORWARD chain policy to DROP and jumps to
+// a DOCKER-USER chain that, by default, contains only `RETURN`. Guest→WAN
+// traffic therefore falls through to that DROP, and isopod cannot see it happen:
+// `setup` creates its taps, installs its table, sets ip_forward, and reports
+// complete success while no packet can leave. The first symptom is a timeout
+// inside a guest — usually a DNS lookup, which reads as a resolver problem and
+// sends the reader looking in the wrong place entirely (dogfood finding #51).
+//
+// The fix is two accept rules in DOCKER-USER, which is the chain Docker
+// documents for exactly this. It is safe for a reason worth stating precisely,
+// because the whole change rests on it: per nft(8) "OVERALL EVALUATION OF THE
+// RULESET", an accept verdict "ends the evaluation of the current base chain …
+// The packet advances to the next base chain", whereas a drop verdict
+// "immediately ends the evaluation of the whole ruleset". `inet isopod`'s
+// forward chain is a separate base chain at the same hook, so accepting in
+// Docker's table removes Docker's drop WITHOUT removing isopod's — every drop
+// in `build_nft_ruleset` (tap↔tap, anti-spoof, the IPv6 deny, the RFC1918
+// guard, the filtered-slot drop, and the closing `iifname "isopod-tap*" drop`
+// default-deny) still applies, unchanged and still hook-terminal.
+//
+// That was measured, not assumed, in throwaway network namespaces: with these
+// accepts live, a drop in a separate `inet` chain still blocked the connection
+// and its counter showed the packets arriving. See target/lint/nfprobe-forward.sh.
+
+/// Docker's documented extension point in the iptables `ip filter` table.
+const DOCKER_USER_CHAIN: &str = "DOCKER-USER";
+
+/// Ownership marker carried by every rule isopod manages in a chain it does not
+/// own, so a human reading `iptables -S DOCKER-USER` can tell where it came from.
+///
+/// **Frozen.** It is part of each rule's identity for `-C` and `-D` matching, so
+/// changing this string would leave rules inserted by an older binary
+/// unmatchable, and therefore unremovable, on every host already provisioned.
+const DOCKER_USER_COMMENT: &str = "managed-by-isopod-setup";
+
+/// Bounded wait for the xtables lock. Docker holds it while reconfiguring, and
+/// an unbounded wait would let a busy daemon wedge `isopod setup` indefinitely.
+const IPT_WAIT: &str = "10";
+
+/// The iptables interface wildcard for isopod's taps.
+///
+/// `+` — NOT nft's `*`. The two ruleset languages spell this differently and the
+/// wrong one silently matches an interface literally named with a trailing
+/// asterisk, which is to say nothing at all.
+const TAP_WILDCARD: &str = "isopod-tap+";
+
+/// Stderr fragments meaning the kernel cannot do `-m comment`.
+///
+/// A kernel without `xt_comment` rejects the match at insert time. Without this
+/// fallback `setup` would fail outright on such a host — a host where it
+/// succeeds today, albeit with broken egress — which trades a silent bug for a
+/// loud regression.
+const NO_COMMENT_MATCH: [&str; 3] = [
+    "Extension comment revision 0 not supported",
+    "No chain/target/match by that name",
+    "Couldn't load match `comment'",
+];
+
+/// Stderr fragments meaning another process holds the xtables lock.
+const IPT_LOCKED: [&str; 2] = ["xtables lock", "Another app is currently holding"];
+
+/// What `setup` did about the forward-hook coexistence problem, reported so the
+/// answer is visible rather than inferred from whether the network happens to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockerUserStatus {
+    /// Rules were missing and have been inserted.
+    Installed,
+    /// Rules were already exactly present; nothing was changed.
+    AlreadyPresent,
+    /// No DOCKER-USER chain on this host, so nothing to coexist with.
+    ChainAbsent,
+    /// No `iptables` binary. A healthy nft-only host, not an error.
+    IptablesMissing,
+    /// Another process held the xtables lock for longer than isopod's bounded
+    /// wait. Reported honestly rather than as "chain absent", which would read
+    /// as "nothing to do" on precisely the hosts where there is most to do.
+    LockBusy,
+    /// `--no-docker-user`: the operator curates that chain themselves.
+    Skipped,
+    /// Rules were removed (`--remove`).
+    Removed,
+}
+
+/// The two rule specs isopod manages in DOCKER-USER, as iptables argv fragments
+/// (everything after the chain name).
+///
+/// **Both are required.** A single inbound accept is not enough: the reply
+/// packet arrives on the WAN interface and, with FORWARD policy DROP, dies
+/// there — so even a TCP handshake fails. The return rule matches on `-d` in the
+/// slot supernet because conntrack un-NATs the reply at nat prerouting
+/// (priority -100) before the filter forward hook (priority 0) sees it, so by
+/// then the destination is already the guest's address.
+///
+/// Scoped to isopod's own taps and its own supernet, so the widening is no
+/// broader than isopod's own rules. A forged source address matches neither and
+/// falls through to Docker's drop — and would be dropped by `inet isopod`'s
+/// anti-spoof rule regardless.
+#[must_use]
+pub fn docker_user_rule_specs(with_comment: bool) -> [Vec<String>; 2] {
+    let finish = |mut v: Vec<String>| -> Vec<String> {
+        if with_comment {
+            v.push("-m".into());
+            v.push("comment".into());
+            v.push("--comment".into());
+            v.push(DOCKER_USER_COMMENT.into());
+        }
+        v.push("-j".into());
+        v.push("ACCEPT".into());
+        v
+    };
+    [
+        // Guest egress.
+        finish(vec![
+            "-i".into(),
+            TAP_WILDCARD.into(),
+            "-s".into(),
+            SLOT_SUPERNET.into(),
+        ]),
+        // Replies to it, and nothing else.
+        finish(vec![
+            "-o".into(),
+            TAP_WILDCARD.into(),
+            "-d".into(),
+            SLOT_SUPERNET.into(),
+            "-m".into(),
+            "conntrack".into(),
+            "--ctstate".into(),
+            "RELATED,ESTABLISHED".into(),
+        ]),
+    ]
+}
+
+/// Outcome of one `iptables` invocation: `None` on success, `Some(stderr)` on a
+/// non-zero exit. A missing binary surfaces as `Err`, so callers can tell "no
+/// iptables on this host" from "iptables said no".
+fn iptables(args: &[String]) -> std::io::Result<Option<String>> {
+    let out = Command::new("iptables").args(args).output()?;
+    if out.status.success() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
+}
+
+fn ipt_args(rest: &[String]) -> Vec<String> {
+    let mut v = vec!["-w".to_string(), IPT_WAIT.to_string()];
+    v.extend_from_slice(rest);
+    v
+}
+
+fn matches_any(stderr: &str, fragments: &[&str]) -> bool {
+    fragments.iter().any(|f| stderr.contains(f))
+}
+
+/// Is there a DOCKER-USER chain here, and can we talk to iptables at all?
+fn probe_docker_user() -> DockerUserStatus {
+    let args = ipt_args(&["-S".to_string(), DOCKER_USER_CHAIN.to_string()]);
+    match iptables(&args) {
+        Ok(None) => DockerUserStatus::AlreadyPresent, // chain exists; caller re-checks rules
+        Ok(Some(stderr)) => {
+            if matches_any(&stderr, &IPT_LOCKED) {
+                DockerUserStatus::LockBusy
+            } else {
+                // "No chain/target/match by that name", and also legacy iptables
+                // on a module-less kernel ("can't initialize iptables table").
+                // Both mean there is nothing here to coexist with.
+                DockerUserStatus::ChainAbsent
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DockerUserStatus::IptablesMissing,
+        Err(_) => DockerUserStatus::ChainAbsent,
+    }
+}
+
+/// Insert the coexistence accepts, idempotently.
+///
+/// Called AFTER [`apply_nft`], never before: the ip-filter widening must not
+/// exist for even an instant without `inet isopod`'s drops in force.
+fn ensure_docker_user_accepts() -> Result<DockerUserStatus> {
+    match probe_docker_user() {
+        DockerUserStatus::AlreadyPresent => {}
+        other => return Ok(other),
+    }
+
+    let mut installed = false;
+    // Positions 1 and 2 so both precede Docker's terminal `-j RETURN`.
+    for (pos, idx) in [(1usize, 0usize), (2, 1)] {
+        // Present already, in either spelling? Then leave it alone. Checking the
+        // comment-less variant too means a host that fell back once is not
+        // re-inserted into on every subsequent run.
+        let mut present = false;
+        for with_comment in [true, false] {
+            let spec = &docker_user_rule_specs(with_comment)[idx];
+            let mut args = ipt_args(&["-C".to_string(), DOCKER_USER_CHAIN.to_string()]);
+            args.extend_from_slice(spec);
+            if let Ok(None) = iptables(&args) {
+                present = true;
+                break;
+            }
+        }
+        if present {
+            continue;
+        }
+
+        // Insert, preferring the marked variant. A kernel without xt_comment
+        // rejects it; fall back rather than failing a setup that works today.
+        let mut last_err = String::new();
+        let mut done = false;
+        for with_comment in [true, false] {
+            let spec = &docker_user_rule_specs(with_comment)[idx];
+            let mut args = ipt_args(&[
+                "-I".to_string(),
+                DOCKER_USER_CHAIN.to_string(),
+                pos.to_string(),
+            ]);
+            args.extend_from_slice(spec);
+            match iptables(&args) {
+                Ok(None) => {
+                    if !with_comment {
+                        eprintln!(
+                            "setup: this kernel cannot do `-m comment`; the DOCKER-USER rules \
+                             are installed unmarked (they are still matched exactly on teardown)"
+                        );
+                    }
+                    installed = true;
+                    done = true;
+                    break;
+                }
+                Ok(Some(stderr)) => {
+                    // Docker deleting the chain between probe and insert.
+                    if with_comment && matches_any(&stderr, &NO_COMMENT_MATCH) {
+                        last_err = stderr;
+                        continue; // retry unmarked
+                    }
+                    if stderr.contains("No chain/target/match by that name") {
+                        return Ok(DockerUserStatus::ChainAbsent);
+                    }
+                    if matches_any(&stderr, &IPT_LOCKED) {
+                        return Ok(DockerUserStatus::LockBusy);
+                    }
+                    last_err = stderr;
+                }
+                Err(e) => bail!("spawning iptables to insert into {DOCKER_USER_CHAIN}: {e}"),
+            }
+        }
+        if !done {
+            bail!(
+                "could not insert isopod's coexistence rule into {DOCKER_USER_CHAIN}: {}",
+                last_err.trim()
+            );
+        }
+    }
+
+    Ok(if installed {
+        DockerUserStatus::Installed
+    } else {
+        DockerUserStatus::AlreadyPresent
+    })
+}
+
+/// Remove them again.
+///
+/// Called FIRST in [`teardown`], the mirror of the provision ordering, so the
+/// widening is gone before isopod's own enforcement is.
+///
+/// Both spellings are attempted, and each in a bounded loop: a host that fell
+/// back to unmarked rules, or accumulated duplicates through some path outside
+/// isopod, must still end up clean rather than leaving an orphan nobody can
+/// name.
+fn remove_docker_user_accepts() -> Result<DockerUserStatus> {
+    match probe_docker_user() {
+        DockerUserStatus::AlreadyPresent => {}
+        other => return Ok(other),
+    }
+    for idx in [0usize, 1] {
+        for with_comment in [true, false] {
+            let spec = &docker_user_rule_specs(with_comment)[idx];
+            let mut args = ipt_args(&["-D".to_string(), DOCKER_USER_CHAIN.to_string()]);
+            args.extend_from_slice(spec);
+            // 16 is a backstop, not an expectation: normally one delete per
+            // spec succeeds and the second reports nothing left to remove.
+            for _ in 0..16 {
+                match iptables(&args) {
+                    Ok(None) => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(DockerUserStatus::Removed)
 }
 
 // ===========================================================================
@@ -1030,5 +1356,180 @@ mod tests {
         // Whatever it is, it must parse to *some* uid on Linux.
         let uid = effective_uid();
         assert!(uid.is_some(), "effective uid should be readable on Linux");
+    }
+
+    // -----------------------------------------------------------------------
+    // Docker forward-hook coexistence (dogfood finding #51).
+    // -----------------------------------------------------------------------
+
+    /// The exact argv is FROZEN. It is each rule's identity for `iptables -C`
+    /// and `-D`, so a change here makes rules an older binary inserted
+    /// unmatchable — and therefore unremovable — on every host already
+    /// provisioned. A failure of this test is not a test to update; it is a
+    /// migration to think through.
+    #[test]
+    fn docker_user_rule_specs_are_frozen() {
+        let [egress, reply] = docker_user_rule_specs(true);
+        assert_eq!(
+            egress,
+            vec![
+                "-i",
+                "isopod-tap+",
+                "-s",
+                "10.107.0.0/16",
+                "-m",
+                "comment",
+                "--comment",
+                "managed-by-isopod-setup",
+                "-j",
+                "ACCEPT",
+            ]
+        );
+        assert_eq!(
+            reply,
+            vec![
+                "-o",
+                "isopod-tap+",
+                "-d",
+                "10.107.0.0/16",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-m",
+                "comment",
+                "--comment",
+                "managed-by-isopod-setup",
+                "-j",
+                "ACCEPT",
+            ]
+        );
+    }
+
+    /// The unmarked fallback for kernels without `xt_comment` must differ from
+    /// the marked spec ONLY by the comment match. If it diverged in any other
+    /// way, a host that fell back would be re-inserted into on every run,
+    /// because neither `-C` probe would match what is actually there.
+    #[test]
+    fn the_unmarked_fallback_differs_only_by_the_comment() {
+        for idx in [0usize, 1] {
+            let marked = docker_user_rule_specs(true)[idx].clone();
+            let plain = docker_user_rule_specs(false)[idx].clone();
+            let stripped: Vec<String> = {
+                let mut v = marked.clone();
+                let at = v
+                    .windows(2)
+                    .position(|w| w == ["-m", "comment"])
+                    .expect("the marked spec carries `-m comment`");
+                v.drain(at..at + 4); // -m comment --comment <value>
+                v
+            };
+            assert_eq!(stripped, plain, "spec {idx} diverges beyond the comment");
+        }
+    }
+
+    /// Both rules are required. A single inbound accept leaves the reply to die
+    /// on Docker's policy DROP, so even a TCP handshake fails — measured, not
+    /// assumed. Anything that reduces this to one rule has broken the fix.
+    #[test]
+    fn both_directions_are_covered_and_scoped_to_isopod() {
+        let specs = docker_user_rule_specs(true);
+        assert_eq!(specs.len(), 2, "the reply leg is not optional");
+
+        let egress = specs[0].join(" ");
+        let reply = specs[1].join(" ");
+        assert!(
+            egress.contains("-i isopod-tap+"),
+            "egress matches on input iface"
+        );
+        assert!(
+            reply.contains("-o isopod-tap+"),
+            "reply matches on output iface"
+        );
+
+        // Scoped to isopod's own supernet in BOTH directions: the widening must
+        // be no broader than isopod's own rules. The reply matches on -d
+        // because conntrack un-NATs before the filter forward hook.
+        for spec in &specs {
+            let joined = spec.join(" ");
+            assert!(
+                joined.contains(SLOT_SUPERNET),
+                "unscoped rule would widen beyond isopod's own addressing: {joined}"
+            );
+        }
+
+        // Accept-only. The safety argument depends on `inet isopod` remaining
+        // the sole policy layer; a DROP or REJECT here would put policy in a
+        // chain isopod does not own and cannot reason about.
+        for spec in &specs {
+            assert_eq!(
+                spec[spec.len() - 2..],
+                ["-j", "ACCEPT"],
+                "rules in a foreign chain must be accept-only"
+            );
+            let joined = spec.join(" ");
+            assert!(!joined.contains("DROP") && !joined.contains("REJECT"));
+        }
+
+        assert!(
+            reply.contains("--ctstate RELATED,ESTABLISHED"),
+            "the reply rule must be conntrack-scoped, not a blanket accept inbound to the taps"
+        );
+    }
+
+    /// nft spells the interface wildcard `*`; iptables spells it `+`. Using the
+    /// nft form here would match an interface literally named with a trailing
+    /// asterisk, which is to say nothing, and the rule would sit in the chain
+    /// looking correct while doing nothing at all.
+    #[test]
+    fn the_wildcard_is_the_iptables_one_not_the_nft_one() {
+        assert_eq!(TAP_WILDCARD, "isopod-tap+");
+        for spec in docker_user_rule_specs(true) {
+            let joined = spec.join(" ");
+            assert!(
+                !joined.contains("isopod-tap*"),
+                "nft-style wildcard leaked into an iptables rule: {joined}"
+            );
+        }
+    }
+
+    /// The status is serialized into `isopod setup`'s JSON, so these strings are
+    /// a public interface that CI and users read.
+    #[test]
+    fn docker_user_status_serializes_kebab_case() {
+        let cases = [
+            (DockerUserStatus::Installed, "\"installed\""),
+            (DockerUserStatus::AlreadyPresent, "\"already-present\""),
+            (DockerUserStatus::ChainAbsent, "\"chain-absent\""),
+            (DockerUserStatus::IptablesMissing, "\"iptables-missing\""),
+            (DockerUserStatus::LockBusy, "\"lock-busy\""),
+            (DockerUserStatus::Skipped, "\"skipped\""),
+            (DockerUserStatus::Removed, "\"removed\""),
+        ];
+        for (v, want) in cases {
+            assert_eq!(serde_json::to_string(&v).unwrap(), want);
+        }
+    }
+
+    /// The coexistence rules only remove ANOTHER tool's drop. isopod's own
+    /// default-deny must still be the last word for tap-sourced forwarding, or
+    /// the accepts would be widening rather than unblocking.
+    #[test]
+    fn isopod_keeps_its_own_default_deny_for_tap_traffic() {
+        let rs = build_nft_ruleset("eth0", 2, false, 2);
+        let forward = rs
+            .split("chain forward {")
+            .nth(1)
+            .and_then(|s| s.split("chain input {").next())
+            .expect("a forward chain");
+        let last_drop = forward
+            .lines()
+            .rfind(|l| l.contains("drop"))
+            .expect("the forward chain drops something");
+        assert!(
+            last_drop.contains("iifname \"isopod-tap*\" drop"),
+            "the closing default-deny is what makes a DOCKER-USER accept safe; \
+             found instead: {last_drop}"
+        );
     }
 }

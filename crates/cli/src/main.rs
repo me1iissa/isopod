@@ -80,6 +80,12 @@ struct SetupArgs {
     /// to provision none, reproducing the pre-0.9 ruleset exactly.
     #[arg(long = "filtered-slots", default_value_t = isopod_core::net::DEFAULT_FILTERED_SLOTS)]
     filtered_slots: usize,
+    /// Do NOT insert isopod's accept rules into Docker's `DOCKER-USER` chain.
+    /// Only pass this if you curate that chain yourself: Docker sets the
+    /// `FORWARD` policy to DROP, which silently swallows all guest egress, and
+    /// isopod cannot detect it from anything else it inspects.
+    #[arg(long = "no-docker-user")]
+    no_docker_user: bool,
 }
 
 #[derive(Subcommand)]
@@ -374,6 +380,7 @@ fn run_setup(args: SetupArgs) -> i32 {
             iface: args.iface,
             allow_lan_egress: args.allow_lan_egress,
             filtered_slots: args.filtered_slots,
+            manage_docker_user: !args.no_docker_user,
         },
     ))
 }

@@ -450,6 +450,36 @@ MUTATIONS = [
         package="isopod-guest-agent",
         target="--bins",
     ),
+    Mutation(
+        name="docker-coexistence-forgets-the-reply-leg",
+        file="crates/core/src/net/setup.rs",
+        old='''        // Replies to it, and nothing else.
+        finish(vec![
+            "-o".into(),
+            TAP_WILDCARD.into(),
+            "-d".into(),
+            SLOT_SUPERNET.into(),
+            "-m".into(),
+            "conntrack".into(),
+            "--ctstate".into(),
+            "RELATED,ESTABLISHED".into(),
+        ]),''',
+        new='''        // Replies to it, and nothing else.
+        finish(vec!["-o".into(), TAP_WILDCARD.into()]),''',
+        defect=(
+            "The reply rule loses its scoping, becoming a blanket accept for "
+            "anything forwarded toward an isopod tap. This is the shape of "
+            "mistake that looks like a simplification and is a widening: the "
+            "rule lives in a chain isopod does not own, so an unscoped accept "
+            "there admits traffic isopod's own supernet and conntrack checks "
+            "were the only thing bounding. Finding #51 needed BOTH rules — a "
+            "single inbound accept loses every reply packet to Docker's policy "
+            "DROP, so not even a handshake completes — which makes the reply "
+            "rule easy to treat as a formality and edit carelessly."
+        ),
+        package="isopod-core",
+        filter="net::setup",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its
