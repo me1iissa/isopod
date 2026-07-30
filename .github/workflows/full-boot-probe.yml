@@ -114,6 +114,23 @@ jobs:
           ip -o link show | grep isopod-tap | head -3 || echo "::warning::no isopod-tap devices found"
           sudo nft list tables || echo "::warning::nft list tables failed"
 
+      # A hypothesis with nothing to do with DNS, and it has to be ruled out
+      # before any of the DNS evidence below means anything. Docker runs on
+      # hosted runners and sets the `ip filter` FORWARD chain policy to DROP.
+      # isopod's forward chain is a separate base chain at the same hook
+      # (net/setup.rs, `policy accept`) and cannot override another base
+      # chain's drop. If that is what is happening, every guest→WAN packet
+      # dies regardless of resolver — which produces exactly the observed
+      # EAI_AGAIN, because the host resolves through OUTPUT and the guest
+      # through FORWARD. DOCKER-USER is the chain Docker provides for exactly
+      # this coexistence problem.
+      - name: Packet-filter shape
+        run: |
+          echo "--- iptables FORWARD policy ---"
+          sudo iptables -L FORWARD -n | head -3 || echo "(iptables unavailable)"
+          echo "--- DOCKER-USER chain ---"
+          sudo iptables -L DOCKER-USER -n 2>/dev/null | head -5 || echo "(no DOCKER-USER chain)"
+
       # busybox wget cannot be used to test egress. It issues absolute-form
       # requests for https:// URLs instead of CONNECT, so the broker refuses it
       # as malformed before policy is ever consulted — and a DNS failure reads
@@ -221,12 +238,16 @@ jobs:
       # on the broker's own 403, so a timeout or a DNS error fails the step
       # instead of being mistaken for enforcement.
       #
-      # A PREDICTION worth recording, because it is the asymmetry the whole DNS
-      # finding rests on: this step should pass even where the step above
-      # cannot resolve. Filtered egress does not use the guest's resolver at
-      # all — the broker answers DNS host-side and the guest reaches names
-      # through CONNECT. If filtered egress works here while NAT DNS does not,
-      # that isolates the defect to the hardcoded public resolvers exactly.
+      # This step proves egress POLICY and nothing whatever about DNS. An
+      # earlier revision of this comment predicted it would isolate the DNS
+      # defect; that was wrong, and wrong in the same shape as every other
+      # mistake this file records. A filtered guest is handed proxy variables
+      # (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY — crates/guest-agent/src/net.rs),
+      # python's urllib honours them, and getaddrinfo against the literal proxy
+      # address short-circuits, so no DNS query is emitted at all. Measured on
+      # a real filtered run reaching six hosts: `"dns_queries": []`. The DNS
+      # half is exercised by the step AFTER this one, which is the control that
+      # prediction assumed already existed.
       - name: Boot with filtered egress and a real allowlist
         id: filtered
         run: |
@@ -254,6 +275,35 @@ jobs:
           grep -q LEAK out.txt && { echo "::error::egress leak"; exit 1; }
           echo "both halves held: allowlisted reachable, other refused by policy"
 
+      # THE CONTROL THAT EXERCISES HOST-SIDE DNS, and the one the tree did not
+      # have. `gethostbyname` ignores the proxy environment entirely, so the
+      # query goes to the guest's own resolver — which in filtered mode is the
+      # slot gateway — and lands on the broker's DNS responder. That is the
+      # exact mechanism a NAT-mode fix would generalise, so proving it carries
+      # a packet on THIS runner class is worth more than any amount of
+      # reasoning about whether it should.
+      #
+      # The assertion is on the run's own egress record rather than on guest
+      # stdout, deliberately: `dns_queries` is written host-side from what the
+      # broker actually answered, so a guest cannot fabricate it. Verified
+      # locally before being committed — a filtered run of exactly this shape
+      # recorded `"dns_queries": ["example.com"]`.
+      - name: Filtered-mode DNS reaches the host-side responder
+        id: filtered_dns
+        run: |
+          set -o pipefail
+          ./target/release/isopod run --stage base --base base-alpine --allow-host example.com -- \
+            /bin/sh -c 'python3 - <<PY
+          import socket
+          print("resolved", socket.gethostbyname("example.com"))
+          PY' | tee /dev/stderr > fdns.json
+          jq -e '.egress.dns_queries | index("example.com")' fdns.json > /dev/null || {
+            echo "::error::no guest DNS query reached the broker — the gateway resolver path does not carry packets here"
+            jq -c '.egress' fdns.json || true
+            exit 1
+          }
+          echo "the broker answered a guest DNS query: $(jq -c '.egress.dns_queries' fdns.json)"
+
       - name: Live suite
         if: inputs.run_live_suite
         run: cargo test --workspace --locked -- --ignored --test-threads=1
@@ -270,6 +320,7 @@ jobs:
           DNS_TODAY: ${{ steps.dns_today.outcome }}
           DNS_HOST: ${{ steps.dns_host.outcome }}
           FILTERED_OUTCOME: ${{ steps.filtered.outcome }}
+          FILTERED_DNS: ${{ steps.filtered_dns.outcome }}
           JOB_STATUS: ${{ job.status }}
         run: |
           {
@@ -284,6 +335,7 @@ jobs:
             echo "| guest DNS, as shipped | $DNS_TODAY |"
             echo "| guest DNS, host upstream | $DNS_HOST |"
             echo "| filtered egress, both halves | $FILTERED_OUTCOME |"
+            echo "| filtered DNS hits the broker | $FILTERED_DNS |"
             echo "| job | $JOB_STATUS |"
             echo ""
             echo "The two DNS rows are diagnostics and never fail the job — read"
