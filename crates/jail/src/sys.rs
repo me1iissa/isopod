@@ -134,6 +134,41 @@ pub fn bind_mount(src: &str, dst: &str) -> io::Result<()> {
 
 /// Remount an existing bind at `dst` read-only
 /// (`mount(NULL, dst, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL)`).
+/// Make `dst` read-only **including every mount beneath it**.
+///
+/// [`remount_readonly`] alone is not enough and the gap is silent. `bind_mount`
+/// uses `MS_REC`, so a bind carries its submounts with it — but
+/// `MS_REMOUNT | MS_RDONLY` applies to ONE mount, so every submount stays
+/// writable. Measured, not inferred: bind a tree containing a tmpfs, remount the
+/// top read-only, and a write to the top is refused while a write to the
+/// submount succeeds.
+///
+/// That matters here because the jail binds `~/.isopod` read-only, and that tree
+/// holds the stage store and the guest images. A submount under it — a separate
+/// disk for images, a tmpfs, an encrypted volume — would be writable by the very
+/// process this jail exists to contain, and a stage corrupted there is forked by
+/// every later run that builds on it.
+///
+/// # Errors
+/// If any mount at or beneath `dst` cannot be made read-only, or if
+/// `/proc/self/mountinfo` cannot be read. **Fails closed**: a jail that cannot
+/// prove the tree is read-only must not report that it is.
+pub fn remount_readonly_recursive(dst: &str) -> io::Result<()> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| annotate(e, "reading /proc/self/mountinfo"))?;
+    let mut targets = submounts_of(&mountinfo, dst);
+    // The bind itself may not be listed yet if the caller is racing its own
+    // mount table read; remounting it is idempotent, so ensure it is included.
+    if !targets.iter().any(|t| t == dst) {
+        targets.push(dst.to_string());
+    }
+    for target in &targets {
+        remount_readonly(target)
+            .map_err(|e| annotate(e, &format!("remounting {target} read-only")))?;
+    }
+    Ok(())
+}
+
 pub fn remount_readonly(dst: &str) -> io::Result<()> {
     let dst = cstr(dst)?;
     // SAFETY: a bind remount needs only the target path; source/fstype/data are
@@ -157,6 +192,71 @@ pub fn remount_readonly(dst: &str) -> io::Result<()> {
 
 /// Mount a fresh `proc` filesystem at `dst` reflecting this process's pid
 /// namespace (`mount("proc", dst, "proc", 0, NULL)`).
+/// Every mountpoint at or beneath `target`, deepest first, parsed from the
+/// contents of `/proc/self/mountinfo`.
+///
+/// Pure and total, so the parsing is testable without privilege — which matters
+/// because getting it wrong leaves a writable hole in a read-only bind and
+/// nothing anywhere says so.
+///
+/// mountinfo's format is fixed up to a variable run of optional fields, which is
+/// terminated by a literal `-`. The mount point is field 5 (index 4), and it is
+/// **octal-escaped**: a path containing a space, tab, newline or backslash
+/// appears as `\040`, `\011`, `\012`, `\134`. Comparing the raw text would miss
+/// a submount under a directory with a space in its name — an attacker-chosen
+/// condition wherever the bound path is user-controlled.
+///
+/// Deepest-first because a remount must not be shadowed by a later remount of
+/// its parent.
+#[must_use]
+pub fn submounts_of(mountinfo: &str, target: &str) -> Vec<String> {
+    let target = target.trim_end_matches('/');
+    let mut found: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            // Fields before the optional run: id, parent, dev, root, mountpoint.
+            let mount_point = line.split(' ').nth(4)?;
+            let decoded = unescape_octal(mount_point);
+            let under = decoded == target
+                || decoded
+                    .strip_prefix(target)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            under.then_some(decoded)
+        })
+        .collect();
+    // Deepest first: a parent remounted after its child would shadow the child.
+    found.sort_by(|a, b| {
+        b.matches('/')
+            .count()
+            .cmp(&a.matches('/').count())
+            .then(a.cmp(b))
+    });
+    found.dedup();
+    found
+}
+
+/// Decode mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash). Anything that is not a complete 3-digit octal escape is
+/// passed through unchanged rather than dropped.
+fn unescape_octal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let digits = &s[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(digits, 8) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 pub fn mount_proc(dst: &str) -> io::Result<()> {
     let source = cstr("proc")?;
     let dst = cstr(dst)?;
@@ -312,4 +412,115 @@ pub fn wait_and_proxy(child: i32) -> ! {
         }
     }
     unsafe { libc::_exit(1) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real excerpt, shape-for-shape: the variable optional-field run before
+    /// the `-` separator is what makes naive splitting wrong, so the fixture
+    /// includes lines both with and without it.
+    const MOUNTINFO: &str = "\
+25 30 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+26 30 0:23 / /home/u/.isopod rw,relatime - ext4 /dev/sda2 rw
+27 26 0:24 / /home/u/.isopod/images rw,relatime shared:9 - tmpfs none rw
+28 27 0:25 / /home/u/.isopod/images/deep rw,relatime - tmpfs none rw
+29 30 0:26 / /home/u/.isopod-other rw,relatime - ext4 /dev/sda3 rw
+31 30 0:27 / /home/u/.isopodx rw,relatime - ext4 /dev/sda4 rw
+";
+
+    #[test]
+    fn submounts_include_the_target_and_everything_under_it() {
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        assert!(got.contains(&"/home/u/.isopod".to_string()));
+        assert!(got.contains(&"/home/u/.isopod/images".to_string()));
+        assert!(got.contains(&"/home/u/.isopod/images/deep".to_string()));
+    }
+
+    /// A prefix match on the raw string would sweep in `/home/u/.isopod-other`
+    /// and `/home/u/.isopodx`, remounting mounts the jail was never given —
+    /// read-only, on the host, outside the jail's own tree. The boundary must be
+    /// a path separator, not a character count.
+    #[test]
+    fn a_sibling_that_merely_shares_a_prefix_is_not_a_submount() {
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        assert!(
+            !got.iter().any(|m| m == "/home/u/.isopod-other"),
+            "a prefix match would remount an unrelated mount: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m == "/home/u/.isopodx"),
+            "a prefix match would remount an unrelated mount: {got:?}"
+        );
+    }
+
+    /// Deepest first. Remounting a parent before its child lets the parent's
+    /// mount shadow the child, and the child stays writable — the exact hole
+    /// this function exists to close, reintroduced by ordering alone.
+    #[test]
+    fn deepest_mounts_come_first() {
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        let deep = got.iter().position(|m| m == "/home/u/.isopod/images/deep");
+        let mid = got.iter().position(|m| m == "/home/u/.isopod/images");
+        let top = got.iter().position(|m| m == "/home/u/.isopod");
+        assert!(deep < mid && mid < top, "wrong order: {got:?}");
+    }
+
+    /// mountinfo octal-escapes space, tab, newline and backslash in the mount
+    /// point. Comparing the raw text would miss a submount under a directory
+    /// whose name contains one — and the name is frequently user-chosen.
+    #[test]
+    fn octal_escaped_mount_points_are_decoded_before_comparison() {
+        let mi = "\
+40 30 0:30 / /home/u/my\\040stage rw,relatime - ext4 /dev/sda5 rw
+41 40 0:31 / /home/u/my\\040stage/inner rw,relatime - tmpfs none rw
+";
+        let got = submounts_of(mi, "/home/u/my stage");
+        assert_eq!(
+            got,
+            vec![
+                "/home/u/my stage/inner".to_string(),
+                "/home/u/my stage".to_string()
+            ],
+            "a space in the path must not hide a submount"
+        );
+    }
+
+    #[test]
+    fn unescape_passes_through_anything_that_is_not_a_complete_escape() {
+        assert_eq!(unescape_octal("/plain/path"), "/plain/path");
+        assert_eq!(unescape_octal("/a\\040b"), "/a b");
+        assert_eq!(unescape_octal("/a\\011b"), "/a\tb");
+        assert_eq!(unescape_octal("/a\\134b"), "/a\\b");
+        // Truncated / non-octal: kept verbatim rather than silently dropped.
+        assert_eq!(unescape_octal("/a\\04"), "/a\\04");
+        assert_eq!(unescape_octal("/a\\09b"), "/a\\09b");
+    }
+
+    /// A target with no submounts still yields itself, so the caller always has
+    /// something to remount and never silently does nothing.
+    #[test]
+    fn a_target_with_no_submounts_still_returns_itself() {
+        assert_eq!(submounts_of(MOUNTINFO, "/proc"), vec!["/proc".to_string()]);
+    }
+
+    /// Garbage in must not panic: this parses a kernel file on the security
+    /// path, and a panic there takes down a jail launch.
+    #[test]
+    fn malformed_lines_are_skipped_not_fatal() {
+        let mi = "short line\n\n25 30 0:22 /\n25 30 0:22 / /proc rw - proc proc rw\n";
+        assert_eq!(submounts_of(mi, "/proc"), vec!["/proc".to_string()]);
+    }
+
+    /// A trailing slash on the target is the same target. Without normalising,
+    /// `/home/u/.isopod/` would match nothing and the whole tree would be
+    /// left writable while the call reported success.
+    #[test]
+    fn a_trailing_slash_on_the_target_is_ignored() {
+        assert_eq!(
+            submounts_of(MOUNTINFO, "/home/u/.isopod/"),
+            submounts_of(MOUNTINFO, "/home/u/.isopod")
+        );
+    }
 }

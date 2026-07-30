@@ -520,6 +520,28 @@ MUTATIONS = [
         package="isopod-core",
         filter="image::rootfs",
     ),
+    Mutation(
+        name="a-read-only-bind-sweeps-in-unrelated-host-mounts",
+        file="crates/jail/src/sys.rs",
+        old="""            let under = decoded == target
+                || decoded
+                    .strip_prefix(target)
+                    .is_some_and(|rest| rest.starts_with('/'));""",
+        new="""            let under = decoded.starts_with(target);""",
+        defect=(
+            "The submount search matches on raw prefix instead of a path "
+            "boundary, so binding `~/.isopod` read-only also remounts "
+            "`~/.isopod-other` and `~/.isopodx` read-only — mounts the jail was "
+            "never given, on the host, outside the jail's tree. A hardening "
+            "opt-in that silently makes unrelated host filesystems read-only is "
+            "worse than the hole it closes, and the failure would surface as "
+            "some other program mysteriously losing write access."
+        ),
+        package="isopod-jail",
+        # The jail's tests live in its binary target, so the suite must be run
+        # with --bins for the harness to name the test that caught this.
+        target="--bins",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

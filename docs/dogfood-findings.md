@@ -975,6 +975,36 @@ flowchart LR
     opens — and the remedy is re-running `sudo isopod setup`, which is the same
     doctrine already published for a flushed nftables ruleset.
 
+52. **[fixed in 0.18.0] HIGH — every submount of a read-only jail bind was
+    writable.** The jail binds `~/.isopod` read-only, and that tree holds the
+    stage store and the guest images. `bind_mount` uses `MS_REC`, so the bind
+    carries submounts with it — but `MS_REMOUNT | MS_RDONLY` applies to exactly
+    one mount, so every submount stayed writable. Measured in a disposable guest
+    rather than reasoned about: bind a tree containing a tmpfs, remount the top
+    read-only, and a write to the top is refused while a write to the submount
+    succeeds and the file's contents change.
+
+    | | |
+    |---|---|
+    | write to the top of a read-only bind | refused |
+    | write to a **submount** of it | **succeeded** |
+
+    A submount under `~/.isopod` is not exotic — a separate disk for images, a
+    tmpfs, an encrypted volume. The jail exists to contain a compromised
+    Firecracker, and that process could have written to a stage layer every later
+    run forks. → FIX: `remount_readonly_recursive` walks `/proc/self/mountinfo`
+    and remounts every mount at or beneath the target, **deepest first** so a
+    parent cannot shadow a child, and fails closed if any of them cannot be made
+    read-only.
+
+    Found because the jail's syscall layer had **no unit tests at all** — 21
+    `unsafe` blocks covered only by one `#[ignore]`d integration test that, until
+    the day before, ran nowhere but a maintainer's laptop. The parser is now pure
+    and unit-tested, including the two ways it can be subtly wrong: matching on
+    raw prefix (which would remount unrelated host mounts read-only) and
+    comparing mountinfo's octal-escaped paths without decoding them (which would
+    miss a submount under any directory with a space in its name).
+
 **Checked and found sound**: the tap teardown was reported exactly right — the
 error named WSL2 as the likely cause, named `sudo isopod setup` as the fix, and
 offered `--no-network` as the alternative, which is what made the offline route

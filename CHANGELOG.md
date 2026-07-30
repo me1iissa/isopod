@@ -6,6 +6,47 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.18.0] — 2026-07-30
+
+> **Releases 0.15.0 through 0.17.0 were never tagged or published.** They landed
+> on `main` as steps of one piece of work and are kept below as the record of what
+> changed when. This is the version that ships them; if you are upgrading from
+> 0.14.0, read those sections too — they describe behaviour in this release.
+
+### Fixed — every submount of a read-only jail bind was writable
+
+The rootless jail binds `~/.isopod` read-only, and that tree holds the stage store
+and the guest images. `bind_mount` uses `MS_REC`, so the bind carries its
+submounts with it — but `MS_REMOUNT | MS_RDONLY` applies to exactly **one** mount,
+so every submount stayed writable.
+
+Measured rather than reasoned about, in a disposable guest: bind a tree containing
+a tmpfs, remount the top read-only, and a write to the top is refused while a
+write to the submount succeeds and the file's contents change.
+
+A submount under `~/.isopod` is not exotic — a separate disk for images, a tmpfs,
+an encrypted volume. The jail exists to contain a compromised Firecracker, and
+that process could have written to a stage layer every later run forks.
+
+`remount_readonly_recursive` now walks `/proc/self/mountinfo` and remounts every
+mount at or beneath the target, **deepest first** so a parent cannot shadow a
+child, and **fails closed**: a jail that cannot prove the tree is read-only must
+not report that it is. Dogfood finding #52.
+
+### Added — the jail's syscall layer has unit tests
+
+It had none. Twenty-one `unsafe` blocks, covered only by a single `#[ignore]`d
+integration test which — until the day before this — ran nowhere but a
+maintainer's laptop and needs a privilege CI can withdraw. A security boundary in
+a sandbox for untrusted code has to be checked in the pull-request gate, on every
+change, without needing privilege.
+
+The mountinfo parser is pure and tested, including the two ways it can be subtly
+wrong. Matching on raw prefix would make `~/.isopod-other` and `~/.isopodx` read-only
+too — unrelated host mounts, outside the jail, silently losing write access.
+And mountinfo octal-escapes its mount points, so comparing the raw text would miss
+a submount under any directory with a space in its name.
+
 ## [0.17.0] — 2026-07-30
 
 ### Fixed — a guest that never took its resolver said nothing about it
