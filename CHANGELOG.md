@@ -6,6 +6,52 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.16.0] — 2026-07-30
+
+Part two of the gateway DNS resolver; 0.15.0 provisioned the rules, this builds
+the resolver that answers on them. Still nothing points a guest at it — that is
+part three — so no guest behaves differently yet.
+
+### Added — a DNS resolver for NAT slots, and an honest failure mode
+
+`DnsForwarder` answers on a slot's gateway through **the host's own resolution
+path**, so a guest resolves exactly what the host resolves — including
+split-horizon and internal names a public resolver can never see, and without
+sending every lookup to a third party regardless of the operator's DNS policy.
+Same lifecycle as the egress broker: two tokio tasks in the supervisor's process,
+aborted on drop, dead with the run. No new process, no new port.
+
+**It never falls back to a public resolver.** A host that cannot resolve gives
+its guests `SERVFAIL`. The alternative — quietly retrying against 1.1.1.1 —
+would defeat the privacy property on exactly the networks where nobody expects
+it, and would do so invisibly.
+
+`SERVFAIL` rather than "no records" is the point of a new `Resolution` type.
+`resolve_v4` collapsed "the resolver failed" and "the name has no A record" into
+an empty vector, which is right for a caller about to dial something and wrong
+for one about to synthesise a reply: answering NOERROR-empty tells a guest the
+domain exists but has no addresses, which is terminal — resolvers stop retrying.
+A broken host resolver would have been indistinguishable from a missing domain,
+which is the exact confusion that sent this project chasing a resolver bug for
+half a day when the real fault was a packet filter.
+
+The resolver answers **one** sandbox. It binds a host address, so without the
+peer gate any local process could use it as a general-purpose resolver — and, on
+a filtered slot, learn what that sandbox looked up.
+
+### Changed — DNS over TCP no longer competes with proxy traffic
+
+The filtered broker served DNS-TCP through the same accept loop and the same
+`MAX_CONCURRENT_CONNS` permits as SOCKS and HTTP tunnels, so a run that saturated
+its tunnels could starve its own name resolution — a stall that presents as a DNS
+timeout and points nowhere near the cause. DNS now has its own accept loop.
+
+The responder is one type with a mode switch rather than two servers: the
+transport, parser and encoder were already policy-free, and only two points in
+`answer_dns` ever cared. Filtered mode is unchanged in behaviour — allowlist,
+ledger event, remembered answers for attribution — and its 41 tests still pass
+untouched.
+
 ## [0.15.0] — 2026-07-30
 
 ### Added — provisioning for a gateway DNS resolver (inert until the runtime half lands)

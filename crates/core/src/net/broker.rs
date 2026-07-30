@@ -478,12 +478,21 @@ impl Broker {
             http: build_upstream_client(spec.allow_private, spec.allow_loopback)?,
         });
 
+        // One responder, both transports. DNS-TCP no longer competes with
+        // proxy connections for MAX_CONCURRENT_CONNS permits: a resolver that
+        // stalls behind saturated tunnels is a resolver that times out.
+        let responder = Arc::new(DnsResponder {
+            guest: spec.guest,
+            mode: DnsMode::Filtered(Arc::clone(&policy)),
+            peer_refusal_logged: std::sync::atomic::AtomicBool::new(false),
+        });
+
         let tasks = vec![
             tokio::spawn(serve_tcp(socks, Arc::clone(&policy), Proto::Socks5)),
             tokio::spawn(serve_tcp(http, Arc::clone(&policy), Proto::Http)),
             tokio::spawn(serve_tcp(inject, Arc::clone(&policy), Proto::Inject)),
-            tokio::spawn(serve_dns_udp(dns_udp, Arc::clone(&policy))),
-            tokio::spawn(serve_tcp(dns_tcp, Arc::clone(&policy), Proto::Dns)),
+            tokio::spawn(serve_dns_udp(dns_udp, Arc::clone(&responder))),
+            tokio::spawn(serve_dns_tcp(dns_tcp, responder)),
         ];
 
         Ok(Self {
@@ -819,7 +828,9 @@ async fn serve_tcp(listener: TcpListener, policy: Arc<Policy>, proto: Proto) {
                     Proto::Socks5 => handle_socks(stream, &policy).await,
                     Proto::Http => handle_http(stream, &policy).await,
                     Proto::Inject => handle_inject(stream, &policy).await,
-                    Proto::Dns => handle_dns_tcp(stream, &policy).await,
+                    // DNS has its own accept loop (`serve_dns_tcp`); it never
+                    // reaches this dispatch.
+                    Proto::Dns => {}
                 }
             };
             let _ = tokio::time::timeout(CONN_MAX_LIFETIME, work).await;
@@ -948,9 +959,30 @@ use super::egress::Decision;
 /// record. A failure and a timeout are the same answer here — no addresses —
 /// because both leave the caller with nothing to dial.
 async fn resolve_v4(host: &str, port: u16) -> Vec<SocketAddr> {
+    match resolve_v4_detailed(host, port).await {
+        Resolution::Addrs(v) => v,
+        Resolution::Failed => Vec::new(),
+    }
+}
+
+/// Whether the host's resolver ANSWERED, and with what.
+///
+/// [`resolve_v4`] collapses both outcomes into an empty vector, which is right
+/// for a caller about to dial something — nothing to dial either way. It is
+/// wrong for a caller about to synthesise a DNS reply: "the name has no A
+/// record" and "this host could not resolve at all" are different answers, and
+/// telling a guest the first when the second happened makes a broken host
+/// resolver look like a nonexistent domain.
+enum Resolution {
+    Addrs(Vec<SocketAddr>),
+    Failed,
+}
+
+async fn resolve_v4_detailed(host: &str, port: u16) -> Resolution {
     match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await {
-        Ok(Ok(iter)) => iter.filter(SocketAddr::is_ipv4).collect(),
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Ok(iter)) => Resolution::Addrs(iter.filter(SocketAddr::is_ipv4).collect()),
+        // A resolver error and a timeout are both "this host did not answer".
+        Ok(Err(_)) | Err(_) => Resolution::Failed,
     }
 }
 
@@ -1902,7 +1934,65 @@ async fn copy_counting<R, W>(
 // DNS responder.
 // ===========================================================================
 
-async fn serve_dns_udp(socket: UdpSocket, policy: Arc<Policy>) {
+/// What a DNS responder may answer, and what it records.
+///
+/// The transport, parser and encoder below are policy-free and shared. Only two
+/// points in [`answer_dns`] care which mode they are in, which is why this is a
+/// mode switch rather than a second server.
+enum DnsMode {
+    /// Filtered egress. The allowlist decides, every query is a ledger event
+    /// with the same verdict enforcement used, and answers are remembered so a
+    /// later connection to a bare address can be attributed to the name that
+    /// produced it.
+    Filtered(Arc<Policy>),
+    /// NAT egress. There is no allowlist to consult and no brokered connection
+    /// to attribute an answer to, so this mode never denies and never
+    /// remembers — but it DOES record the names, because seeing what a workload
+    /// tried to look up is most of what the flight recorder is for and needs no
+    /// enforcement to be worth having.
+    Open {
+        allow_private: bool,
+        recorder: Recorder,
+    },
+}
+
+/// A DNS server bound to one slot's gateway.
+struct DnsResponder {
+    /// The only address whose queries are answered. The listener is bound to a
+    /// host address, so without this any local process could use it as a
+    /// general-purpose resolver.
+    guest: Ipv4Addr,
+    mode: DnsMode,
+    peer_refusal_logged: std::sync::atomic::AtomicBool,
+}
+
+impl DnsResponder {
+    fn peer_permitted(&self, peer: IpAddr) -> bool {
+        // A filtered responder defers to the policy, so the refusal is logged
+        // once per run with the credential wording that path already has.
+        if let DnsMode::Filtered(policy) = &self.mode {
+            return policy.peer_permitted(peer);
+        }
+        let ok = match peer {
+            IpAddr::V4(v4) => v4 == self.guest,
+            IpAddr::V6(v6) => v6.to_ipv4_mapped() == Some(self.guest),
+        };
+        if !ok
+            && !self
+                .peer_refusal_logged
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "isopod: gateway resolver refused a query from {peer}: it answers only this \
+                 run's sandbox ({}).",
+                self.guest
+            );
+        }
+        ok
+    }
+}
+
+async fn serve_dns_udp(socket: UdpSocket, responder: Arc<DnsResponder>) {
     let mut buf = vec![0u8; MAX_DNS_MSG];
     loop {
         let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
@@ -1916,18 +2006,149 @@ async fn serve_dns_udp(socket: UdpSocket, policy: Arc<Policy>) {
         // datagrams without ever crossing the tap-pinned filter rule. Answering
         // only this run's sandbox keeps the responder from being a general-purpose
         // resolver for whatever else is on the host.
-        if !policy.peer_permitted(peer.ip()) {
+        if !responder.peer_permitted(peer.ip()) {
             continue;
         }
-        let reply = answer_dns(&buf[..n], &policy).await;
+        let reply = answer_dns(&buf[..n], &responder).await;
         if let Some(reply) = reply {
             let _ = socket.send_to(&reply, peer).await;
         }
     }
 }
 
+/// A resolver for one **NAT** slot, bound to that slot's gateway.
+///
+/// The counterpart to [`Broker`] for runs with no allowlist. It answers through
+/// the host's own resolution path, so a guest resolves exactly what the host
+/// resolves — including split-horizon and internal names, which a public
+/// resolver can never see, and without sending every lookup to a third party
+/// regardless of the operator's DNS policy.
+///
+/// Same lifecycle as [`Broker`]: two long-lived tasks in the supervisor's own
+/// process, aborted on drop, dead with the run. There is no new process and no
+/// new port — it listens on the port `isopod setup` already redirects to.
+///
+/// It never falls back to a public resolver. A host that cannot resolve gives
+/// its guests SERVFAIL, because the alternative is silently routing a query
+/// somewhere the operator did not choose at exactly the moment they would least
+/// expect it.
+pub struct DnsForwarder {
+    tasks: Vec<JoinHandle<()>>,
+    responder: Arc<DnsResponder>,
+    dns: String,
+    dns_addr: SocketAddr,
+}
+
+impl DnsForwarder {
+    /// Bind UDP and TCP on `gateway:port` and start answering `guest`.
+    ///
+    /// # Errors
+    /// If either listener cannot bind. A NAT run must not boot with a resolver
+    /// its guest has been told to use but which is not listening: setup's
+    /// redirect would send every query into a closed port, which reads to the
+    /// workload as a network outage rather than a configuration problem.
+    pub async fn start(
+        gateway: Ipv4Addr,
+        guest: Ipv4Addr,
+        allow_private: bool,
+        port: u16,
+    ) -> Result<Self> {
+        let udp = bind_udp(gateway, port).await?;
+        let dns_addr = udp
+            .local_addr()
+            .unwrap_or(SocketAddr::from((gateway, port)));
+        let tcp = bind_tcp(gateway, port).await?;
+        let responder = Arc::new(DnsResponder {
+            guest,
+            mode: DnsMode::Open {
+                allow_private,
+                recorder: Recorder::new(),
+            },
+            peer_refusal_logged: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tasks = vec![
+            tokio::spawn(serve_dns_udp(udp, Arc::clone(&responder))),
+            tokio::spawn(serve_dns_tcp(tcp, Arc::clone(&responder))),
+        ];
+        Ok(Self {
+            tasks,
+            responder,
+            dns: gateway.to_string(),
+            dns_addr,
+        })
+    }
+
+    /// The address the UDP responder actually bound, which is the requested
+    /// port for a real run and an ephemeral one under test.
+    #[must_use]
+    pub fn dns_addr(&self) -> SocketAddr {
+        self.dns_addr
+    }
+
+    /// The address to hand the guest as its resolver.
+    #[must_use]
+    pub fn dns(&self) -> &str {
+        &self.dns
+    }
+
+    /// Every name this run asked the gateway to resolve, in order, deduplicated
+    /// by the caller.
+    ///
+    /// A NAT run's record carries these and nothing else — there is no brokered
+    /// connection to allow or deny, so reporting an empty allowed list would
+    /// invite the reading that nothing was reached.
+    #[must_use]
+    pub fn resolved_names(&self) -> Vec<String> {
+        match &self.responder.mode {
+            DnsMode::Open { recorder, .. } => recorder
+                .snapshot()
+                .0
+                .into_iter()
+                .filter(|e| e.proto == Proto::Dns)
+                .map(|e| e.host.to_string())
+                .collect(),
+            // Unreachable: `start` only ever builds an Open responder.
+            DnsMode::Filtered(_) => Vec::new(),
+        }
+    }
+
+    /// Stop both listeners. Idempotent.
+    pub fn shutdown(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for DnsForwarder {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Accept loop for DNS over TCP, mirroring [`serve_dns_udp`]'s peer gate.
+///
+/// Separate from [`serve_tcp`] so a resolver is never starved by proxy traffic:
+/// they shared a permit pool, and a run that saturated its tunnels made its own
+/// name resolution time out.
+async fn serve_dns_tcp(listener: TcpListener, responder: Arc<DnsResponder>) {
+    loop {
+        let Ok((stream, peer)) = listener.accept().await else {
+            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            continue;
+        };
+        if !responder.peer_permitted(peer.ip()) {
+            continue;
+        }
+        let responder = Arc::clone(&responder);
+        tokio::spawn(async move {
+            handle_dns_tcp(stream, &responder).await;
+        });
+    }
+}
+
 /// DNS over TCP: a 2-byte big-endian length prefix, then the message.
-async fn handle_dns_tcp(mut stream: TcpStream, policy: &Policy) {
+async fn handle_dns_tcp(mut stream: TcpStream, responder: &DnsResponder) {
     let read = async {
         let mut len = [0u8; 2];
         stream.read_exact(&mut len).await?;
@@ -1945,7 +2166,7 @@ async fn handle_dns_tcp(mut stream: TcpStream, policy: &Policy) {
     let Ok(Ok(query)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read).await else {
         return;
     };
-    if let Some(reply) = answer_dns(&query, policy).await {
+    if let Some(reply) = answer_dns(&query, responder).await {
         let Ok(len) = u16::try_from(reply.len()) else {
             return;
         };
@@ -1961,6 +2182,11 @@ const QTYPE_A: u16 = 1;
 const RCODE_NOERROR: u8 = 0;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_FORMERR: u8 = 1;
+/// The host's own resolver failed. Reported to the guest as such rather than as
+/// "no records": a NAT guest resolving through the gateway inherits the host's
+/// resolution exactly, and a host that cannot answer must not look to the guest
+/// like a name that does not exist.
+const RCODE_SERVFAIL: u8 = 2;
 
 /// A parsed DNS question — everything the broker needs from a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1975,7 +2201,7 @@ struct DnsQuery {
 
 /// Build the response for one query, resolving host-side when the name is
 /// allowed.
-async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
+async fn answer_dns(raw: &[u8], responder: &DnsResponder) -> Option<Vec<u8>> {
     let query = match parse_dns_query(raw) {
         Some(q) => q,
         None => {
@@ -1986,29 +2212,49 @@ async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
         }
     };
 
-    let target = Target::Name(query.name.clone(), 0);
-    // One evaluation, so the recorded reason is the same one enforcement used.
-    // Consulting `decide` separately would report `not_allowed` for a name that
-    // `check` refused as a credential's pinned host — the operator would be told
-    // to widen an allow list that is not the problem.
-    let (allowed, reason) = match policy.check(&target) {
-        Verdict::Allow(_) => (true, None),
-        Verdict::Deny(r) => (false, Some(r)),
-    };
-    policy.record(EgressEvent {
-        proto: Proto::Dns,
-        host: query.name.clone(),
-        port: 0,
-        allowed,
-        reason,
-        bytes_up: 0,
-        bytes_down: 0,
-        ts_ms: policy.now_ms(),
-        note: None,
-    });
-
-    if !allowed {
-        return Some(build_dns_response(&query, RCODE_NXDOMAIN, &[]));
+    // TOUCHPOINT 1 — whether this name may be answered, and the ledger entry.
+    match &responder.mode {
+        DnsMode::Filtered(policy) => {
+            let target = Target::Name(query.name.clone(), 0);
+            // One evaluation, so the recorded reason is the same one enforcement
+            // used. Consulting `decide` separately would report `not_allowed`
+            // for a name that `check` refused as a credential's pinned host —
+            // the operator would be told to widen an allow list that is not the
+            // problem.
+            let (allowed, reason) = match policy.check(&target) {
+                Verdict::Allow(_) => (true, None),
+                Verdict::Deny(r) => (false, Some(r)),
+            };
+            policy.record(EgressEvent {
+                proto: Proto::Dns,
+                host: query.name.clone(),
+                port: 0,
+                allowed,
+                reason,
+                bytes_up: 0,
+                bytes_down: 0,
+                ts_ms: policy.now_ms(),
+                note: None,
+            });
+            if !allowed {
+                return Some(build_dns_response(&query, RCODE_NXDOMAIN, &[]));
+            }
+        }
+        DnsMode::Open { recorder, .. } => {
+            // Nothing to deny against. The name is recorded anyway: a NAT run's
+            // record exists to say what was looked up, not what was permitted.
+            recorder.record(EgressEvent {
+                proto: Proto::Dns,
+                host: query.name.clone(),
+                port: 0,
+                allowed: true,
+                reason: None,
+                bytes_up: 0,
+                bytes_down: 0,
+                ts_ms: recorder.elapsed_ms(),
+                note: None,
+            });
+        }
     }
     if query.qtype != QTYPE_A {
         // A filtered slot has no IPv6 path at all, so AAAA is answered
@@ -2023,13 +2269,32 @@ async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
     // address directly — which is a packet the filter drops, but a filter is a
     // second line, not the first. A name that resolves entirely into the floored
     // set is answered NOERROR-with-no-records, exactly like a name with no A.
-    let ips: Vec<Ipv4Addr> = resolve_v4(query.name.as_str(), 0)
-        .await
+    // TOUCHPOINT 2 — the floor applied to the answer, and what is remembered.
+    let (allow_loopback, allow_private) = match &responder.mode {
+        DnsMode::Filtered(p) => (p.allow_loopback, p.allow_private),
+        // `allow_loopback` is test scaffolding for the filtered path; a NAT
+        // guest must never be told 127.0.0.1, which in its namespace is itself.
+        DnsMode::Open { allow_private, .. } => (false, *allow_private),
+    };
+
+    let answered = match resolve_v4_detailed(query.name.as_str(), 0).await {
+        Resolution::Addrs(v) => v,
+        // The host's resolver did not answer. Say so, rather than claiming the
+        // name has no records: a gateway resolver's whole contract is that the
+        // guest sees what the host sees, and there is deliberately no fallback
+        // to a public resolver — that would silently route the query to a third
+        // party on exactly the networks where nobody expects it.
+        Resolution::Failed => {
+            return Some(build_dns_response(&query, RCODE_SERVFAIL, &[]));
+        }
+    };
+
+    let ips: Vec<Ipv4Addr> = answered
         .into_iter()
         .filter_map(|a| match a.ip() {
             IpAddr::V4(v4)
-                if (policy.allow_loopback && v4.is_loopback())
-                    || super::egress::is_dialable(&IpAddr::V4(v4), policy.allow_private) =>
+                if (allow_loopback && v4.is_loopback())
+                    || super::egress::is_dialable(&IpAddr::V4(v4), allow_private) =>
             {
                 Some(v4)
             }
@@ -2039,10 +2304,14 @@ async fn answer_dns(raw: &[u8], policy: &Policy) -> Option<Vec<u8>> {
     if ips.is_empty() {
         return Some(build_dns_response(&query, RCODE_NOERROR, &[]));
     }
-    for ip in &ips {
-        policy
-            .recorder
-            .remember_resolved(IpAddr::V4(*ip), &query.name);
+    if let DnsMode::Filtered(policy) = &responder.mode {
+        // Only filtered runs attribute a later connection back to the name that
+        // produced the address; a NAT run has no brokered connection to attribute.
+        for ip in &ips {
+            policy
+                .recorder
+                .remember_resolved(IpAddr::V4(*ip), &query.name);
+        }
     }
     Some(build_dns_response(&query, RCODE_NOERROR, &ips))
 }
@@ -3413,5 +3682,96 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(500), c.read_exact(&mut buf)).await;
             assert!(got.is_err() || got.map(|r| r.is_err()).unwrap_or(true));
         }
+    }
+
+    // --- the NAT gateway resolver -----------------------------------------
+
+    /// A name the host cannot resolve must come back SERVFAIL, not "no records".
+    ///
+    /// `.invalid` is reserved by RFC 2606 precisely so it never resolves, which
+    /// makes this deterministic offline as well as on: either way the host's
+    /// resolver fails, and the guest must be told that rather than being told
+    /// the name exists but has no addresses. Answering NOERROR-empty here would
+    /// make a broken host resolver indistinguishable from a domain with no A
+    /// record, and the guest would stop retrying.
+    #[tokio::test]
+    async fn a_name_the_host_cannot_resolve_is_servfail_not_empty() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let fwd = DnsForwarder::start(lo, lo, false, 0).await.unwrap();
+
+        let sock = tokio::net::UdpSocket::bind((lo, 0)).await.unwrap();
+        sock.send_to(
+            &dns_query_bytes(0x4242, "nothing.invalid", QTYPE_A),
+            fwd.dns_addr(),
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; MAX_DNS_MSG];
+        let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
+            .await
+            .expect("the resolver answered")
+            .unwrap();
+
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 0x4242, "id echoed");
+        assert_eq!(buf[3] & 0x0f, RCODE_SERVFAIL, "rcode should be SERVFAIL");
+        assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 0, "no answers");
+        let _ = n;
+    }
+
+    /// The names are recorded even when resolution fails. A NAT run's record
+    /// exists to say what the workload tried to look up; whether the lookup
+    /// succeeded is a different question, and the failures are often the
+    /// interesting ones.
+    #[tokio::test]
+    async fn the_gateway_resolver_records_what_it_was_asked_for() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let fwd = DnsForwarder::start(lo, lo, false, 0).await.unwrap();
+        assert!(fwd.resolved_names().is_empty(), "nothing asked for yet");
+
+        let sock = tokio::net::UdpSocket::bind((lo, 0)).await.unwrap();
+        sock.send_to(
+            &dns_query_bytes(1, "telemetry.invalid", QTYPE_A),
+            fwd.dns_addr(),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; MAX_DNS_MSG];
+        let _ = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut buf))
+            .await
+            .expect("the resolver answered");
+
+        assert_eq!(fwd.resolved_names(), vec!["telemetry.invalid".to_string()]);
+    }
+
+    /// The resolver answers ONE sandbox. It is bound to a host address, so
+    /// without the peer gate any local process could use it as a general
+    /// resolver — and, on a filtered slot, learn what the sandbox looked up.
+    #[tokio::test]
+    async fn the_gateway_resolver_ignores_everyone_but_its_own_guest() {
+        let lo = Ipv4Addr::LOCALHOST;
+        // A guest address that is NOT the loopback the test queries from.
+        let fwd = DnsForwarder::start(lo, Ipv4Addr::new(10, 107, 0, 2), false, 0)
+            .await
+            .unwrap();
+
+        let sock = tokio::net::UdpSocket::bind((lo, 0)).await.unwrap();
+        sock.send_to(
+            &dns_query_bytes(7, "example.invalid", QTYPE_A),
+            fwd.dns_addr(),
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; MAX_DNS_MSG];
+        let got = tokio::time::timeout(Duration::from_millis(750), sock.recv(&mut buf)).await;
+        assert!(
+            got.is_err(),
+            "a query from a non-guest peer must go unanswered"
+        );
+        assert!(
+            fwd.resolved_names().is_empty(),
+            "and must not appear in the record either"
+        );
     }
 }
