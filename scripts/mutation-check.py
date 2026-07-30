@@ -480,6 +480,26 @@ MUTATIONS = [
         package="isopod-core",
         filter="net::setup",
     ),
+    Mutation(
+        name="a-broken-host-resolver-looks-like-a-missing-domain",
+        file="crates/core/src/net/broker.rs",
+        old="""        Resolution::Failed => {
+            return Some(build_dns_response(&query, RCODE_SERVFAIL, &[]));
+        }""",
+        new="""        Resolution::Failed => Vec::new(),""",
+        defect=(
+            "The gateway resolver stops distinguishing 'this host could not "
+            "resolve' from 'this name has no A record', and answers both "
+            "NOERROR-with-no-records. A guest is then told the domain exists "
+            "but has no addresses, which is a terminal answer — resolvers stop "
+            "retrying and fall back to nothing — when the truth is that the "
+            "host's own resolver failed and a retry might well succeed. It is "
+            "also the exact reading that sent this project chasing a resolver "
+            "bug for half a day when the real fault was a packet filter."
+        ),
+        package="isopod-core",
+        filter="net::broker",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its
