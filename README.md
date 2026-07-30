@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/me1iissa/isopod/actions/workflows/ci.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/ci.yml)
 [![Advisories](https://github.com/me1iissa/isopod/actions/workflows/advisories.yml/badge.svg)](https://github.com/me1iissa/isopod/actions/workflows/advisories.yml)
+[![coverage (unit)](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fme1iissa%2Fisopod%2Fbadges%2Fcoverage.json)](docs/coverage.md)
 
 **Run untrusted code in a real microVM. Boots in ~0.4 s, destroyed after every call.**
 

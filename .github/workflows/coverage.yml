@@ -39,6 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     # Advisory means advisory: a red coverage job must not mark the push red.
     continue-on-error: true
+    permissions:
+      contents: write # force-pushes the badge endpoint to the orphan `badges` branch
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -56,8 +58,51 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Coverage
         run: |
-          cargo llvm-cov --workspace --locked --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov --workspace --locked --summary-only \
+            | tee /tmp/coverage.txt | tee -a "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --lcov --output-path lcov.info
+
+      # The same parser the pull-request digest uses, so the badge and the
+      # comment can never disagree about what the number is. It writes nothing
+      # when the summary did not parse, which leaves the previous badge standing
+      # rather than replacing a real number with a wrong one.
+      - name: Render the badge endpoint
+        id: badge
+        run: |
+          python3 .github/ci-digest.py \
+            --head-lock Cargo.lock --base-lock Cargo.lock \
+            --coverage /tmp/coverage.txt --code-changed true \
+            --badge-out /tmp/coverage.json > /dev/null
+          if [ -f /tmp/coverage.json ]; then
+            cat /tmp/coverage.json
+            echo "rendered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::coverage summary did not parse; badge left unchanged"
+            echo "rendered=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The endpoint document lives on an orphan `badges` branch that shields.io
+      # reads and nothing else does, so a number that changes on every push
+      # never enters main's history. The branch ruleset protects main only.
+      # Force-push is correct here: the branch carries state, not history.
+      - name: Publish the badge
+        if: steps.badge.outputs.rendered == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          work="$(mktemp -d)"
+          cd "$work"
+          git init -q
+          git checkout -q --orphan badges
+          cp /tmp/coverage.json .
+          git add coverage.json
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "coverage badge: $(jq -r .message coverage.json)"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" badges
+          echo "published $(jq -r .message coverage.json) to the badges branch"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-lcov
