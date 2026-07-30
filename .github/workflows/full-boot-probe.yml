@@ -223,6 +223,12 @@ jobs:
             exit 0
           fi
           echo "host upstream resolver: $UP"
+          # $UP inside the single quotes is deliberate and must NOT expand on
+          # the host. The value crosses into the guest through `--env UP=`, and
+          # it is the guest's shell that expands it — expanding here would bake
+          # the host's resolver into the command string and the step would stop
+          # testing what the guest was configured with.
+          # shellcheck disable=SC2016
           ./target/release/isopod run --stage base --base base-alpine --env "UP=$UP" -- \
             /bin/sh -c 'printf "nameserver %s\n" "$UP" > /etc/resolv.conf; python3 - <<PY
           import socket
