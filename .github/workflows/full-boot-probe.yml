@@ -161,13 +161,21 @@ jobs:
             fi
           done
 
-      # THE DECISIVE STEP. No DNS anywhere in the guest: the host resolves the
-      # name, the literal address is handed in through --env, and the guest
-      # opens a TLS connection to it with SNI. Pass ⇒ NAT forwarding works and
-      # the only broken thing is name resolution. Fail ⇒ NAT itself is broken
-      # here and the DNS finding was a red herring.
+      # THE DECISIVE STEP, and run 30533962633 answered it: this FAILS on a
+      # hosted runner, and the DNS story was a red herring. The same run showed
+      # `FORWARD (policy DROP)` with DOCKER-USER returning straight through to
+      # it, and showed the host reaching BOTH 1.1.1.1 and 8.8.8.8 successfully.
+      # So the network never blocked the resolvers isopod bakes in; Docker's
+      # FORWARD policy was dropping every guest→WAN packet, the DNS query
+      # among them. The fix belongs in `isopod setup`, not in the resolver.
+      #
+      # continue-on-error, with the gate at the end of the job: this is an
+      # assertion and must redden the run, but not before the diagnostics after
+      # it have been collected. In the previous run it aborted the job and
+      # skipped the four steps whose output was the entire point of dispatching.
       - name: NAT forwards packets, with no DNS in the guest
         id: nat
+        continue-on-error: true
         run: |
           set -o pipefail
           IP="$(getent ahostsv4 example.com | awk 'NR==1{print $1}')"
@@ -256,6 +264,7 @@ jobs:
       # prediction assumed already existed.
       - name: Boot with filtered egress and a real allowlist
         id: filtered
+        continue-on-error: true # asserted by the gate at the end of the job
         run: |
           set -o pipefail
           ./target/release/isopod run --stage base --base base-alpine --allow-host example.com -- \
@@ -296,6 +305,7 @@ jobs:
       # recorded `"dns_queries": ["example.com"]`.
       - name: Filtered-mode DNS reaches the host-side responder
         id: filtered_dns
+        continue-on-error: true # asserted by the gate at the end of the job
         run: |
           set -o pipefail
           ./target/release/isopod run --stage base --base base-alpine --allow-host example.com -- \
@@ -309,6 +319,28 @@ jobs:
             exit 1
           }
           echo "the broker answered a guest DNS query: $(jq -c '.egress.dns_queries' fdns.json)"
+
+      # Every assertion above runs with continue-on-error so that a failure
+      # cannot skip the diagnostics that explain it — which is exactly what
+      # happened in run 30533962633, where one red step discarded the four
+      # findings the dispatch existed to collect. This step is where those
+      # assertions are actually enforced, so the run still goes red.
+      - name: Assertions held
+        env:
+          NAT: ${{ steps.nat.outcome }}
+          FILTERED: ${{ steps.filtered.outcome }}
+          FILTERED_DNS: ${{ steps.filtered_dns.outcome }}
+        run: |
+          failed=""
+          [ "$NAT" = "success" ] || failed="$failed\n  NAT forwarding: $NAT"
+          [ "$FILTERED" = "success" ] || failed="$failed\n  filtered egress: $FILTERED"
+          [ "$FILTERED_DNS" = "success" ] || failed="$failed\n  filtered DNS: $FILTERED_DNS"
+          if [ -n "$failed" ]; then
+            # shellcheck disable=SC2059  # $failed carries the \n escapes to expand
+            printf "::error::assertions did not hold:$failed\n"
+            exit 1
+          fi
+          echo "every assertion held"
 
       - name: Live suite
         if: inputs.run_live_suite
