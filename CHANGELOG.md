@@ -6,6 +6,61 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.14.0] — 2026-07-30
+
+### Fixed — a coexisting Docker install silently swallowed all guest egress
+
+Docker sets the iptables `ip filter` FORWARD policy to DROP and jumps to a
+`DOCKER-USER` chain containing only `RETURN`, so every guest→WAN packet fell
+through to that drop. **Any host running Docker had broken NAT egress, and
+nothing said so:** `isopod setup` reported complete success throughout — taps
+created, nft table installed, `ip_forward=1`, guest addressed — because nothing
+in setup looked at whether another tool had already claimed the forward hook.
+Dogfood finding #51.
+
+The first symptom is a timeout inside a guest, usually a DNS lookup, which reads
+as a resolver problem. It read as one here, and was diagnosed as one — a
+hardcoded-public-resolver bug — confidently and wrongly, until a guest handed a
+literal IP with no DNS anywhere in the path failed too, while the host reached
+both `1.1.1.1` and `8.8.8.8`. Host traffic goes through OUTPUT and guest traffic
+through FORWARD; only one of those was dropped.
+
+`setup` now inserts two accept rules into `DOCKER-USER` when that chain exists.
+Two, not one: the reply arrives on the WAN interface and dies on the same policy
+DROP, so a single inbound accept never completes a TCP handshake.
+
+**Why this cannot weaken the sandbox.** Per nft(8), an accept verdict ends
+evaluation of *the current base chain* and the packet advances to the next base
+chain, whereas a drop ends the whole ruleset. `inet isopod`'s forward chain is a
+separate base chain at the same hook, so accepting in Docker's table removes
+Docker's drop and none of isopod's — tap↔tap isolation, anti-spoof, the IPv6
+deny, the RFC1918 guard, the filtered-slot drop and the closing
+`iifname "isopod-tap*" drop` default-deny all still apply. Measured in throwaway
+network namespaces rather than assumed: with the accepts live, a drop in a
+separate `inet` chain still blocked the connection and its counter showed the
+packets arriving. The rules are accept-only and scoped to isopod's own taps and
+its own `10.107.0.0/16`.
+
+Docker publishes no persistence contract for that chain, so a daemon restart or
+a network creation may flush it. That is fail-closed — egress stops, nothing
+opens — and the remedy is re-running `sudo isopod setup`, the same doctrine
+already published for a flushed nftables ruleset.
+
+### Added — `setup` reports what it did about the forward hook
+
+`isopod setup`'s JSON gains `docker_user`: `installed`, `already-present`,
+`chain-absent`, `iptables-missing`, `lock-busy`, `skipped` or `removed`. The
+failure this addresses is invisible to every other field in that report, so the
+answer is stated rather than left to be inferred from whether the network happens
+to work. A lock timeout reports `lock-busy` and not `chain-absent`, because
+conflating them would read as "nothing to do" on precisely the busy Docker hosts
+where there is most to do.
+
+`--no-docker-user` declines the mechanism for anyone curating that chain
+themselves. A kernel without `xt_comment` falls back to unmarked rules rather
+than failing a `setup` that succeeds today, and teardown matches both spellings
+so neither can orphan.
+
 ## [0.13.3] — 2026-07-30
 
 ### Added — CI reports what it learned, on the pull request, while it can still matter
