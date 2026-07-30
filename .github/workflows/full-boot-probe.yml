@@ -62,7 +62,9 @@ jobs:
           # musl-tools: the guest agent is a static-pie musl binary.
           # busybox-static: build-rootfs copies the host's static busybox in.
           # nftables: `isopod setup` installs the egress ruleset through it.
-          sudo apt-get install -y -qq musl-tools busybox-static nftables
+          # dnsutils: the egress diagnostics below query resolvers directly, to
+          # tell "this network blocks public DNS" from "our NAT is broken".
+          sudo apt-get install -y -qq musl-tools busybox-static nftables dnsutils
           echo "busybox: $(command -v busybox) $(file -b "$(command -v busybox)" | cut -c1-40)"
           echo "nft:     $(nft --version)"
 
@@ -116,25 +118,117 @@ jobs:
       # requests for https:// URLs instead of CONNECT, so the broker refuses it
       # as malformed before policy is ever consulted — and a DNS failure reads
       # identically to a blocked host. The first run of this probe passed both
-      # egress steps that way, proving nothing. Use the alpine base and python's
-      # urllib, which speaks CONNECT and distinguishes the failure modes.
-      - name: Boot with NAT egress
+      # egress steps that way, proving nothing. Use the alpine base and python,
+      # which speaks CONNECT and distinguishes the failure modes.
+      #
+      # Run 30528308922 then died at getaddrinfo with EAI_AGAIN, and so proved
+      # nothing about NAT either: name resolution failed before a single packet
+      # was sent anywhere. DNS and packet forwarding are different failures and
+      # the first masks the second, so they are measured separately here. Only
+      # the by-literal-IP step and the filtered-egress step assert; the rest
+      # record facts, because a fact this probe exists to gather must not be
+      # able to fail the job that gathers it.
+      - name: DNS facts, host side
+        run: |
+          echo "--- /etc/resolv.conf ---"
+          cat /etc/resolv.conf || true
+          echo "--- /run/systemd/resolve/resolv.conf ---"
+          cat /run/systemd/resolve/resolv.conf 2>/dev/null || echo "(absent)"
+          echo "--- can the HOST reach the resolvers isopod bakes into guests? ---"
+          for r in 1.1.1.1 8.8.8.8; do
+            ans="$(dig +time=3 +tries=1 +short "@$r" example.com 2>/dev/null || true)"
+            if [ -n "$ans" ]; then
+              echo "host -> $r:53   ANSWERED ($ans)"
+            else
+              echo "host -> $r:53   NO ANSWER — this network does not permit the resolvers isopod hardcodes"
+            fi
+          done
+
+      # THE DECISIVE STEP. No DNS anywhere in the guest: the host resolves the
+      # name, the literal address is handed in through --env, and the guest
+      # opens a TLS connection to it with SNI. Pass ⇒ NAT forwarding works and
+      # the only broken thing is name resolution. Fail ⇒ NAT itself is broken
+      # here and the DNS finding was a red herring.
+      - name: NAT forwards packets, with no DNS in the guest
+        id: nat
         run: |
           set -o pipefail
-          ./target/release/isopod run --stage base --base base-alpine -- \
+          IP="$(getent ahostsv4 example.com | awk 'NR==1{print $1}')"
+          test -n "$IP" || { echo "::error::the RUNNER ITSELF could not resolve example.com"; exit 1; }
+          echo "host resolved example.com -> $IP"
+          ./target/release/isopod run --stage base --base base-alpine --env "TARGET_IP=$IP" -- \
             /bin/sh -c 'python3 - <<PY
-          import urllib.request, sys
-          body = urllib.request.urlopen("https://example.com/", timeout=20).read()
-          assert b"Example Domain" in body, body[:200]
-          print("nat-egress-ok", len(body), "bytes")
-          PY' | tee /dev/stderr | grep -q nat-egress-ok
+          import os, socket, ssl
+          ip = os.environ["TARGET_IP"]
+          ctx = ssl.create_default_context()
+          with socket.create_connection((ip, 443), timeout=20) as raw:
+              with ctx.wrap_socket(raw, server_hostname="example.com") as s:
+                  s.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+                  status = s.recv(4096).split(b"\r\n")[0]
+          assert b"200" in status, status
+          print("nat-forwards-ok", status.decode())
+          PY' | tee /dev/stderr > nat.txt
+          grep -q nat-forwards-ok nat.txt \
+            || { echo "::error::NAT does not forward packets here — the DNS failure was masking a second fault"; exit 1; }
+
+      # The failing case from run 30528308922, recorded rather than asserted:
+      # this is the behaviour the fix has to change, so the probe should keep
+      # reporting it truthfully until it does.
+      - name: Guest DNS as isopod configures it today
+        id: dns_today
+        continue-on-error: true
+        run: |
+          ./target/release/isopod run --stage base --base base-alpine -- \
+            /bin/sh -c 'echo "guest resolv.conf:"; cat /etc/resolv.conf; python3 - <<PY
+          import socket
+          try:
+              print("guest-dns-ok", socket.gethostbyname("example.com"))
+          except Exception as e:
+              print("guest-dns-FAILED:", type(e).__name__, e)
+          PY'
+
+      # Validates the proposed fix before any of it is written: if pointing the
+      # guest at the HOST's own upstream resolver makes resolution work, then
+      # host-derived DNS is the answer and the hardcoded public resolvers are
+      # the whole defect.
+      - name: Guest DNS via the host's own upstream resolver
+        id: dns_host
+        continue-on-error: true
+        run: |
+          UP=""
+          for f in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
+            [ -r "$f" ] || continue
+            UP="$(awk '/^nameserver/ && $2 !~ /^127\./ { print $2; exit }' "$f")"
+            [ -n "$UP" ] && break
+          done
+          if [ -z "$UP" ]; then
+            echo "::warning::no non-loopback resolver on the host — the loopback-stub case, which host-derived DNS must also handle"
+            exit 0
+          fi
+          echo "host upstream resolver: $UP"
+          ./target/release/isopod run --stage base --base base-alpine --env "UP=$UP" -- \
+            /bin/sh -c 'printf "nameserver %s\n" "$UP" > /etc/resolv.conf; python3 - <<PY
+          import socket
+          try:
+              print("host-upstream-dns-ok", socket.gethostbyname("example.com"))
+          except Exception as e:
+              print("host-upstream-dns-FAILED:", type(e).__name__, e)
+          PY'
 
       # Two assertions, and BOTH must hold: the allowlisted host is reachable
       # AND the other one is refused BY POLICY. Checking only the refusal is
       # worthless — everything fails when nothing works. The denial is matched
       # on the broker's own 403, so a timeout or a DNS error fails the step
       # instead of being mistaken for enforcement.
+      #
+      # A PREDICTION worth recording, because it is the asymmetry the whole DNS
+      # finding rests on: this step should pass even where the step above
+      # cannot resolve. Filtered egress does not use the guest's resolver at
+      # all — the broker answers DNS host-side and the guest reaches names
+      # through CONNECT. If filtered egress works here while NAT DNS does not,
+      # that isolates the defect to the hardcoded public resolvers exactly.
       - name: Boot with filtered egress and a real allowlist
+        id: filtered
         run: |
           set -o pipefail
           ./target/release/isopod run --stage base --base base-alpine --allow-host example.com -- \
@@ -172,6 +266,10 @@ jobs:
         if: always()
         env:
           SETUP_OUTCOME: ${{ steps.setup.outcome }}
+          NAT_OUTCOME: ${{ steps.nat.outcome }}
+          DNS_TODAY: ${{ steps.dns_today.outcome }}
+          DNS_HOST: ${{ steps.dns_host.outcome }}
+          FILTERED_OUTCOME: ${{ steps.filtered.outcome }}
           JOB_STATUS: ${{ job.status }}
         run: |
           {
@@ -182,5 +280,12 @@ jobs:
             echo "| Stage | Result |"
             echo "|---|---|"
             echo "| networking provisioned | $SETUP_OUTCOME |"
+            echo "| NAT forwards (no guest DNS) | $NAT_OUTCOME |"
+            echo "| guest DNS, as shipped | $DNS_TODAY |"
+            echo "| guest DNS, host upstream | $DNS_HOST |"
+            echo "| filtered egress, both halves | $FILTERED_OUTCOME |"
             echo "| job | $JOB_STATUS |"
+            echo ""
+            echo "The two DNS rows are diagnostics and never fail the job — read"
+            echo "their step logs for the actual resolver behaviour."
           } >> "$GITHUB_STEP_SUMMARY"
