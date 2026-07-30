@@ -684,6 +684,49 @@ pub fn build_nft_ruleset(
         format!("\t\tiifname \"isopod-tap*\" ip daddr {{ {PRIVATE_V4_DESTS} }} drop\n")
     };
 
+    // PUBLIC (NAT) slots: send their DNS to a host-side forwarder on their own
+    // gateway, so a guest inherits the resolution the host actually has —
+    // including split-horizon and internal names — instead of the public
+    // resolvers isopod used to bake into every image. Those resolvers work on a
+    // permissive network and fail on a restrictive one, and either way they send
+    // every guest lookup to a third party regardless of the operator's own DNS
+    // policy.
+    //
+    // THE `ip daddr <gateway>` PIN IS LOAD-BEARING, for two separate reasons,
+    // and dropping it breaks each differently:
+    //
+    //  1. NAT semantics survive. A guest that deliberately queries 1.1.1.1:53
+    //     keeps its direct masqueraded path — only traffic aimed at its own
+    //     gateway is redirected. A filtered slot's redirect is unpinned because
+    //     nothing else is reachable from there; here, everything is.
+    //  2. Rollout works in either order. An OLD binary on a NEW provisioning
+    //     still points guests at 1.1.1.1, and that traffic must not be hijacked
+    //     into a port where nothing is listening. With the pin these rules are
+    //     completely inert for a binary that does not know about them.
+    //
+    // Only port 5353 is opened, never the broker's four-port set: no broker
+    // listens on a NAT gateway, and the hole should be the narrowest that works.
+    let mut public_prerouting = String::new();
+    let mut public_input = String::new();
+    for i in 0..filtered_from.min(slots) {
+        let gip = host_ip(i);
+        public_prerouting.push_str(&format!(
+            "\t\tiifname \"isopod-tap{i}\" ip daddr {gip} udp dport 53 \
+             redirect to :{BROKER_DNS_PORT}\n\
+             \t\tiifname \"isopod-tap{i}\" ip daddr {gip} tcp dport 53 \
+             redirect to :{BROKER_DNS_PORT}\n"
+        ));
+        // Matched on the POST-DNAT port, like the filtered accepts below: the
+        // input hook runs after nat prerouting, so writing 53 here would
+        // blackhole every query while looking correct.
+        public_input.push_str(&format!(
+            "\t\tiifname \"isopod-tap{i}\" ip daddr {gip} udp dport \
+             {BROKER_DNS_PORT} accept\n\
+             \t\tiifname \"isopod-tap{i}\" ip daddr {gip} tcp dport \
+             {BROKER_DNS_PORT} accept\n"
+        ));
+    }
+
     // Filtered slots: forward nothing, redirect :53 to the broker's
     // unprivileged port, and open exactly the three broker ports on the gateway.
     let mut filtered_forward = String::new();
@@ -712,18 +755,24 @@ pub fn build_nft_ruleset(
             gip = host_ip(i),
         ));
     }
-    // The prerouting chain exists only when something needs it, so an install
-    // with no filtered slots emits the pre-0.9 table verbatim.
-    let prerouting_chain = if filtered_prerouting.is_empty() {
+    // The prerouting chain exists only when something needs it. With any slot
+    // at all that is now always — public slots redirect their DNS too — so the
+    // elision survives only for `slots == 0`, which `provision` rejects anyway.
+    // Public rules first, though the two sets are disjoint by interface: rules
+    // that cannot both match are order-independent, and grouping them by kind
+    // keeps `nft list` readable.
+    let prerouting_rules = format!("{public_prerouting}{filtered_prerouting}");
+    let prerouting_chain = if prerouting_rules.is_empty() {
         String::new()
     } else {
         format!(
             "\tchain prerouting {{\n\
              \t\ttype nat hook prerouting priority dstnat; policy accept;\n\
-             {filtered_prerouting}\
+             {prerouting_rules}\
              \t}}\n"
         )
     };
+    let input_rules = format!("{public_input}{filtered_input}");
 
     format!(
         "add table inet isopod\n\
@@ -747,7 +796,7 @@ pub fn build_nft_ruleset(
          \t}}\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority filter; policy accept;\n\
-         {filtered_input}\
+         {input_rules}\
          \t\tiifname \"isopod-tap*\" ct state new drop\n\
          \t}}\n\
          }}\n",
@@ -1170,18 +1219,107 @@ mod tests {
 
     // --- filtered slots ---------------------------------------------------
 
-    /// The regression gate for acceptance criterion #4: with no filtered slots,
-    /// the emitted ruleset must be **byte-identical** to the 0.8.1 output. The
-    /// expected text is a checked-in fixture captured from the 0.8.1 code, not
-    /// a string rebuilt from the same constants this function uses — otherwise a
-    /// refactor could redefine "identical" and the test would still pass.
+    /// A public slot's gateway is opened for DNS and NOTHING else.
+    ///
+    /// A filtered slot's gateway runs a broker and needs its four ports. No
+    /// broker listens on a NAT gateway, so opening that set there would be a
+    /// hole with nothing behind it — and the input chain is the only thing
+    /// standing between a guest and host services.
     #[test]
-    fn no_filtered_slots_is_byte_identical_to_0_8_1() {
-        let fixture = include_str!("../../tests/fixtures/nft-ruleset-0.8.1-12slots.txt");
+    fn public_slots_open_only_the_dns_port() {
+        let rs = build_nft_ruleset("eth0", 12, false, 8);
+        let input = rs.split("chain input {").nth(1).expect("an input chain");
+
+        // tap0 is public: DNS only, on the post-DNAT port.
+        assert!(input.contains("iifname \"isopod-tap0\" ip daddr 10.107.0.1 udp dport 5353 accept"));
+        assert!(input.contains("iifname \"isopod-tap0\" ip daddr 10.107.0.1 tcp dport 5353 accept"));
+        // And not the broker set, which only a filtered gateway serves.
+        for port in [1080u16, 3128, 3129] {
+            assert!(
+                !input.contains(&format!(
+                    "isopod-tap0\" ip daddr 10.107.0.1 tcp dport {port}"
+                )),
+                "public slot 0 must not open broker port {port}"
+            );
+        }
+        // tap8 is filtered and keeps the full set.
+        assert!(input.contains("iifname \"isopod-tap8\" ip daddr 10.107.8.1 tcp dport { 1080, 3128, 3129, 5353 } accept"));
+    }
+
+    /// Every slot filtered means no public-slot rules at all, and the manifest
+    /// must say so: a recorded gateway-DNS port on a host that opened none would
+    /// point the runtime at a hole that does not exist.
+    #[test]
+    fn all_filtered_means_no_public_dns_rules_and_no_manifest_claim() {
+        let rs = build_nft_ruleset("eth0", 4, false, 0);
+        // Filtered slots have their OWN redirect, deliberately unpinned. What
+        // must be absent is the gateway-PINNED form, which is the public-slot
+        // rule — so match on the pin, not on "redirect".
+        assert!(
+            !rs.lines()
+                .any(|l| l.contains("ip daddr") && l.contains("dport 53 redirect")),
+            "with every slot filtered there is no public slot to redirect"
+        );
+        // Filtered slots still get their own unpinned redirect.
+        let rs_mixed = build_nft_ruleset("eth0", 4, false, 2);
+        assert!(rs_mixed.contains("iifname \"isopod-tap2\" udp dport 53 redirect to :5353"));
+
+        let all_filtered = super::super::Manifest::new(4, "eth0".into(), 0, false, 0);
+        assert_eq!(
+            all_filtered.gateway_dns_port(),
+            None,
+            "no public slots ⇒ nothing to record"
+        );
+        let mixed = super::super::Manifest::new(4, "eth0".into(), 0, false, 2);
+        assert_eq!(mixed.gateway_dns_port(), Some(BROKER_DNS_PORT));
+    }
+
+    /// The whole ruleset, pinned byte-for-byte against a checked-in fixture.
+    ///
+    /// This replaces `no_filtered_slots_is_byte_identical_to_0_8_1`, which
+    /// asserted that an install with no filtered slots emitted the pre-0.9 table
+    /// verbatim. That is deliberately no longer true: public slots now redirect
+    /// gateway-addressed DNS to a host-side forwarder, which is a versioned
+    /// change to the provisioning format. The 0.8.1 fixtures stay in the tree as
+    /// the historical record of what the old format was.
+    ///
+    /// The fixtures are generated BY `build_nft_ruleset` itself — see
+    /// `regenerate_the_provisioning_fixtures` — never typed out. A fixture
+    /// hand-written to match what the author believed the writer emits pins the
+    /// belief rather than the behaviour.
+    #[test]
+    fn the_ruleset_matches_the_checked_in_provisioning_fixture() {
+        let fixture = include_str!("../../tests/fixtures/nft-ruleset-0.15-12slots.txt");
         assert_eq!(build_nft_ruleset("eth0", 12, false, 12), fixture);
 
-        let fixture_lan = include_str!("../../tests/fixtures/nft-ruleset-0.8.1-12slots-lan.txt");
+        let fixture_lan = include_str!("../../tests/fixtures/nft-ruleset-0.15-12slots-lan.txt");
         assert_eq!(build_nft_ruleset("eth0", 12, true, 12), fixture_lan);
+    }
+
+    /// Rewrite the fixtures from the production writer. Not a test — a tool.
+    ///
+    /// ```text
+    /// cargo test -p isopod-core --lib regenerate_the_provisioning_fixtures -- --ignored
+    /// ```
+    ///
+    /// `#[ignore]`d so it never runs in CI: a "test" that rewrites the thing it
+    /// is compared against would make every diff self-approving. Run it
+    /// deliberately, then read the diff, then check the result parses with
+    /// `nft -c -f`.
+    #[test]
+    #[ignore = "regenerates fixtures; run deliberately, then read the diff"]
+    fn regenerate_the_provisioning_fixtures() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        std::fs::write(
+            dir.join("nft-ruleset-0.15-12slots.txt"),
+            build_nft_ruleset("eth0", 12, false, 12),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("nft-ruleset-0.15-12slots-lan.txt"),
+            build_nft_ruleset("eth0", 12, true, 12),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1223,8 +1361,22 @@ mod tests {
                 "iifname \"isopod-tap{i}\" tcp dport 53 redirect to :5353"
             )));
         }
-        // Public slots keep their direct path to the DEFAULT_DNS resolvers.
-        assert!(!rs.contains("iifname \"isopod-tap0\" udp dport 53"));
+        // A public slot's redirect MUST be pinned to its own gateway address.
+        // Unpinned, it would capture a guest's deliberate query to 1.1.1.1 and
+        // send it to a port that may have no listener — and it would do the same
+        // to a guest driven by an older binary that does not know the gateway
+        // resolver exists. Both turn working DNS into a timeout, so the absence
+        // of the unpinned form is asserted, not just the presence of the pinned.
+        assert!(
+            rs.contains(
+                "iifname \"isopod-tap0\" ip daddr 10.107.0.1 udp dport 53 redirect to :5353"
+            ),
+            "a public slot should redirect DNS aimed at its own gateway"
+        );
+        assert!(
+            !rs.contains("iifname \"isopod-tap0\" udp dport 53 redirect"),
+            "an UNPINNED public redirect would hijack a guest's direct query to a public resolver"
+        );
     }
 
     #[test]

@@ -1,0 +1,84 @@
+add table inet isopod
+delete table inet isopod
+table inet isopod {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.107.0.0/16 oifname "eth0" masquerade
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "isopod-tap0" ip daddr 10.107.0.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap0" ip daddr 10.107.0.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap1" ip daddr 10.107.1.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap1" ip daddr 10.107.1.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap2" ip daddr 10.107.2.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap2" ip daddr 10.107.2.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap3" ip daddr 10.107.3.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap3" ip daddr 10.107.3.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap4" ip daddr 10.107.4.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap4" ip daddr 10.107.4.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap5" ip daddr 10.107.5.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap5" ip daddr 10.107.5.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap6" ip daddr 10.107.6.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap6" ip daddr 10.107.6.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap7" ip daddr 10.107.7.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap7" ip daddr 10.107.7.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap8" ip daddr 10.107.8.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap8" ip daddr 10.107.8.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap9" ip daddr 10.107.9.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap9" ip daddr 10.107.9.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap10" ip daddr 10.107.10.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap10" ip daddr 10.107.10.1 tcp dport 53 redirect to :5353
+		iifname "isopod-tap11" ip daddr 10.107.11.1 udp dport 53 redirect to :5353
+		iifname "isopod-tap11" ip daddr 10.107.11.1 tcp dport 53 redirect to :5353
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		iifname "isopod-tap*" oifname "isopod-tap*" drop
+		iifname "isopod-tap0" ip saddr != 10.107.0.2 drop
+		iifname "isopod-tap1" ip saddr != 10.107.1.2 drop
+		iifname "isopod-tap2" ip saddr != 10.107.2.2 drop
+		iifname "isopod-tap3" ip saddr != 10.107.3.2 drop
+		iifname "isopod-tap4" ip saddr != 10.107.4.2 drop
+		iifname "isopod-tap5" ip saddr != 10.107.5.2 drop
+		iifname "isopod-tap6" ip saddr != 10.107.6.2 drop
+		iifname "isopod-tap7" ip saddr != 10.107.7.2 drop
+		iifname "isopod-tap8" ip saddr != 10.107.8.2 drop
+		iifname "isopod-tap9" ip saddr != 10.107.9.2 drop
+		iifname "isopod-tap10" ip saddr != 10.107.10.2 drop
+		iifname "isopod-tap11" ip saddr != 10.107.11.2 drop
+		iifname "isopod-tap*" meta nfproto ipv6 drop
+		iifname "isopod-tap*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } drop
+		iifname "eth0" oifname "isopod-tap*" ct state established,related accept
+		iifname "isopod-tap*" oifname "eth0" accept
+		iifname "isopod-tap*" drop
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "isopod-tap0" ip daddr 10.107.0.1 udp dport 5353 accept
+		iifname "isopod-tap0" ip daddr 10.107.0.1 tcp dport 5353 accept
+		iifname "isopod-tap1" ip daddr 10.107.1.1 udp dport 5353 accept
+		iifname "isopod-tap1" ip daddr 10.107.1.1 tcp dport 5353 accept
+		iifname "isopod-tap2" ip daddr 10.107.2.1 udp dport 5353 accept
+		iifname "isopod-tap2" ip daddr 10.107.2.1 tcp dport 5353 accept
+		iifname "isopod-tap3" ip daddr 10.107.3.1 udp dport 5353 accept
+		iifname "isopod-tap3" ip daddr 10.107.3.1 tcp dport 5353 accept
+		iifname "isopod-tap4" ip daddr 10.107.4.1 udp dport 5353 accept
+		iifname "isopod-tap4" ip daddr 10.107.4.1 tcp dport 5353 accept
+		iifname "isopod-tap5" ip daddr 10.107.5.1 udp dport 5353 accept
+		iifname "isopod-tap5" ip daddr 10.107.5.1 tcp dport 5353 accept
+		iifname "isopod-tap6" ip daddr 10.107.6.1 udp dport 5353 accept
+		iifname "isopod-tap6" ip daddr 10.107.6.1 tcp dport 5353 accept
+		iifname "isopod-tap7" ip daddr 10.107.7.1 udp dport 5353 accept
+		iifname "isopod-tap7" ip daddr 10.107.7.1 tcp dport 5353 accept
+		iifname "isopod-tap8" ip daddr 10.107.8.1 udp dport 5353 accept
+		iifname "isopod-tap8" ip daddr 10.107.8.1 tcp dport 5353 accept
+		iifname "isopod-tap9" ip daddr 10.107.9.1 udp dport 5353 accept
+		iifname "isopod-tap9" ip daddr 10.107.9.1 tcp dport 5353 accept
+		iifname "isopod-tap10" ip daddr 10.107.10.1 udp dport 5353 accept
+		iifname "isopod-tap10" ip daddr 10.107.10.1 tcp dport 5353 accept
+		iifname "isopod-tap11" ip daddr 10.107.11.1 udp dport 5353 accept
+		iifname "isopod-tap11" ip daddr 10.107.11.1 tcp dport 5353 accept
+		iifname "isopod-tap*" ct state new drop
+	}
+}

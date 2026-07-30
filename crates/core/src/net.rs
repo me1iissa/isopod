@@ -258,6 +258,24 @@ pub struct Manifest {
     /// assumed reachable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     broker_tcp_ports: Option<Vec<u16>>,
+    /// The port this provisioning redirected **public** (NAT) slots' DNS to, so
+    /// their guests resolve through a host-side forwarder on their own gateway
+    /// instead of a hardcoded public resolver.
+    ///
+    /// Recorded for the same reason as `broker_tcp_ports`, and read the same
+    /// fail-closed way: the redirect and the matching input accept are baked
+    /// once as root, and the unprivileged runtime must not point a guest at a
+    /// port this host never opened. `None` — every manifest written before
+    /// 0.15.0, and every install whose slots are all filtered — means "no
+    /// gateway resolver here", and the runtime falls back to [`DEFAULT_DNS`].
+    ///
+    /// This is what makes the change safe to roll out in either order. A NEW
+    /// binary on an OLD provisioning reads `None` and uses the public resolvers
+    /// that host's ruleset still expects; an OLD binary on a NEW provisioning
+    /// ignores the key and keeps using them too, which the daddr-pinned
+    /// redirect leaves working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_dns_port: Option<u16>,
 }
 
 impl Manifest {
@@ -285,7 +303,23 @@ impl Manifest {
             allow_lan_egress,
             filtered_from: filtered.then_some(filtered_from),
             broker_tcp_ports: filtered.then(|| BROKER_TCP_PORTS.to_vec()),
+            // Only when this host actually HAS a public slot. With every slot
+            // filtered there are no public-slot rules to record, and claiming
+            // otherwise would point a runtime at a hole that was never opened.
+            gateway_dns_port: (filtered_from > 0).then_some(BROKER_DNS_PORT),
         }
+    }
+
+    /// The port public slots' DNS is redirected to on their own gateway, or
+    /// `None` when this host has no such rule.
+    ///
+    /// `None` is the answer for every pre-0.15.0 manifest and for a host whose
+    /// slots are all filtered. The caller must fall back to [`DEFAULT_DNS`]
+    /// rather than guessing a port: a redirect to somewhere nothing listens
+    /// would turn working DNS into a timeout.
+    #[must_use]
+    pub fn gateway_dns_port(&self) -> Option<u16> {
+        self.gateway_dns_port
     }
 
     /// The broker TCP ports this host's nftables ruleset opens on a filtered
