@@ -6,12 +6,20 @@ name: Coverage
 # reddens a build, and nothing may ever be made to depend on this number.
 #
 # The number systematically undercounts, and gating on it would punish the
-# wrong code: the `#[ignore]`d /dev/kvm suite — real boots, the jail, VM
-# lifecycle, the egress-enforcement ledger — cannot run on GitHub-hosted
-# runners, so the best-defended paths in the tree are absent from every
-# percentage this workflow prints. What the report is for: finding the module
-# or branch that NO test executes — the one question the mutation harness
-# does not ask, because it only interrogates code it has a mutation for.
+# wrong code: the `#[ignore]`d suite — real boots, the jail, VM lifecycle, the
+# egress-enforcement ledger — does not run here, so the best-defended paths in
+# the tree are absent from every percentage this workflow prints.
+#
+# Not because a hosted runner cannot boot a microVM. It can: the full-boot
+# probe granted itself kvm-group access through a udev rule and measured a
+# guest booting in 84 ms. The reason is cost. Reaching that point takes a
+# vendored Firecracker build, four guest images and a privileged `isopod
+# setup` — some twenty minutes — which is why it lives in a dispatch-only
+# probe rather than on every push.
+#
+# What the report is for: finding the module or branch that NO test executes —
+# the one question the mutation harness does not ask, because it only
+# interrogates code it has a mutation for.
 on:
   push:
     branches: [main]

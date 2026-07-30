@@ -164,8 +164,15 @@ jobs:
         if: inputs.run_live_suite
         run: cargo test --workspace --locked -- --ignored --test-threads=1
 
+      # Expansions go through env, not into the script body — the same rule the
+      # rest of the tree follows. Neither value is attacker-controllable, which
+      # is why zizmor rates it informational; the convention is worth more than
+      # the exception.
       - name: Verdict
         if: always()
+        env:
+          SETUP_OUTCOME: ${{ steps.setup.outcome }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           {
             echo "### Full boot probe"
@@ -174,6 +181,6 @@ jobs:
             echo ""
             echo "| Stage | Result |"
             echo "|---|---|"
-            echo "| networking provisioned | ${{ steps.setup.outcome }} |"
-            echo "| job | ${{ job.status }} |"
+            echo "| networking provisioned | $SETUP_OUTCOME |"
+            echo "| job | $JOB_STATUS |"
           } >> "$GITHUB_STEP_SUMMARY"
