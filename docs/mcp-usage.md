@@ -98,6 +98,22 @@ Tools registered via the plugin appear scoped as
 `mcp__plugin_<plugin-name>_<server-name>__<tool>`; isopod uses the same name
 for both, hence `isopod_isopod`).
 
+The repo also self-hosts a one-plugin marketplace, so the whole thing is two
+commands once isopod itself is installed:
+
+```
+/plugin marketplace add me1iissa/isopod
+/plugin install isopod@isopod
+```
+
+`source` is `./` — the plugin *is* this repo — so an install copies the tracked
+tree, 2.8 MB. The 1.2 GB `vendor/firecracker` build output nearby is untracked
+and a submodule gitlink, so none of it travels.
+
+The marketplace entry deliberately carries **no `version`**. `plugin.json` already
+declares one and the release tooling keeps it in lockstep with the workspace;
+a second copy here would be a third place to bump and the first to drift.
+
 Note on distribution: the plugin's `command` is a small launcher,
 `${CLAUDE_PLUGIN_ROOT}/isopod-mcp`, which finds the server wherever isopod was
 installed. It prefers a `target/release` build in the plugin root (so a dev
