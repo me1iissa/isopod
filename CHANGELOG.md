@@ -50,6 +50,22 @@ live probe can exercise both implementations on any host, rather than leaving th
 older one to run only where nobody tests; it selects which implementation makes
 the tree read-only, never whether it is made read-only.
 
+### Fixed — the pinned Alpine bootstrap package stopped existing
+
+Building the `base-alpine` guest image began failing with a bare 404 for
+`apk-tools-static-3.0.6-r0.apk`. Nothing here changed: Alpine's CDN serves only
+the *current* revision of each package, so a pin goes 404 the moment upstream
+rebuilds it — here, `3.0.7-r0` shipped and took `3.0.6-r0` with it.
+
+That is the pin doing its job. A digest that could quietly follow a moving file
+would be no pin at all, so the fix is to re-pin, never to stop verifying. Bumped
+to `3.0.7-r0` and its sha256, with the new `apk.static` checked to still be a
+static x86_64 ELF at the expected path in the package.
+
+Both bootstrap downloads now explain this when they fail, instead of reporting an
+HTTP status that reads like a network fault or a compromised mirror: the error
+names the listing to check and the two constants to re-pin.
+
 ### Added — the jail's syscall layer has unit tests
 
 It had none. Twenty-one `unsafe` blocks, covered only by a single `#[ignore]`d
