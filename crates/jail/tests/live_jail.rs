@@ -9,8 +9,6 @@
 //!   (the exact "rw nested over ro home" pattern a real run uses),
 //! * a **submount** of that read-only bind is read-only too — `/dev/shm`, a
 //!   `nosuid,nodev` tmpfs under `/`, which also exercises the locked-flag rule,
-//! * both implementations of that recursive remount: `mount_setattr(2)` on a
-//!   5.12+ kernel and the mountinfo walk every older one falls back to,
 //! * `/dev/kvm` is **openable read-write** inside the namespace (proof that the
 //!   retained `kvm` supplementary group + the bound device node work together —
 //!   no host `chmod`), and
@@ -86,79 +84,56 @@ fn jail_unshares_chroots_and_opens_kvm() {
     let uid = real_id("Uid:");
     let gid = real_id("Gid:");
 
-    // Both implementations of the recursive read-only remount, on every host
-    // that can run this at all. `mount_setattr(2)` is what a 5.12+ kernel takes;
-    // the mountinfo walk is what everything older takes, and without forcing it
-    // here it would only ever run on machines nobody tests on.
-    for force_walk in [false, true] {
-        let _ = std::fs::remove_file(&out_file);
-        let mut cmd = Command::new(jail_bin);
-        cmd.args([
-            "--root",
-            root.to_str().unwrap(),
-            "--uid",
-            &uid, // in-ns 0 maps to the writer's real uid (single-id map)
-            "--gid",
-            &gid,
-            "--bind",
-            &format!("{}:ro", "/"),
-            "--bind",
-            &format!("{}:rw", scratch.display()),
-            "--dev",
-            "/dev/kvm",
-            "--dev",
-            "/dev/null",
-            "--",
-            "/bin/sh",
-            "-c",
-            &script,
-        ]);
-        if force_walk {
-            cmd.env("ISOPOD_JAIL_FORCE_REMOUNT_WALK", "1");
-        }
-        let status = cmd.status().expect("spawn isopod-jail");
+    let mut cmd = Command::new(jail_bin);
+    cmd.args([
+        "--root",
+        root.to_str().unwrap(),
+        "--uid",
+        &uid, // in-ns 0 maps to the writer's real uid (single-id map)
+        "--gid",
+        &gid,
+        "--bind",
+        &format!("{}:ro", "/"),
+        "--bind",
+        &format!("{}:rw", scratch.display()),
+        "--dev",
+        "/dev/kvm",
+        "--dev",
+        "/dev/null",
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    let status = cmd.status().expect("spawn isopod-jail");
+    assert!(
+        status.success(),
+        "jail launcher exited non-zero: {status:?}"
+    );
 
-        let how = if force_walk {
-            "mountinfo walk"
-        } else {
-            "mount_setattr"
-        };
+    let out = std::fs::read_to_string(&out_file).expect("child wrote the rw-bound output file");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("0"),
+        "child must see in-namespace uid 0; got {out:?}"
+    );
+    assert!(
+        out.contains("KVM-RW-OK"),
+        "/dev/kvm must be openable rw inside the jail (retained kvm group + bound node); got {out:?}"
+    );
+    // A read-only bind is recursive, so a *submount* of it is read-only too.
+    // `/dev/shm` is a tmpfs under the read-only `/` and is `nosuid,nodev`, so it
+    // also covers the mount whose locked flags a hand-rolled remount could not
+    // carry — the defect that took two rounds on real hosts to find.
+    if shm_is_a_writable_submount() {
         assert!(
-            status.success(),
-            "jail launcher exited non-zero via {how}: {status:?}"
-        );
-
-        let out = std::fs::read_to_string(&out_file).expect("child wrote the rw-bound output file");
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            lines.first().copied(),
-            Some("0"),
-            "child must see in-namespace uid 0 ({how}); got {out:?}"
-        );
-        assert!(
-            out.contains("KVM-RW-OK"),
-            "/dev/kvm must be openable rw inside the jail (retained kvm group + bound node) ({how}); got {out:?}"
-        );
-        // The regression this pair of paths exists for: a read-only bind is
-        // recursive, so a *submount* of it is read-only too. `/dev/shm` is a
-        // tmpfs under the read-only `/`, and it is `nosuid,nodev` — so it also
-        // proves the walk hands those locked flags back, which is the difference
-        // between a read-only submount and EPERM.
-        if shm_is_a_writable_submount() {
-            assert!(
-                out.contains("SHM-RO-OK"),
-                "a submount of a read-only bind must be read-only ({how}); got {out:?}"
-            );
-        }
-        assert!(
-            out.contains("CapEff"),
-            "CapEff line present ({how}); got {out:?}"
-        );
-        assert!(
-            out.contains("DONE"),
-            "child ran to completion ({how}); got {out:?}"
+            out.contains("SHM-RO-OK"),
+            "a submount of a read-only bind must be read-only; got {out:?}"
         );
     }
+    assert!(out.contains("CapEff"), "CapEff line present; got {out:?}");
+    assert!(out.contains("DONE"), "child ran to completion; got {out:?}");
 
     // Cleanup (best-effort; the chroot holds only empty mountpoint skeletons).
     let _ = std::fs::remove_dir_all(&root);

@@ -28,12 +28,14 @@ the VM away. Isolation is the KVM hardware boundary, not a shared kernel.
 sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted.org"])
 ```
 
-> Pre-1.0 and moving quickly; `main` is the supported line. Newest: host-declared
-> credentials a run can spend but never read (0.10.0 — [docs](docs/credentials.md)),
-> hardened in 0.11.0 after an adversarial review of the shipped code
-> ([changelog](CHANGELOG.md)). **0.11.0 needs one `sudo isopod setup` on an existing
-> host** — a filtered run now verifies the kernel's own forwarding guard and fails
-> closed without it.
+> Pre-1.0 and moving quickly; `main` is the supported line. Newest (0.19.0,
+> [changelog](CHANGELOG.md)): a read-only jail bind is now read-only *including
+> every mount beneath it* — it was not, and said nothing — which makes
+> **Linux 5.12 a requirement for the opt-in jail** and for nothing else. Also
+> since 0.14.0: guest egress survives a coexisting Docker install, which used to
+> swallow it silently, and a NAT run gets a host-side DNS resolver instead of
+> baked-in public ones. **An existing host needs one `sudo isopod setup`** to pick
+> up the forward-hook and resolver provisioning.
 
 ---
 
@@ -446,7 +448,7 @@ The short version:
 - The security boundary is the Firecracker VMM + KVM, the host-side code that ingests guest-controlled bytes, and the tap/nftables network fabric — **not** the inside of the guest. Inside a guest, untrusted code runs as root by design; the guest is expendable.
 - Firecracker runs **unprivileged** (kvm group) with its **seccomp filter on** and **all capabilities dropped**. Guest→host and guest→guest are blocked, the base image is read-only, and no host filesystem is shared into the guest.
 - **Guest egress is public-only by default.** A networked guest reaches the internet but not the host's private network: RFC1918, CGNAT, and link-local/metadata destinations are dropped, with per-tap anti-spoofing. (LAN reachability is an explicit opt-in: `isopod setup --allow-lan-egress`.)
-- An **optional rootless jail** (`ISOPOD_JAIL=1`) wraps each Firecracker in user/pid namespaces, a minimal chroot, and per-VM cgroup caps — a second isolation layer with no privileged host component. It is opt-in in this release; enable it (or keep the host single-tenant) before running mutually distrusting workloads.
+- An **optional rootless jail** (`ISOPOD_JAIL=1`, Linux 5.12+) wraps each Firecracker in user/pid namespaces, a minimal chroot, and per-VM cgroup caps — a second isolation layer with no privileged host component. It is opt-in in this release; enable it (or keep the host single-tenant) before running mutually distrusting workloads. On an older kernel it refuses to start rather than enforce a weaker boundary than it reports; unjailed runs are unaffected.
 - Guest-controlled host sinks are **bounded**: exec/serial logs are size-capped, every RPC the host waits on is time-bounded, and resource requests are validated before boot.
 - **Per-run egress allowlists the guest cannot rewrite.** `--allow-host` / `allow_hosts` puts a run on a *filtered* slot that forwards nothing, reachable only through a host-side broker that enforces the allowlist and resolves names itself — so a root guest can neither reach an unlisted destination nor exfiltrate over DNS. The policy is nftables rules written once by `sudo isopod setup` plus a host process the guest cannot address; nothing inside the guest can edit it. Every allowed and denied destination lands in `RunReport.egress` and `~/.isopod/vms/<id>/egress.jsonl`. Allowlisting is destination control, not DLP — see [SECURITY.md](SECURITY.md) for what is and is not claimed.
 - For untrusted code, prefer **`--no-network` (CLI) / `network=false` (MCP)** — no NIC is attached at all; exec still works over vsock.

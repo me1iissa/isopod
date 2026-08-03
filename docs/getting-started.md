@@ -504,11 +504,22 @@ lands as an unprivileged unmapped uid, not your account), a minimal chroot
 (your home and the rest of `~/.isopod` are not visible), and per-VM cgroup
 memory/cpu/pids caps.
 
-Requirements: unprivileged user namespaces, a delegated cgroup v2 subtree (a
-normal systemd user session provides one), and `kvm` group membership. The
-preflight **fails closed** with a specific message if something is missing —
-it never silently runs unjailed. See [SECURITY.md](../SECURITY.md) for what
-the jail does and does not defend against.
+Requirements: **Linux 5.12 or newer**, unprivileged user namespaces, a delegated
+cgroup v2 subtree (a normal systemd user session provides one), and `kvm` group
+membership. The preflight **fails closed** with a specific message if something
+is missing — it never silently runs unjailed. See [SECURITY.md](../SECURITY.md)
+for what the jail does and does not defend against.
+
+The kernel floor is `mount_setattr(2)`, which arrived in 5.12 and is the only
+mechanism that makes a bind read-only *including every mount beneath it* — in one
+atomic call, adding the read-only attribute without clearing the flags a user
+namespace locks, and reaching mounts that another mount is stacked over. A
+hand-rolled equivalent for older kernels was tried and abandoned: it failed all
+three ways, each time on a real host and never on a developer's machine, because
+whether it fails at all depends on the host's mount table. Without that guarantee
+a read-only bind silently leaves its submounts writable, so on an older kernel the
+jail refuses to start rather than claim a boundary it cannot enforce. Everything
+else in isopod — including unjailed runs — is unaffected by this floor.
 
 ## 8. Claude Code: MCP server + skill
 

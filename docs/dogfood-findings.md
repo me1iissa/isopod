@@ -1061,6 +1061,22 @@ flowchart LR
     namespace and running the real jail binary against it: the committed code
     fails at that path, the fix passes.
 
+    **Then the fallback was deleted.** Three rounds, three defects, every one of
+    them found on a hosted runner and none on a developer's machine — because
+    whether the walk fails is a property of the host's mount table, not of the
+    code. It dropped locked flags; it read flags off the wrong line where two
+    mounts share a mount point; and it could never have reached a shadowed mount
+    at all. `mount_setattr(2)` was correct on the first attempt and structurally
+    cannot hit any of the three. The jail now requires Linux 5.12 and refuses to
+    start below it, naming the requirement, this host's kernel, and the fact that
+    dropping `ISOPOD_JAIL=1` starts an unjailed VM. The jail is opt-in, so this
+    floor applies to nothing else.
+
+    The lesson worth keeping is not about mounts. A second implementation of a
+    security boundary, on a path that only runs where nobody tests, is a liability
+    priced as a feature — it accumulates defects at full rate and reveals them at
+    the rate the untested hosts are exercised.
+
     The fallback is now forced by an environment variable in the live probe, so
     both paths run on every host that can run the probe at all, instead of the
     older one running only on machines nobody tests on. The probe also gained the
