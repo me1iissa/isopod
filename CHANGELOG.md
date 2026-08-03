@@ -28,10 +28,27 @@ A submount under `~/.isopod` is not exotic — a separate disk for images, a tmp
 an encrypted volume. The jail exists to contain a compromised Firecracker, and
 that process could have written to a stage layer every later run forks.
 
-`remount_readonly_recursive` now walks `/proc/self/mountinfo` and remounts every
-mount at or beneath the target, **deepest first** so a parent cannot shadow a
-child, and **fails closed**: a jail that cannot prove the tree is read-only must
-not report that it is. Dogfood finding #52.
+`remount_readonly_recursive` now makes the whole tree read-only, and **fails
+closed**: a jail that cannot prove the tree is read-only must not report that it
+is. It prefers `mount_setattr(2)` with `AT_RECURSIVE`, where the kernel walks the
+tree itself in one atomic call. On a kernel older than 5.12 it falls back to
+reading `/proc/self/mountinfo` and remounting each mount in turn, deepest first.
+Dogfood finding #52.
+
+That fallback has to hand each mount its own flags back. A mount inherited into a
+new user namespace has `nosuid`, `nodev` and `noexec` **locked**
+(`mount_namespaces(7)`), and a remount that does not name them again reads as an
+attempt to clear them — `EPERM`. The first version of this fix omitted them and
+could not start a jail at all on a host whose mount table happened to contain
+such a mount under the bind; it was caught by the live suite on the branch, on a
+hosted runner, after passing on a maintainer's laptop and in the pull-request
+gate. `mount_setattr` sidesteps the rule entirely by only ever *adding* the
+read-only attribute. Dogfood finding #53.
+
+`ISOPOD_JAIL_FORCE_REMOUNT_WALK=1` forces the fallback path. It exists so the
+live probe can exercise both implementations on any host, rather than leaving the
+older one to run only where nobody tests; it selects which implementation makes
+the tree read-only, never whether it is made read-only.
 
 ### Added — the jail's syscall layer has unit tests
 
@@ -41,11 +58,17 @@ maintainer's laptop and needs a privilege CI can withdraw. A security boundary i
 a sandbox for untrusted code has to be checked in the pull-request gate, on every
 change, without needing privilege.
 
-The mountinfo parser is pure and tested, including the two ways it can be subtly
+The mountinfo parser is pure and tested, including the ways it can be subtly
 wrong. Matching on raw prefix would make `~/.isopod-other` and `~/.isopodx` read-only
 too — unrelated host mounts, outside the jail, silently losing write access.
-And mountinfo octal-escapes its mount points, so comparing the raw text would miss
-a submount under any directory with a space in its name.
+mountinfo octal-escapes its mount points, so comparing the raw text would miss
+a submount under any directory with a space in its name. And a remount that drops
+a flag the kernel locked is refused outright, so the flags are read back per mount.
+
+The live probe now asserts what it never did: that a *submount* of the read-only
+bind is read-only, checked against `/dev/shm` — a tmpfs under `/` that is also
+`nosuid,nodev`, so one assertion covers both the recursion and the locked-flag
+rule. It runs the jail twice, once per implementation.
 
 ## [0.17.0] — 2026-07-30
 

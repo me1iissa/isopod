@@ -132,8 +132,6 @@ pub fn bind_mount(src: &str, dst: &str) -> io::Result<()> {
     }
 }
 
-/// Remount an existing bind at `dst` read-only
-/// (`mount(NULL, dst, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL)`).
 /// Make `dst` read-only **including every mount beneath it**.
 ///
 /// [`remount_readonly`] alone is not enough and the gap is silent. `bind_mount`
@@ -149,37 +147,139 @@ pub fn bind_mount(src: &str, dst: &str) -> io::Result<()> {
 /// process this jail exists to contain, and a stage corrupted there is forked by
 /// every later run that builds on it.
 ///
+/// Two implementations, in preference order:
+///
+/// 1. `mount_setattr(2)` with `AT_RECURSIVE` (Linux 5.12+). The kernel walks the
+///    tree itself in one atomic call, *adding* `MOUNT_ATTR_RDONLY` and clearing
+///    nothing — so it cannot trip the locked-flag rule described on
+///    [`remount_readonly`], no mount can appear between reading the mount table
+///    and acting on it, and a mount that another mount is stacked over is still
+///    reached (a path-driven walk can only ever see the topmost one).
+/// 2. On an older kernel — `ENOSYS` — a read of `/proc/self/mountinfo` followed
+///    by one bind remount per mount. Correct, but none of the three properties
+///    above hold, which is why it is the fallback and not the design.
+///
 /// # Errors
-/// If any mount at or beneath `dst` cannot be made read-only, or if
-/// `/proc/self/mountinfo` cannot be read. **Fails closed**: a jail that cannot
-/// prove the tree is read-only must not report that it is.
+/// If any mount at or beneath `dst` cannot be made read-only, or if the fallback
+/// cannot read `/proc/self/mountinfo`. **Fails closed**: a jail that cannot prove
+/// the tree is read-only must not report that it is.
 pub fn remount_readonly_recursive(dst: &str) -> io::Result<()> {
+    if std::env::var_os(FORCE_REMOUNT_WALK).is_none() {
+        match mount_setattr_readonly_recursive(dst) {
+            Ok(()) => return Ok(()),
+            // Kernel older than 5.12: the walk below is the only option.
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+            // Anything else is a real refusal, and this is a security boundary.
+            Err(e) => return Err(annotate(e, "mount_setattr(AT_RECURSIVE)")),
+        }
+    }
+    remount_readonly_walk(dst)
+}
+
+/// Test hook: take the pre-5.12 fallback even where `mount_setattr(2)` exists,
+/// so the walk is exercised by the live jail probe instead of only ever running
+/// on kernels nobody tests against.
+///
+/// It selects *which implementation* makes the tree read-only — never whether
+/// the tree is made read-only. Both fail closed, so setting it cannot weaken a
+/// jail; the worst it can do is make one refuse to start.
+const FORCE_REMOUNT_WALK: &str = "ISOPOD_JAIL_FORCE_REMOUNT_WALK";
+
+/// `struct mount_attr` from `mount_setattr(2)`.
+///
+/// There is no `libc` binding, and the kernel validates the struct size it is
+/// handed against the version it knows, so the field order and widths here are
+/// ABI, not an implementation detail.
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// `mount_setattr(AT_FDCWD, dst, AT_RECURSIVE, {attr_set = MOUNT_ATTR_RDONLY})`.
+///
+/// `attr_clr` is zero: the call only ever *adds* the read-only attribute, so the
+/// kernel's rule that a locked `nosuid`/`nodev`/`noexec` may not be cleared is
+/// never engaged, whatever the tree happens to contain.
+fn mount_setattr_readonly_recursive(dst: &str) -> io::Result<()> {
+    let dst = cstr(dst)?;
+    let attr = MountAttr {
+        attr_set: libc::MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: `dst` is a NUL-terminated C string that outlives the call; `attr`
+    // is a live `#[repr(C)]` `struct mount_attr` and the size passed is its real
+    // size, which is how the kernel selects the struct version. No libc wrapper
+    // exists for this syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::AT_RECURSIVE,
+            std::ptr::from_ref(&attr),
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The pre-5.12 fallback: remount every mount at or beneath `dst`, deepest
+/// first, each with the per-mount flags it already carries.
+fn remount_readonly_walk(dst: &str) -> io::Result<()> {
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| annotate(e, "reading /proc/self/mountinfo"))?;
     let mut targets = submounts_of(&mountinfo, dst);
     // The bind itself may not be listed yet if the caller is racing its own
     // mount table read; remounting it is idempotent, so ensure it is included.
-    if !targets.iter().any(|t| t == dst) {
-        targets.push(dst.to_string());
+    let dst_norm = dst.trim_end_matches('/');
+    if !dst_norm.is_empty() && !targets.iter().any(|t| t.path == dst_norm) {
+        targets.push(Submount {
+            path: dst_norm.to_string(),
+            keep: 0,
+        });
     }
     for target in &targets {
-        remount_readonly(target)
-            .map_err(|e| annotate(e, &format!("remounting {target} read-only")))?;
+        remount_readonly(&target.path, target.keep)
+            .map_err(|e| annotate(e, &format!("remounting {} read-only", target.path)))?;
     }
     Ok(())
 }
 
-pub fn remount_readonly(dst: &str) -> io::Result<()> {
+/// Remount the existing bind at `dst` read-only, repeating the per-mount flags
+/// in `keep` (`mount(NULL, dst, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|keep, NULL)`).
+///
+/// `keep` is not decoration. A mount inherited into a new user namespace has its
+/// `nosuid`, `nodev` and `noexec` bits **locked** (`mount_namespaces(7)`), and a
+/// remount that omits one reads as an attempt to *clear* it — which the kernel
+/// refuses with `EPERM`. Measured, not inferred: in a nested user namespace, a
+/// `nosuid,nodev,noexec` submount rejects `MS_RDONLY` alone and accepts the same
+/// remount the moment the three bits are passed back.
+///
+/// Atime flags are deliberately absent. `mount(2)` specifies that a remount
+/// naming none of `MS_NOATIME`/`MS_NODIRATIME`/`MS_RELATIME`/`MS_STRICTATIME`
+/// preserves the mount's existing atime setting — which is exactly what the same
+/// locking rule requires, so parsing them could only introduce a way to get it
+/// wrong.
+pub fn remount_readonly(dst: &str, keep: libc::c_ulong) -> io::Result<()> {
     let dst = cstr(dst)?;
     // SAFETY: a bind remount needs only the target path; source/fstype/data are
     // ignored (NULL). The flag mask is the documented "make this bind read-only"
-    // incantation.
+    // incantation, plus the flags this mount already carries.
     let rc = unsafe {
         libc::mount(
             std::ptr::null(),
             dst.as_ptr(),
             std::ptr::null(),
-            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong | keep,
             std::ptr::null(),
         )
     };
@@ -209,30 +309,76 @@ pub fn remount_readonly(dst: &str) -> io::Result<()> {
 /// Deepest-first because a remount must not be shadowed by a later remount of
 /// its parent.
 #[must_use]
-pub fn submounts_of(mountinfo: &str, target: &str) -> Vec<String> {
+pub fn submounts_of(mountinfo: &str, target: &str) -> Vec<Submount> {
+    // Trimming `/` to the empty string is what makes the separator test below
+    // treat every mount as being under the root, as it should.
     let target = target.trim_end_matches('/');
-    let mut found: Vec<String> = mountinfo
+    let mut found: Vec<Submount> = mountinfo
         .lines()
         .filter_map(|line| {
-            // Fields before the optional run: id, parent, dev, root, mountpoint.
-            let mount_point = line.split(' ').nth(4)?;
+            // Fields before the optional run: id, parent, dev, root, mountpoint,
+            // then the per-mount options.
+            let mut fields = line.split(' ');
+            let mount_point = fields.nth(4)?;
+            // A line truncated after the mount point still names a real mount.
+            // Yielding it with no flags fails closed — the remount errors and
+            // the jail refuses to start — where skipping it would silently leave
+            // that mount writable.
+            let options = fields.next().unwrap_or("");
             let decoded = unescape_octal(mount_point);
             let under = decoded == target
                 || decoded
                     .strip_prefix(target)
                     .is_some_and(|rest| rest.starts_with('/'));
-            under.then_some(decoded)
+            under.then(|| Submount {
+                path: decoded,
+                keep: preserved_flags(options),
+            })
         })
         .collect();
     // Deepest first: a parent remounted after its child would shadow the child.
     found.sort_by(|a, b| {
-        b.matches('/')
+        b.path
+            .matches('/')
             .count()
-            .cmp(&a.matches('/').count())
-            .then(a.cmp(b))
+            .cmp(&a.path.matches('/').count())
+            .then_with(|| a.path.cmp(&b.path))
     });
     found.dedup();
     found
+}
+
+/// One mount to make read-only: where it is, and the per-mount flags a remount
+/// of it must repeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submount {
+    /// Mount point, with mountinfo's octal escapes already decoded.
+    pub path: String,
+    /// `MS_*` bits this mount already carries. See [`remount_readonly`] for why
+    /// dropping one turns a remount into an `EPERM`.
+    pub keep: libc::c_ulong,
+}
+
+/// The `MS_*` bits a bind remount must repeat, read from mountinfo's per-mount
+/// options field (`rw,nosuid,nodev,noexec,relatime`).
+///
+/// Deliberately narrow: the three flags the kernel *locks* on a mount inherited
+/// into a user namespace, plus `nosymfollow` — which is not locked, and so fails
+/// differently and worse. Omitting it does not error; it silently clears the
+/// flag, turning a remount meant to tighten a mount into one that loosens it.
+///
+/// Atime options are not parsed at all; see [`remount_readonly`].
+#[must_use]
+fn preserved_flags(options: &str) -> libc::c_ulong {
+    options.split(',').fold(0, |keep, opt| {
+        keep | match opt {
+            "nosuid" => libc::MS_NOSUID,
+            "nodev" => libc::MS_NODEV,
+            "noexec" => libc::MS_NOEXEC,
+            "nosymfollow" => libc::MS_NOSYMFOLLOW,
+            _ => 0,
+        }
+    })
 }
 
 /// Decode mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline,
@@ -430,12 +576,63 @@ mod tests {
 31 30 0:27 / /home/u/.isopodx rw,relatime - ext4 /dev/sda4 rw
 ";
 
+    /// Mount points only, for the tests that are about *which* mounts are found.
+    fn paths(found: &[Submount]) -> Vec<String> {
+        found.iter().map(|s| s.path.clone()).collect()
+    }
+
     #[test]
     fn submounts_include_the_target_and_everything_under_it() {
-        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
         assert!(got.contains(&"/home/u/.isopod".to_string()));
         assert!(got.contains(&"/home/u/.isopod/images".to_string()));
         assert!(got.contains(&"/home/u/.isopod/images/deep".to_string()));
+    }
+
+    /// The one that took down the first version of this code. A mount inherited
+    /// into a user namespace has `nosuid`/`nodev`/`noexec` locked, so a remount
+    /// that does not name them again is read as an attempt to clear them and is
+    /// refused with `EPERM` — turning a fix for a silent hole into a jail that
+    /// will not start. The flags have to come back out of mountinfo.
+    #[test]
+    fn the_flags_the_kernel_locks_are_read_back_from_the_mount_options() {
+        let got = submounts_of(MOUNTINFO, "/proc");
+        assert_eq!(
+            got[0].keep,
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            "a locked flag dropped here is an EPERM at the syscall"
+        );
+    }
+
+    /// Atime is locked too, but `mount(2)` preserves it for a remount that names
+    /// no atime flag. Parsing them could only add a way to get it wrong.
+    #[test]
+    fn atime_is_left_for_the_kernel_to_preserve() {
+        assert_eq!(preserved_flags("rw,relatime"), 0);
+        assert_eq!(preserved_flags("rw,noatime,nodiratime"), 0);
+    }
+
+    /// `nosymfollow` is *not* locked, so omitting it does not fail loudly — it
+    /// clears the flag, quietly loosening a mount this call exists to tighten.
+    #[test]
+    fn nosymfollow_is_repeated_so_the_remount_cannot_clear_it() {
+        assert_eq!(preserved_flags("ro,nosymfollow"), libc::MS_NOSYMFOLLOW);
+    }
+
+    /// An unknown option contributes nothing rather than being guessed at.
+    #[test]
+    fn unrecognised_options_contribute_no_flags() {
+        assert_eq!(preserved_flags("rw,seclabel,inode64,idmapped"), 0);
+    }
+
+    /// A line truncated after the mount point still names a real mount. It is
+    /// kept, with no flags, so the remount fails and the jail refuses to start —
+    /// dropping it would leave that mount writable and report success.
+    #[test]
+    fn a_line_with_no_options_field_still_yields_the_mount() {
+        let got = submounts_of("25 30 0:22 / /proc\n", "/proc");
+        assert_eq!(paths(&got), vec!["/proc".to_string()]);
+        assert_eq!(got[0].keep, 0);
     }
 
     /// A prefix match on the raw string would sweep in `/home/u/.isopod-other`
@@ -444,7 +641,7 @@ mod tests {
     /// a path separator, not a character count.
     #[test]
     fn a_sibling_that_merely_shares_a_prefix_is_not_a_submount() {
-        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
         assert!(
             !got.iter().any(|m| m == "/home/u/.isopod-other"),
             "a prefix match would remount an unrelated mount: {got:?}"
@@ -460,7 +657,7 @@ mod tests {
     /// this function exists to close, reintroduced by ordering alone.
     #[test]
     fn deepest_mounts_come_first() {
-        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
+        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
         let deep = got.iter().position(|m| m == "/home/u/.isopod/images/deep");
         let mid = got.iter().position(|m| m == "/home/u/.isopod/images");
         let top = got.iter().position(|m| m == "/home/u/.isopod");
@@ -476,7 +673,7 @@ mod tests {
 40 30 0:30 / /home/u/my\\040stage rw,relatime - ext4 /dev/sda5 rw
 41 40 0:31 / /home/u/my\\040stage/inner rw,relatime - tmpfs none rw
 ";
-        let got = submounts_of(mi, "/home/u/my stage");
+        let got = paths(&submounts_of(mi, "/home/u/my stage"));
         assert_eq!(
             got,
             vec![
@@ -502,7 +699,10 @@ mod tests {
     /// something to remount and never silently does nothing.
     #[test]
     fn a_target_with_no_submounts_still_returns_itself() {
-        assert_eq!(submounts_of(MOUNTINFO, "/proc"), vec!["/proc".to_string()]);
+        assert_eq!(
+            paths(&submounts_of(MOUNTINFO, "/proc")),
+            vec!["/proc".to_string()]
+        );
     }
 
     /// Garbage in must not panic: this parses a kernel file on the security
@@ -510,7 +710,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let mi = "short line\n\n25 30 0:22 /\n25 30 0:22 / /proc rw - proc proc rw\n";
-        assert_eq!(submounts_of(mi, "/proc"), vec!["/proc".to_string()]);
+        assert_eq!(paths(&submounts_of(mi, "/proc")), vec!["/proc".to_string()]);
     }
 
     /// A trailing slash on the target is the same target. Without normalising,
@@ -522,5 +722,17 @@ mod tests {
             submounts_of(MOUNTINFO, "/home/u/.isopod/"),
             submounts_of(MOUNTINFO, "/home/u/.isopod")
         );
+    }
+
+    /// Binding `/` read-only is a real configuration (the live probe uses it),
+    /// and it is the one target that trims to the empty string. Every mount must
+    /// still be found — a `/`-rooted bind that swept up nothing would report
+    /// success over an entirely writable tree.
+    #[test]
+    fn binding_the_root_finds_every_mount() {
+        let got = paths(&submounts_of(MOUNTINFO, "/"));
+        assert_eq!(got.len(), MOUNTINFO.lines().count(), "got {got:?}");
+        assert!(got.contains(&"/proc".to_string()));
+        assert!(got.contains(&"/home/u/.isopodx".to_string()));
     }
 }

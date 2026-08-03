@@ -542,6 +542,23 @@ MUTATIONS = [
         # with --bins for the harness to name the test that caught this.
         target="--bins",
     ),
+    Mutation(
+        name="a-read-only-remount-drops-a-flag-the-kernel-locked",
+        file="crates/jail/src/sys.rs",
+        old="""            "nosuid" => libc::MS_NOSUID,""",
+        new="""            "nosuid" => 0,""",
+        defect=(
+            "The per-mount flags handed back to a bind remount lose `nosuid`. A "
+            "mount inherited into a user namespace has that bit locked, so a "
+            "remount omitting it reads as an attempt to clear it and the kernel "
+            "refuses with EPERM — the jail cannot start at all on any host whose "
+            "mount table holds a nosuid mount under the bind. This shipped once: "
+            "it passed the local gate and the pull-request gate, and was caught "
+            "only by the live suite on a hosted runner."
+        ),
+        package="isopod-jail",
+        target="--bins",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its
