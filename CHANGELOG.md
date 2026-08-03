@@ -6,6 +6,50 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.19.0] — 2026-08-03
+
+### Changed — the rootless jail requires Linux 5.12 (`ISOPOD_JAIL=1` only)
+
+**Breaking for jail users on older kernels; nothing else changes.** The jail is
+opt-in, so isopod itself gains no kernel floor — an unjailed run is unaffected,
+and a host below 5.12 keeps everything except the optional second isolation layer.
+
+`mount_setattr(2)` is the only mechanism that makes a bind read-only including
+every mount beneath it and actually holds: the kernel walks the tree in one call,
+so nothing can appear between reading a mount table and acting on it; it *adds*
+`MOUNT_ATTR_RDONLY` and clears nothing, so it cannot trip the rule that a
+`nosuid`/`nodev`/`noexec` bit locked into a user namespace may not be cleared; and
+it reaches a mount that another mount is stacked over, which nothing driven by
+path can do.
+
+0.18.0 shipped a hand-rolled walk over `/proc/self/mountinfo` for older kernels.
+It is removed. It failed all three ways above, in three successive rounds, **each
+one found only by the live suite on a hosted runner and never on a developer's
+machine** — because whether it fails at all is a property of the host's mount
+table, not of the code. It dropped the locked flags and earned `EPERM`; it then
+read flags off the wrong mountinfo line where two mounts share a mount point
+(`/proc/sys/fs/binfmt_misc` is a systemd autofs with the real filesystem mounted
+over it) and earned the same `EPERM` again; and it could never have reached a
+shadowed mount at all, since a remount by path only ever finds the topmost.
+
+A second implementation of a security boundary, on a path that only runs where
+nobody tests, accumulates defects at full rate and reveals them at the rate the
+untested hosts are exercised. It is worth less than the hosts it buys. Dogfood
+finding #53.
+
+On an older kernel the jail now refuses to start, naming the requirement, this
+host's kernel release, and the fact that dropping `ISOPOD_JAIL=1` starts an
+unjailed VM.
+
+### Changed — the jail's tests follow the code they protected
+
+The mountinfo parser and its unit tests are gone with the fallback they served.
+What remains is tested where the guarantee now lives: the live probe's assertion
+that a **submount** of a read-only bind is read-only, and the unsupported-kernel
+path — both the message and, separately, the decision to use it. That second test
+exists because a mutation proved the first was not enough: the message was
+covered, the call site was not, so deleting the call left every test passing.
+
 ## [0.18.0] — 2026-07-30
 
 > **Releases 0.15.0 through 0.17.0 were never tagged or published.** They landed
@@ -28,35 +72,37 @@ A submount under `~/.isopod` is not exotic — a separate disk for images, a tmp
 an encrypted volume. The jail exists to contain a compromised Firecracker, and
 that process could have written to a stage layer every later run forks.
 
-`remount_readonly_recursive` now makes the whole tree read-only via
-`mount_setattr(2)` with `AT_RECURSIVE`, and **fails closed**: a jail that cannot
-prove the tree is read-only must not report that it is. Dogfood finding #52.
+`remount_readonly_recursive` now makes the whole tree read-only, and **fails
+closed**: a jail that cannot prove the tree is read-only must not report that it
+is. It prefers `mount_setattr(2)` with `AT_RECURSIVE`, where the kernel walks the
+tree itself in one atomic call. On a kernel older than 5.12 it falls back to
+reading `/proc/self/mountinfo` and remounting each mount in turn, deepest first.
+Dogfood finding #52.
 
-### Changed — the rootless jail now requires Linux 5.12 (`ISOPOD_JAIL=1` only)
+That fallback has to hand each mount its own flags back. A mount inherited into a
+new user namespace has `nosuid`, `nodev` and `noexec` **locked**
+(`mount_namespaces(7)`), and a remount that does not name them again reads as an
+attempt to clear them — `EPERM`. The first version of this fix omitted them and
+could not start a jail at all on a host whose mount table happened to contain
+such a mount under the bind; it was caught by the live suite on the branch, on a
+hosted runner, after passing on a maintainer's laptop and in the pull-request
+gate. `mount_setattr` sidesteps the rule entirely by only ever *adding* the
+read-only attribute. Dogfood finding #53.
 
-`mount_setattr(2)` is the only mechanism that makes a bind read-only including
-every mount beneath it and actually holds: the kernel walks the tree in one call,
-so nothing can appear between reading a mount table and acting on it; it *adds*
-`MOUNT_ATTR_RDONLY` and clears nothing, so it cannot trip the rule that a
-`nosuid`/`nodev`/`noexec` bit locked into a user namespace may not be cleared; and
-it reaches a mount that another mount is stacked over, which nothing driven by
-path can do.
+The flags come from `statvfs(2)`, not from the mount's line in
+`/proc/self/mountinfo`. Those are not the same thing: **two mounts can share one
+mount point** — a systemd autofs with the real filesystem mounted over it, which
+is exactly what `/proc/sys/fs/binfmt_misc` is on a hosted runner — and a remount
+by path reaches only the topmost. Reading flags off a mountinfo line applied the
+lower mount's flags to the upper mount and earned the same `EPERM` a second time.
+`statvfs` resolves a path the way `mount` does, so it always describes the mount
+about to be remounted; mountinfo is left to enumerate paths, which is the one job
+it can do reliably.
 
-A hand-rolled walk over `/proc/self/mountinfo` was written for older kernels and
-then removed. It failed all three ways, in three successive rounds, **each one
-found only by the live suite on a hosted runner and never on a developer's
-machine** — because whether it fails at all is a property of the host's mount
-table, not of the code. It dropped the locked flags and earned `EPERM`; it then
-read flags off the wrong mountinfo line where two mounts share a mount point
-(`/proc/sys/fs/binfmt_misc` is a systemd autofs with the real filesystem over it)
-and earned the same `EPERM` again; and it could not have reached a shadowed mount
-at all. A second implementation of a security boundary that runs only where nobody
-tests is worth less than the hosts it buys. Dogfood finding #53.
-
-On an older kernel the jail now refuses to start, naming the requirement, this
-host's kernel, and the fact that dropping `ISOPOD_JAIL=1` starts an unjailed VM.
-**Only the opt-in jail is affected** — the kernel floor for isopod itself is
-unchanged.
+`ISOPOD_JAIL_FORCE_REMOUNT_WALK=1` forces the fallback path. It exists so the
+live probe can exercise both implementations on any host, rather than leaving the
+older one to run only where nobody tests; it selects which implementation makes
+the tree read-only, never whether it is made read-only.
 
 ### Fixed — the pinned Alpine bootstrap package stopped existing
 
@@ -82,16 +128,17 @@ maintainer's laptop and needs a privilege CI can withdraw. A security boundary i
 a sandbox for untrusted code has to be checked in the pull-request gate, on every
 change, without needing privilege.
 
+The mountinfo parser is pure and tested, including the ways it can be subtly
+wrong. Matching on raw prefix would make `~/.isopod-other` and `~/.isopodx` read-only
+too — unrelated host mounts, outside the jail, silently losing write access.
+mountinfo octal-escapes its mount points, so comparing the raw text would miss
+a submount under any directory with a space in its name. And a mount point can
+appear twice, so it is listed once — the duplicate names the same reachable mount.
+
 The live probe now asserts what it never did: that a *submount* of the read-only
 bind is read-only, checked against `/dev/shm` — a tmpfs under `/` that is also
-`nosuid,nodev`, so one assertion covers both the recursion and the mount whose
-locked flags took two rounds on real hosts to get right. Without it the original
-hole would have sailed through the probe unnoticed, which is how it survived.
-
-The mountinfo parser and its tests were removed along with the fallback they
-served. What remains is tested at the level that now carries the guarantee: the
-message an unsupported kernel produces — which is the entire user-facing contract
-of that failure — and the live probe.
+`nosuid,nodev`, so one assertion covers both the recursion and the locked-flag
+rule. It runs the jail twice, once per implementation.
 
 ## [0.17.0] — 2026-07-30
 
