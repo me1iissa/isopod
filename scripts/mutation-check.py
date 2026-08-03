@@ -603,6 +603,21 @@ MUTATIONS = [
         package="isopod-core",
         filter="snapshot::",
     ),
+    Mutation(
+        name="a-socket-path-too-long-for-the-kernel-is-accepted",
+        file="crates/core/src/paths.rs",
+        old="""    if len <= SUN_PATH_MAX {""",
+        new="""    if len <= SUN_PATH_MAX + 1 {""",
+        defect=(
+            "The socket-path budget is off by one, so a vm_dir whose vsock path "
+            "is exactly one byte over the kernel's sun_path limit is accepted. "
+            "Firecracker then cannot bind, and the run fails ten seconds later "
+            "as a timeout naming the path but not the reason — the exact "
+            "failure this guard exists to replace."
+        ),
+        package="isopod-core",
+        filter="paths::",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

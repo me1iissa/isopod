@@ -34,6 +34,33 @@ kernel and carries a control that must be rejected — a substring search over a
 gains a *Warm resume* section stating what one memory image resumed many times
 does and does not share.
 
+### Fixed — a deep `$ISOPOD_HOME` failed as an unexplained ten-second timeout
+
+A Unix socket path cannot exceed 107 bytes, and isopod puts Firecracker's API
+socket and the guest-agent vsock inside `$ISOPOD_HOME/vms/<vm-id>/`. Past that
+depth `bind` fails inside Firecracker, the process exits 1, and isopod waited the
+full **ten seconds** for a socket that would never appear before reporting a
+timeout that named the path but not the reason:
+
+```
+Firecracker API socket …/vms/dev-96965fa0/api.sock did not become ready within
+10000 ms (process exited: exit status: 1)
+```
+
+Nothing in that says "your home directory is too long", and the run costs ten
+seconds to find out. Both spawn paths now check before creating anything and
+refuse in **6 ms** with the length, the limit, and how many bytes to remove:
+
+```
+the VM directory … is too deep for a Unix socket: its vsock path is 170 bytes and
+the kernel's limit is 107 … Shorten $ISOPOD_HOME by at least 63 bytes (it is
+currently 142 bytes) or leave it unset to use ~/.isopod
+```
+
+The limit was measured rather than read off a header — binding at successively
+deeper paths fails at exactly 108 — and the test asserts both sides of the
+boundary. Found by the competitive audit's dogfood pass.
+
 ### Added — snapshots are integrity-checked before they are resumed
 
 Stages were content-addressed with blake3; snapshots recorded sizes and nothing

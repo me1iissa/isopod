@@ -83,6 +83,57 @@ pub fn vms_dir() -> Result<PathBuf> {
     ensure_dir(isopod_home()?.join("vms"))
 }
 
+/// The kernel's hard limit on a Unix-domain socket path: `sun_path` is 108
+/// bytes including its NUL terminator, so 107 usable bytes.
+///
+/// Measured, not read off a header: binding at successively deeper paths fails
+/// at exactly 108.
+const SUN_PATH_MAX: usize = 107;
+
+/// The longest basename isopod appends inside a VM directory (`vsock.sock`;
+/// `api.sock` is shorter).
+const LONGEST_SOCKET_NAME: &str = "/vsock.sock";
+
+/// Refuse a VM directory whose sockets would not fit in `sun_path`.
+///
+/// Firecracker's API socket and the guest-agent vsock both live inside the VM
+/// directory, so a deep `$ISOPOD_HOME` silently pushes them past the kernel's
+/// limit. The failure is invisible at the point it happens: `bind` fails inside
+/// Firecracker, the process exits 1, and isopod waits the full **ten seconds**
+/// for a socket that will never appear before reporting a timeout that names
+/// the path but not the reason. This turns that into an immediate, specific
+/// refusal.
+///
+/// # Errors
+/// If `<vm_dir>/vsock.sock` would exceed the kernel's 107-byte limit.
+pub fn check_socket_path_fits(vm_dir: &Path) -> Result<()> {
+    let len = socket_path_len(vm_dir);
+    if len <= SUN_PATH_MAX {
+        return Ok(());
+    }
+    let over = len - SUN_PATH_MAX;
+    anyhow::bail!(
+        "the VM directory {} is too deep for a Unix socket: its vsock path is {len} bytes and \
+         the kernel's limit is {SUN_PATH_MAX}, so Firecracker cannot bind and the run would \
+         fail as an unexplained timeout. Shorten $ISOPOD_HOME by at least {over} bytes (it is \
+         currently {home} bytes) or leave it unset to use ~/.isopod",
+        vm_dir.display(),
+        home = vm_dir
+            .parent()
+            .and_then(Path::parent)
+            .map_or(0, |p| p.as_os_str().len()),
+    )
+}
+
+/// Byte length of the longest socket path isopod will create inside `vm_dir`.
+///
+/// Pure, so the arithmetic is testable without building a directory tree that
+/// deep — which is the only reason this boundary went unnoticed.
+#[must_use]
+fn socket_path_len(vm_dir: &Path) -> usize {
+    vm_dir.as_os_str().len() + LONGEST_SOCKET_NAME.len()
+}
+
 /// `~/.isopod/snapshots` — warm-pool snapshot artifacts (M6). Created on demand.
 pub fn snapshots_dir() -> Result<PathBuf> {
     ensure_dir(isopod_home()?.join("snapshots"))
@@ -100,6 +151,49 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The exact boundary, asserted rather than assumed. 107 bytes bind; 108
+    /// does not — measured by binding at successively deeper paths.
+    #[test]
+    fn the_socket_budget_is_the_kernels_and_not_a_guess() {
+        // A vm_dir whose vsock path lands exactly on the limit is allowed.
+        let exact = "x".repeat(SUN_PATH_MAX - LONGEST_SOCKET_NAME.len());
+        let dir = std::path::PathBuf::from(&exact);
+        assert_eq!(socket_path_len(&dir), SUN_PATH_MAX);
+        assert!(check_socket_path_fits(&dir).is_ok(), "107 bytes must fit");
+
+        // One byte more must not.
+        let over = std::path::PathBuf::from(format!("{exact}y"));
+        assert_eq!(socket_path_len(&over), SUN_PATH_MAX + 1);
+        assert!(check_socket_path_fits(&over).is_err(), "108 bytes must not");
+    }
+
+    /// The refusal has to be actionable: the failure it replaces named the path
+    /// and nothing else, which is why it cost ten seconds and a head-scratch.
+    #[test]
+    fn the_refusal_says_how_much_too_long_and_what_to_change() {
+        let dir = std::path::PathBuf::from(format!("/{}/vms/dev-0123abcd", "d".repeat(120)));
+        let err = check_socket_path_fits(&dir).unwrap_err().to_string();
+        assert!(err.contains("ISOPOD_HOME"), "names the knob: {err}");
+        assert!(err.contains("Shorten"), "says what to do: {err}");
+        assert!(err.contains("107"), "names the limit: {err}");
+        assert!(
+            err.contains("unexplained timeout"),
+            "connects it to the symptom the operator actually sees: {err}"
+        );
+    }
+
+    /// The default home must not be anywhere near the limit — if it were, this
+    /// guard would refuse ordinary installs.
+    #[test]
+    fn the_default_home_leaves_ample_room() {
+        let dir =
+            std::path::PathBuf::from("/home/a-reasonably-long-username/.isopod/vms/dev-0123abcd");
+        assert!(
+            check_socket_path_fits(&dir).is_ok(),
+            "a normal home must not trip the guard"
+        );
+    }
+
     use super::*;
 
     #[test]
