@@ -303,7 +303,9 @@ fn apply_bind(root: &Path, src: &Path, writable: bool) -> io::Result<()> {
     sys::bind_mount(src_s, dst_s)
         .map_err(|e| sys::annotate(e, &format!("bind {} -> {}", src.display(), dst.display())))?;
     if !writable {
-        sys::remount_readonly(dst_s)
+        // Recursive, because the bind above is recursive. A single remount would
+        // leave every submount of a read-only bind writable, silently.
+        sys::remount_readonly_recursive(dst_s)
             .map_err(|e| sys::annotate(e, &format!("remount {} read-only", dst.display())))?;
     }
     Ok(())

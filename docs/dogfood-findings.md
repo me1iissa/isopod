@@ -975,6 +975,101 @@ flowchart LR
     opens — and the remedy is re-running `sudo isopod setup`, which is the same
     doctrine already published for a flushed nftables ruleset.
 
+52. **[fixed in 0.18.0] HIGH — every submount of a read-only jail bind was
+    writable.** The jail binds `~/.isopod` read-only, and that tree holds the
+    stage store and the guest images. `bind_mount` uses `MS_REC`, so the bind
+    carries submounts with it — but `MS_REMOUNT | MS_RDONLY` applies to exactly
+    one mount, so every submount stayed writable. Measured in a disposable guest
+    rather than reasoned about: bind a tree containing a tmpfs, remount the top
+    read-only, and a write to the top is refused while a write to the submount
+    succeeds and the file's contents change.
+
+    | | |
+    |---|---|
+    | write to the top of a read-only bind | refused |
+    | write to a **submount** of it | **succeeded** |
+
+    A submount under `~/.isopod` is not exotic — a separate disk for images, a
+    tmpfs, an encrypted volume. The jail exists to contain a compromised
+    Firecracker, and that process could have written to a stage layer every later
+    run forks. → FIX: `remount_readonly_recursive` uses `mount_setattr(2)` with
+    `AT_RECURSIVE` — the kernel walks the tree itself, in one atomic call — and
+    falls back on a pre-5.12 kernel to reading `/proc/self/mountinfo` and
+    remounting every mount at or beneath the target, **deepest first** so a
+    parent cannot shadow a child. Fails closed either way. See #53 for what the
+    first version of that fallback got wrong.
+
+    Found because the jail's syscall layer had **no unit tests at all** — 21
+    `unsafe` blocks covered only by one `#[ignore]`d integration test that, until
+    the day before, ran nowhere but a maintainer's laptop. The parser is now pure
+    and unit-tested, including the two ways it can be subtly wrong: matching on
+    raw prefix (which would remount unrelated host mounts read-only) and
+    comparing mountinfo's octal-escaped paths without decoding them (which would
+    miss a submount under any directory with a space in its name).
+
+53. **[fixed in 0.18.0] HIGH — the fix for #52 could not start a jail on a host
+    whose mount table held a `nosuid`/`nodev`/`noexec` mount.** Caught by the
+    live suite on the branch — not by review, not by the local gate, and not by
+    the eight unit tests written for #52, every one of which passed.
+
+    ```
+    isopod-jail: child setup failed: remount <root>/ read-only:
+      remounting <root>/proc/sys/fs/binfmt_misc read-only: Operation not permitted
+    ```
+
+    A mount inherited into a new user namespace has its `nosuid`, `nodev` and
+    `noexec` bits **locked** (`mount_namespaces(7)`). A remount that does not
+    name them again reads as an attempt to *clear* them, and the kernel answers
+    `EPERM`. The top-level bind remounts fine because the jail created it and it
+    carries no locked bits — which is exactly why this passed on a maintainer's
+    laptop and failed on a hosted runner. It is a property of the **host's mount
+    table**, not of the code.
+
+    Measured in a nested user namespace rather than reasoned about:
+
+    | remount of a `nosuid,nodev,noexec` submount | result |
+    |---|---|
+    | `MS_RDONLY` alone | `EPERM` |
+    | `MS_RDONLY` + the three flags passed back | ok, and the mount is `ro` |
+
+    → FIX: `mount_setattr(2)` with `AT_RECURSIVE` only ever *adds*
+    `MOUNT_ATTR_RDONLY` and clears nothing, so it cannot engage the rule at all.
+    Atime needs no help either way — `mount(2)` preserves it for a remount that
+    names no atime flag, so repeating it could only add a way to get it wrong.
+
+    **The pre-5.12 fallback then failed the same way a second time**, on the same
+    mount, for a different reason — and the second reason is the interesting one.
+    Reading each mount's flags out of its mountinfo line looks obviously correct
+    and is not: **two mounts can share one mount point**, and a remount by path
+    reaches only the topmost. `/proc/sys/fs/binfmt_misc` is exactly that shape on
+    a hosted runner — a systemd autofs with the real filesystem mounted over it —
+    so the walk applied the *lower* mount's flags to the *upper* mount:
+
+    ```
+    /tmp/dst/sub  rw,relatime                     keep=0   <- lower
+    /tmp/dst/sub  rw,nosuid,nodev,noexec,relatime  keep=14  <- topmost
+    remount /tmp/dst/sub keep=0  -> EPERM
+    remount /tmp/dst/sub keep=14 -> ok
+    ```
+
+    The fallback now asks `statvfs(2)` for the flags instead. It resolves a path
+    exactly as `mount(2)` does, so it always describes the mount about to be
+    remounted — the correlation problem cannot arise. mountinfo is left to do the
+    one job it can do reliably: enumerate which paths exist.
+
+    Reproduced locally by stacking two tmpfs mounts at one path inside a user
+    namespace and running the real jail binary against it: the committed code
+    fails at that path, the fix passes.
+
+    The fallback is now forced by an environment variable in the live probe, so
+    both paths run on every host that can run the probe at all, instead of the
+    older one running only on machines nobody tests on. The probe also gained the
+    assertion #52 never had: that a *submount* of the read-only bind is read-only
+    (`/dev/shm`, which is both a tmpfs under `/` and `nosuid,nodev`, so it covers
+    the recursion and the locked-flag rule at once). Both mechanisms were then
+    broken on purpose to confirm the probe fails — dropping the flags reproduces
+    the `EPERM` above, and dropping `AT_RECURSIVE` reproduces #52's writable hole.
+
 **Checked and found sound**: the tap teardown was reported exactly right — the
 error named WSL2 as the likely cause, named `sudo isopod setup` as the fix, and
 offered `--no-network` as the alternative, which is what made the offline route

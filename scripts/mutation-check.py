@@ -520,6 +520,50 @@ MUTATIONS = [
         package="isopod-core",
         filter="image::rootfs",
     ),
+    Mutation(
+        name="a-read-only-bind-sweeps-in-unrelated-host-mounts",
+        file="crates/jail/src/sys.rs",
+        old="""            let under = decoded == target
+                || decoded
+                    .strip_prefix(target)
+                    .is_some_and(|rest| rest.starts_with('/'));""",
+        new="""            let under = decoded.starts_with(target);""",
+        defect=(
+            "The submount search matches on raw prefix instead of a path "
+            "boundary, so binding `~/.isopod` read-only also remounts "
+            "`~/.isopod-other` and `~/.isopodx` read-only — mounts the jail was "
+            "never given, on the host, outside the jail's tree. A hardening "
+            "opt-in that silently makes unrelated host filesystems read-only is "
+            "worse than the hole it closes, and the failure would surface as "
+            "some other program mysteriously losing write access."
+        ),
+        package="isopod-jail",
+        # The jail's tests live in its binary target, so the suite must be run
+        # with --bins for the harness to name the test that caught this.
+        target="--bins",
+    ),
+    Mutation(
+        name="a-read-only-remount-drops-a-flag-the-kernel-locked",
+        file="crates/jail/src/sys.rs",
+        old="""    if f_flag & libc::ST_NOSUID != 0 {
+        keep |= libc::MS_NOSUID;
+    }""",
+        new="""    if f_flag & libc::ST_NOSUID != 0 {
+        keep |= libc::MS_NODEV;
+    }""",
+        defect=(
+            "The flags handed back to a bind remount mistranslate `nosuid`, so a "
+            "nosuid mount is remounted without it. A mount inherited into a user "
+            "namespace has that bit locked, so the remount reads as an attempt to "
+            "clear it and the kernel refuses with EPERM — the jail cannot start at "
+            "all on any host whose mount table holds a nosuid mount under the "
+            "bind. This shipped once: it passed the local gate and the "
+            "pull-request gate, and was caught only by the live suite on a hosted "
+            "runner."
+        ),
+        package="isopod-jail",
+        target="--bins",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

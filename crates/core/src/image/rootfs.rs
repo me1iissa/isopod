@@ -65,6 +65,14 @@ const IMAGE_EPOCH: &str = "315532800";
 // `<branch>/main/x86_64/` for `apk-tools-static-*.apk` and `alpine-keys-*.apk`,
 // download each, run `sha256sum`, and re-pin the four constants below. The package
 // set is a rolling reference of what that branch ships — no digest to bump there.
+//
+// These pins also rot on their own, without anyone touching the branch. Alpine's
+// CDN serves only the *current* revision of each package, so the moment a package
+// is rebuilt the pinned file stops existing and the download 404s — which is what
+// took `apk-tools-static-3.0.6-r0` out from under this build. That is the pin
+// working as intended (a digest that could silently follow a moving file would be
+// no pin at all), so the answer is always to re-pin against the listing, never to
+// stop verifying. [`fetch_apk_static`] says so in the error.
 
 /// Pinned Alpine stable branch for the `base-alpine` flavor.
 const ALPINE_BRANCH: &str = "v3.24";
@@ -72,10 +80,10 @@ const ALPINE_BRANCH: &str = "v3.24";
 const ALPINE_CDN: &str = "https://dl-cdn.alpinelinux.org/alpine";
 
 /// `apk-tools-static` package version (ships the static `apk.static` bootstrapper).
-const APK_TOOLS_STATIC_VERSION: &str = "3.0.6-r0";
+const APK_TOOLS_STATIC_VERSION: &str = "3.0.7-r0";
 /// sha256 of `apk-tools-static-<version>.apk` under `<branch>/main/x86_64/`.
 const APK_TOOLS_STATIC_SHA256: &str =
-    "a62f54609910d1eb23d8ebcf69dd7954280fe76047452bb88410122cbca14a6e";
+    "ed1c5e82177844249b7c4ecc2653b78eed096be20496b7fb860a9e165b2e5ce1";
 /// `alpine-keys` package version (the repository-signing public keys).
 const ALPINE_KEYS_VERSION: &str = "2.6-r0";
 /// sha256 of `alpine-keys-<version>.apk` under `<branch>/main/x86_64/`.
@@ -1067,13 +1075,31 @@ fn enumerate_busybox_applets(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// What a failed download of a pinned bootstrap package almost always means, and
+/// what to do about it.
+///
+/// Alpine's CDN serves only the *current* revision of each package, so a pin goes
+/// 404 the moment that package is rebuilt — with nothing in this repository having
+/// changed. Without this, the build reports a bare HTTP status and reads like a
+/// network fault or a compromised mirror rather than a pin that needs bumping.
+fn pin_rot_hint(package: &str, const_prefix: &str) -> String {
+    format!(
+        "fetching the pinned {package}. A 404 here means the pin was superseded, not \
+         that anything is wrong: Alpine's CDN keeps only the current revision of each \
+         package. List {ALPINE_CDN}/{ALPINE_BRANCH}/main/x86_64/ for the \
+         {package}-*.apk it serves now, then re-pin {const_prefix}_VERSION and \
+         {const_prefix}_SHA256 to it. Do not stop verifying the digest"
+    )
+}
+
 /// Download the pinned `apk-tools-static` package, verify its sha256, extract the
 /// static `apk.static` binary into `work`, and return its path.
 fn fetch_apk_static(work: &Path) -> Result<PathBuf> {
     let file = format!("apk-tools-static-{APK_TOOLS_STATIC_VERSION}.apk");
     let url = format!("{ALPINE_CDN}/{ALPINE_BRANCH}/main/x86_64/{file}");
     let apk = work.join(&file);
-    download_verified(&url, APK_TOOLS_STATIC_SHA256, &apk)?;
+    download_verified(&url, APK_TOOLS_STATIC_SHA256, &apk)
+        .with_context(|| pin_rot_hint("apk-tools-static", "APK_TOOLS_STATIC"))?;
     extract_member(&apk, work, "sbin/apk.static")?;
     let bin = work.join("sbin/apk.static");
     set_exec(&bin)?;
@@ -1091,7 +1117,8 @@ fn fetch_alpine_keys(work: &Path) -> Result<PathBuf> {
     let file = format!("alpine-keys-{ALPINE_KEYS_VERSION}.apk");
     let url = format!("{ALPINE_CDN}/{ALPINE_BRANCH}/main/x86_64/{file}");
     let apk = work.join(&file);
-    download_verified(&url, ALPINE_KEYS_SHA256, &apk)?;
+    download_verified(&url, ALPINE_KEYS_SHA256, &apk)
+        .with_context(|| pin_rot_hint("alpine-keys", "ALPINE_KEYS"))?;
     extract_member(&apk, work, "etc/apk/keys")?;
     let keys = work.join("etc/apk/keys");
     if !keys.is_dir() {

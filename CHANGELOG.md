@@ -6,6 +6,96 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.18.0] — 2026-07-30
+
+> **Releases 0.15.0 through 0.17.0 were never tagged or published.** They landed
+> on `main` as steps of one piece of work and are kept below as the record of what
+> changed when. This is the version that ships them; if you are upgrading from
+> 0.14.0, read those sections too — they describe behaviour in this release.
+
+### Fixed — every submount of a read-only jail bind was writable
+
+The rootless jail binds `~/.isopod` read-only, and that tree holds the stage store
+and the guest images. `bind_mount` uses `MS_REC`, so the bind carries its
+submounts with it — but `MS_REMOUNT | MS_RDONLY` applies to exactly **one** mount,
+so every submount stayed writable.
+
+Measured rather than reasoned about, in a disposable guest: bind a tree containing
+a tmpfs, remount the top read-only, and a write to the top is refused while a
+write to the submount succeeds and the file's contents change.
+
+A submount under `~/.isopod` is not exotic — a separate disk for images, a tmpfs,
+an encrypted volume. The jail exists to contain a compromised Firecracker, and
+that process could have written to a stage layer every later run forks.
+
+`remount_readonly_recursive` now makes the whole tree read-only, and **fails
+closed**: a jail that cannot prove the tree is read-only must not report that it
+is. It prefers `mount_setattr(2)` with `AT_RECURSIVE`, where the kernel walks the
+tree itself in one atomic call. On a kernel older than 5.12 it falls back to
+reading `/proc/self/mountinfo` and remounting each mount in turn, deepest first.
+Dogfood finding #52.
+
+That fallback has to hand each mount its own flags back. A mount inherited into a
+new user namespace has `nosuid`, `nodev` and `noexec` **locked**
+(`mount_namespaces(7)`), and a remount that does not name them again reads as an
+attempt to clear them — `EPERM`. The first version of this fix omitted them and
+could not start a jail at all on a host whose mount table happened to contain
+such a mount under the bind; it was caught by the live suite on the branch, on a
+hosted runner, after passing on a maintainer's laptop and in the pull-request
+gate. `mount_setattr` sidesteps the rule entirely by only ever *adding* the
+read-only attribute. Dogfood finding #53.
+
+The flags come from `statvfs(2)`, not from the mount's line in
+`/proc/self/mountinfo`. Those are not the same thing: **two mounts can share one
+mount point** — a systemd autofs with the real filesystem mounted over it, which
+is exactly what `/proc/sys/fs/binfmt_misc` is on a hosted runner — and a remount
+by path reaches only the topmost. Reading flags off a mountinfo line applied the
+lower mount's flags to the upper mount and earned the same `EPERM` a second time.
+`statvfs` resolves a path the way `mount` does, so it always describes the mount
+about to be remounted; mountinfo is left to enumerate paths, which is the one job
+it can do reliably.
+
+`ISOPOD_JAIL_FORCE_REMOUNT_WALK=1` forces the fallback path. It exists so the
+live probe can exercise both implementations on any host, rather than leaving the
+older one to run only where nobody tests; it selects which implementation makes
+the tree read-only, never whether it is made read-only.
+
+### Fixed — the pinned Alpine bootstrap package stopped existing
+
+Building the `base-alpine` guest image began failing with a bare 404 for
+`apk-tools-static-3.0.6-r0.apk`. Nothing here changed: Alpine's CDN serves only
+the *current* revision of each package, so a pin goes 404 the moment upstream
+rebuilds it — here, `3.0.7-r0` shipped and took `3.0.6-r0` with it.
+
+That is the pin doing its job. A digest that could quietly follow a moving file
+would be no pin at all, so the fix is to re-pin, never to stop verifying. Bumped
+to `3.0.7-r0` and its sha256, with the new `apk.static` checked to still be a
+static x86_64 ELF at the expected path in the package.
+
+Both bootstrap downloads now explain this when they fail, instead of reporting an
+HTTP status that reads like a network fault or a compromised mirror: the error
+names the listing to check and the two constants to re-pin.
+
+### Added — the jail's syscall layer has unit tests
+
+It had none. Twenty-one `unsafe` blocks, covered only by a single `#[ignore]`d
+integration test which — until the day before this — ran nowhere but a
+maintainer's laptop and needs a privilege CI can withdraw. A security boundary in
+a sandbox for untrusted code has to be checked in the pull-request gate, on every
+change, without needing privilege.
+
+The mountinfo parser is pure and tested, including the ways it can be subtly
+wrong. Matching on raw prefix would make `~/.isopod-other` and `~/.isopodx` read-only
+too — unrelated host mounts, outside the jail, silently losing write access.
+mountinfo octal-escapes its mount points, so comparing the raw text would miss
+a submount under any directory with a space in its name. And a mount point can
+appear twice, so it is listed once — the duplicate names the same reachable mount.
+
+The live probe now asserts what it never did: that a *submount* of the read-only
+bind is read-only, checked against `/dev/shm` — a tmpfs under `/` that is also
+`nosuid,nodev`, so one assertion covers both the recursion and the locked-flag
+rule. It runs the jail twice, once per implementation.
+
 ## [0.17.0] — 2026-07-30
 
 ### Fixed — a guest that never took its resolver said nothing about it
