@@ -6,6 +6,57 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.20.0] — 2026-08-03
+
+Two findings from a competitive audit against another Firecracker sandbox, both
+against isopod rather than the competitor. The audit's headline was that isopod
+**escapes** the identical-entropy-after-fork bug that sandbox ships — but only by
+a property it inherits and never asserted, and one that would disappear silently.
+
+### Added — the guest kernel must be able to reseed after a fork
+
+isopod's warm pool resumes one memory image many times. What stops those
+sandboxes sharing a CSPRNG is not isopod's code — there is none — but
+Firecracker's VMGenID device plus a `CONFIG_VMGENID` guest kernel, which reseeds
+when the generation counter changes. Measured across three warm resumes of a
+five-day-old snapshot: `boot_id`, `/dev/urandom`, stack ASLR, and Python's
+`random`, `os.urandom` and `ssl.RAND_bytes` all differed.
+
+The problem was that nothing said so. A kernel without the option would resume
+every warm sandbox with the CSPRNG state frozen into the snapshot, **every resume
+would still succeed and no test would fail** — and `fetch-kernel --allow-unpinned`
+selects whatever the CI bucket currently offers, so this was a live path.
+
+`fetch-kernel` now refuses to install a kernel with no VMGenID reseed path, naming
+`CONFIG_VMGENID` and the consequence. A live test asserts it for every installed
+kernel and carries a control that must be rejected — a substring search over a
+40 MB binary is exactly the shape that quietly matches everything. `SECURITY.md`
+gains a *Warm resume* section stating what one memory image resumed many times
+does and does not share.
+
+### Added — snapshots are integrity-checked before they are resumed
+
+Stages were content-addressed with blake3; snapshots recorded sizes and nothing
+else, and the resume path checked only that three files existed. On the unjailed
+default path, anything able to write `~/.isopod/snapshots/*/memfile` had code
+execution in every later warm run.
+
+`meta.json` now records a blake3 of both artifacts. `vmstate` — which carries the
+vCPU register state the guest resumes at — is digested in full on every resume.
+The memory file is checked for identity rather than content, and the reason is
+measured, not assumed: blake3 runs at **1.59 GiB/s** here, so digesting a 512 MiB
+memory file costs **315 ms** and a 3 GiB one about **1.9 s**, against a ~49 ms
+resume and the ~410 ms cold boot that resume exists to beat. Verifying every byte
+on the hot path would make the warm path slower than the path it replaces.
+
+`ISOPOD_VERIFY_SNAPSHOT=1` digests both files in full for anyone who wants to pay
+that. The honest boundary is asserted rather than described: one test proves a
+restored mtime defeats the fast check while the full check still catches it.
+
+Verification failures are **not** run failures. An unverifiable or legacy
+snapshot is rebuilt and the run cold-boots, so the fail-closed direction costs one
+cold boot rather than an error.
+
 ## [0.19.0] — 2026-08-03
 
 > **Releases 0.15.0 through 0.18.0 were never tagged or published.** They landed

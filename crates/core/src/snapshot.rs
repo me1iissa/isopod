@@ -284,9 +284,155 @@ impl SnapshotArtifacts {
     }
 
     /// Whether all three files are present (a complete, resumable snapshot).
+    ///
+    /// Presence only. Ask [`is_usable`](Self::is_usable) before resuming.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.vmstate.is_file() && self.memfile.is_file() && self.meta.is_file()
+    }
+
+    /// Whether this snapshot is present **and** matches the digests recorded
+    /// when it was built.
+    ///
+    /// This is the question every reuse site should ask. A `false` here is not
+    /// an error the caller has to handle: `ensure` rebuilds and `resume`
+    /// declines, so an unverifiable snapshot costs one cold boot rather than a
+    /// failed run. Fail closed, toward the slow path.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.verify(Integrity::Fast).is_ok()
+    }
+
+    /// Check the artifacts against `meta.json` at `level`, returning the
+    /// verified metadata.
+    ///
+    /// # Errors
+    /// If a file is missing, the metadata cannot be read, the snapshot predates
+    /// digests, or any recorded size, mtime or digest does not match.
+    pub fn verify(&self, level: Integrity) -> Result<SnapshotMeta> {
+        if !self.is_complete() {
+            bail!("snapshot at {} is incomplete", self.dir.display());
+        }
+        let raw = std::fs::read_to_string(&self.meta)
+            .with_context(|| format!("reading {}", self.meta.display()))?;
+        let meta: SnapshotMeta = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", self.meta.display()))?;
+
+        // Written before digests existed. Not a tamper signal and not worth an
+        // alarming message — it just cannot be checked, so it is not trusted.
+        if meta.vmstate_b3.is_empty() || meta.memfile_b3.is_empty() {
+            bail!(
+                "snapshot at {} predates integrity digests and will be rebuilt",
+                self.dir.display()
+            );
+        }
+
+        let vmstate_len = std::fs::metadata(&self.vmstate)
+            .with_context(|| format!("stat {}", self.vmstate.display()))?
+            .len();
+        if vmstate_len != meta.vmstate_bytes {
+            bail!(
+                "vmstate at {} is {vmstate_len} bytes, meta.json records {}",
+                self.vmstate.display(),
+                meta.vmstate_bytes
+            );
+        }
+
+        // Always digested in full: it is small, and it carries the register
+        // state the guest resumes at.
+        let vmstate_b3 = digest_file(&self.vmstate)?;
+        if vmstate_b3 != meta.vmstate_b3 {
+            bail!(
+                "vmstate at {} does not match its recorded digest",
+                self.vmstate.display()
+            );
+        }
+
+        let mem_meta = std::fs::metadata(&self.memfile)
+            .with_context(|| format!("stat {}", self.memfile.display()))?;
+        if mem_meta.len() != meta.memfile_bytes {
+            bail!(
+                "memory file at {} is {} bytes, meta.json records {}",
+                self.memfile.display(),
+                mem_meta.len(),
+                meta.memfile_bytes
+            );
+        }
+
+        match level {
+            Integrity::Full => {
+                let memfile_b3 = digest_file(&self.memfile)?;
+                if memfile_b3 != meta.memfile_b3 {
+                    bail!(
+                        "memory file at {} does not match its recorded digest",
+                        self.memfile.display()
+                    );
+                }
+            }
+            Integrity::Fast => {
+                let mtime_ns = mtime_ns(&mem_meta);
+                if mtime_ns != meta.memfile_mtime_ns {
+                    bail!(
+                        "memory file at {} was modified after it was digested",
+                        self.memfile.display()
+                    );
+                }
+            }
+        }
+        Ok(meta)
+    }
+}
+
+/// A file's mtime in nanoseconds since the epoch, or `0` if the platform or
+/// filesystem will not report one (in which case the recorded value is `0` too
+/// and the comparison still holds).
+fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// blake3 of `path`, hex-encoded.
+///
+/// Buffered rather than read-to-end: these files run to several gigabytes and
+/// the digest must not need them resident.
+fn digest_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to digest", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; DIGEST_BUF_LEN];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("digesting {}", path.display())))
+            }
+        };
+    }
+    Ok(hex::encode(hasher.finalize().as_bytes()))
+}
+
+/// Read size for [`digest_file`].
+const DIGEST_BUF_LEN: usize = 1 << 20;
+
+/// Opt into digesting the whole memory file on every resume.
+const VERIFY_ENV: &str = "ISOPOD_VERIFY_SNAPSHOT";
+
+/// How hard the resume path checks, honouring [`VERIFY_ENV`].
+///
+/// [`Integrity::Full`] costs a full read of the memory file — hundreds of
+/// milliseconds to seconds — on a path whose whole purpose is to be faster than
+/// a ~410 ms cold boot. It is offered rather than imposed, and the honest
+/// default is [`Integrity::Fast`] plus `ISOPOD_JAIL=1` for anyone whose threat
+/// model includes a writer on the host.
+fn hot_path_integrity() -> Integrity {
+    match std::env::var(VERIFY_ENV).as_deref() {
+        Ok("1") => Integrity::Full,
+        _ => Integrity::Fast,
     }
 }
 
@@ -315,6 +461,51 @@ pub struct SnapshotMeta {
     pub vmstate_bytes: u64,
     /// Size of the memory file in bytes.
     pub memfile_bytes: u64,
+    /// blake3 of the vmstate file, hex. Empty on snapshots written before
+    /// digests existed, which are treated as unusable and rebuilt.
+    #[serde(default)]
+    pub vmstate_b3: String,
+    /// blake3 of the memory file, hex. See [`Integrity`] for when it is checked.
+    #[serde(default)]
+    pub memfile_b3: String,
+    /// The memory file's mtime when it was digested, in nanoseconds since the
+    /// epoch. The hot path cannot re-read a multi-gigabyte file, so it checks
+    /// that this is the same file it hashed rather than that the bytes still
+    /// hash the same. See [`Integrity::Fast`].
+    #[serde(default)]
+    pub memfile_mtime_ns: u128,
+}
+
+/// How thoroughly to check a snapshot's artifacts against its recorded digests.
+///
+/// The two levels exist because the two files are nothing alike. `vmstate` is
+/// tens of kilobytes and carries the vCPU register state — including the
+/// instruction pointer the guest resumes at — so digesting it costs microseconds
+/// and defends the most direct path to execution. The memory file is 512 MiB to
+/// several GiB and Firecracker **mmaps** it: a resume demand-pages only what the
+/// guest touches. Digesting it in full would force reading every byte the design
+/// exists not to read.
+///
+/// Measured on the reference host: blake3 runs at **1.59 GiB/s**, so a full
+/// digest costs **315 ms** for a 512 MiB memory file and about **1.9 s** for a
+/// 3 GiB one — against a ~49 ms resume and the ~410 ms cold boot that resume
+/// exists to beat. Verifying every byte on the hot path would make the warm path
+/// slower than the path it replaces, which is why the two levels are split
+/// rather than one being simply better.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Integrity {
+    /// The hot path. `vmstate` is digested in full; the memory file is checked
+    /// for identity — same size, same mtime as when it was hashed.
+    ///
+    /// Honest about what that is worth: identity detects truncation, a partial
+    /// or crashed write, and any ordinary process writing to the file. It does
+    /// **not** detect an attacker who restores the metadata afterwards. The
+    /// durable containment for a hostile writer is `ISOPOD_JAIL=1`, whose
+    /// read-only bind of `~/.isopod` denies the write outright.
+    Fast,
+    /// Both files digested in full. Used by `ISOPOD_VERIFY_SNAPSHOT=1` and by
+    /// explicit verification, where paying the read is the point.
+    Full,
 }
 
 // ===========================================================================
@@ -369,7 +560,7 @@ async fn ensure_at(
     ctx: &BuildCtx<'_>,
     wait: Duration,
 ) -> Result<(SnapshotArtifacts, bool)> {
-    if artifacts.is_complete() {
+    if artifacts.is_usable() {
         return Ok((artifacts, false));
     }
 
@@ -391,7 +582,7 @@ async fn ensure_at(
             // while we waited — that is the good case, and the whole point of
             // waiting: this run gets the snapshot it would otherwise have built
             // a second copy of.
-            if artifacts.is_complete() {
+            if artifacts.is_usable() {
                 return Ok((artifacts, false));
             }
             // Otherwise somebody has been building for longer than the wait
@@ -411,7 +602,7 @@ async fn ensure_at(
     // The wait may have been spent watching the winner finish. Re-check under
     // the lock: a second arrival should end up *using* the snapshot, not
     // building a second one over the top of it.
-    if artifacts.is_complete() {
+    if artifacts.is_usable() {
         return Ok((artifacts, false));
     }
 
@@ -763,9 +954,13 @@ fn write_meta(key: &SnapshotKey, artifacts: &SnapshotArtifacts) -> Result<()> {
     let vmstate_bytes = std::fs::metadata(&artifacts.vmstate)
         .map(|m| m.len())
         .unwrap_or(0);
-    let memfile_bytes = std::fs::metadata(&artifacts.memfile)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // Digest before stat-ing mtime, so the recorded mtime is never older than
+    // the bytes that were hashed.
+    let vmstate_b3 = digest_file(&artifacts.vmstate)?;
+    let memfile_b3 = digest_file(&artifacts.memfile)?;
+    let mem_meta = std::fs::metadata(&artifacts.memfile)
+        .with_context(|| format!("stat {}", artifacts.memfile.display()))?;
+    let memfile_bytes = mem_meta.len();
     let meta = SnapshotMeta {
         key: key.clone(),
         keyhash: key.keyhash(),
@@ -773,6 +968,9 @@ fn write_meta(key: &SnapshotKey, artifacts: &SnapshotArtifacts) -> Result<()> {
         created_unix: now_unix(),
         vmstate_bytes,
         memfile_bytes,
+        vmstate_b3,
+        memfile_b3,
+        memfile_mtime_ns: mtime_ns(&mem_meta),
     };
     let json = serde_json::to_string_pretty(&meta).context("serializing snapshot meta")?;
     let tmp = artifacts
@@ -815,13 +1013,13 @@ pub async fn resume(
     broker: Option<&net::broker::BrokerEndpoints>,
 ) -> Result<(FcProcess, AgentClient)> {
     let artifacts = artifacts_for(key)?;
-    if !artifacts.is_complete() {
-        bail!(
-            "no complete snapshot for key {} at {}",
-            key.keyhash(),
-            artifacts.dir.display()
-        );
-    }
+    // Verified, not merely present. The bytes about to be mapped as guest RAM
+    // and loaded as vCPU state are the most consequential thing isopod reads
+    // from its own store, and on the unjailed path that store is an ordinary
+    // user-writable directory.
+    artifacts
+        .verify(hot_path_integrity())
+        .with_context(|| format!("refusing to resume the snapshot for key {}", key.keyhash()))?;
 
     let vm_id = vm_dir
         .file_name()
@@ -1132,12 +1330,162 @@ mod tests {
             created_unix: 1_700_000_000,
             vmstate_bytes: 4096,
             memfile_bytes: 536_870_912,
+            vmstate_b3: "aa".repeat(32),
+            memfile_b3: "bb".repeat(32),
+            memfile_mtime_ns: 1_700_000_000_123_456_789,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: SnapshotMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.keyhash, meta.keyhash);
         assert_eq!(back.memfile_bytes, 536_870_912);
         assert_eq!(back.key.base, "base-alpine");
+        assert_eq!(back.vmstate_b3, meta.vmstate_b3);
+        assert_eq!(back.memfile_mtime_ns, meta.memfile_mtime_ns);
+    }
+
+    /// A `meta.json` written before digests existed must still parse — it is
+    /// read to decide the snapshot is unusable, and a parse error there would
+    /// surface as a failed run instead of a rebuild.
+    #[test]
+    fn a_meta_written_before_digests_existed_still_parses() {
+        let key = sample_key();
+        let legacy = serde_json::json!({
+            "key": key,
+            "keyhash": key.keyhash(),
+            "summary": key.summary(),
+            "created_unix": 1_700_000_000u64,
+            "vmstate_bytes": 4096u64,
+            "memfile_bytes": 536_870_912u64,
+        });
+        let back: SnapshotMeta = serde_json::from_str(&legacy.to_string()).unwrap();
+        assert!(back.vmstate_b3.is_empty(), "no digest to trust");
+        assert_eq!(back.memfile_mtime_ns, 0);
+    }
+
+    // --- integrity (dogfood finding I3) ---------------------------------
+    //
+    // Every fixture below is written by `write_meta`, the same function the
+    // build path uses. Hand-authored `meta.json` would test a parser against a
+    // shape the writer may not produce.
+
+    /// Build a small but real snapshot: two files and a `meta.json` written by
+    /// the production writer.
+    fn built_snapshot(dir: &Path) -> (SnapshotArtifacts, SnapshotKey) {
+        let a = SnapshotArtifacts::in_dir(dir.join("snap"));
+        std::fs::create_dir_all(&a.dir).unwrap();
+        std::fs::write(&a.vmstate, b"vmstate-bytes-standing-in-for-vcpu-state").unwrap();
+        std::fs::write(&a.memfile, vec![0x5au8; 4096]).unwrap();
+        let key = sample_key();
+        write_meta(&key, &a).unwrap();
+        (a, key)
+    }
+
+    #[test]
+    fn a_freshly_built_snapshot_verifies_at_both_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _k) = built_snapshot(dir.path());
+        a.verify(Integrity::Fast).expect("fast");
+        a.verify(Integrity::Full).expect("full");
+        assert!(a.is_usable());
+    }
+
+    /// `vmstate` carries the register state the guest resumes at, so it is
+    /// digested in full on every resume — the cheapest, most direct defence
+    /// there is. Both levels must refuse a changed byte.
+    #[test]
+    fn a_tampered_vmstate_is_refused_at_every_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _k) = built_snapshot(dir.path());
+        std::fs::write(&a.vmstate, b"vmstate-bytes-standing-in-for-EVIL-state").unwrap();
+        for level in [Integrity::Fast, Integrity::Full] {
+            let err = a.verify(level).unwrap_err().to_string();
+            assert!(err.contains("does not match its recorded digest"), "{err}");
+        }
+        assert!(!a.is_usable());
+    }
+
+    /// The memory file is too large to digest on the hot path, so `Fast` asks
+    /// whether it is the same file rather than whether the bytes still hash the
+    /// same. An in-place rewrite moves the mtime, and that is what it catches.
+    #[test]
+    fn a_rewritten_memory_file_is_caught_by_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _k) = built_snapshot(dir.path());
+        std::fs::write(&a.memfile, vec![0xffu8; 4096]).unwrap();
+        // Pin the mtime forward rather than trusting the filesystem's clock
+        // granularity to distinguish two writes in the same millisecond.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&a.memfile)
+            .unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000)),
+        )
+        .unwrap();
+        let err = a.verify(Integrity::Fast).unwrap_err().to_string();
+        assert!(err.contains("modified after it was digested"), "{err}");
+        assert!(!a.is_usable());
+    }
+
+    /// And the guarantee `Fast` does not give: identical size and a restored
+    /// mtime pass it, while `Full` still catches the content. This is the
+    /// honest boundary of the hot-path check, asserted rather than described.
+    #[test]
+    fn restoring_the_mtime_defeats_fast_but_not_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _k) = built_snapshot(dir.path());
+        let before = std::fs::metadata(&a.memfile).unwrap().modified().unwrap();
+        std::fs::write(&a.memfile, vec![0xffu8; 4096]).unwrap();
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&a.memfile)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(before))
+            .unwrap();
+        drop(f);
+
+        a.verify(Integrity::Fast)
+            .expect("fast cannot see a same-size, same-mtime rewrite — by design");
+        let err = a.verify(Integrity::Full).unwrap_err().to_string();
+        assert!(err.contains("does not match its recorded digest"), "{err}");
+    }
+
+    /// Truncation changes the size, which both levels check before any digest.
+    #[test]
+    fn a_truncated_memory_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _k) = built_snapshot(dir.path());
+        std::fs::write(&a.memfile, vec![0x5au8; 2048]).unwrap();
+        let err = a.verify(Integrity::Fast).unwrap_err().to_string();
+        assert!(err.contains("meta.json records"), "{err}");
+    }
+
+    /// A snapshot from before digests existed is not trusted. It must not be an
+    /// alarming failure either — it costs one cold boot and a rebuild.
+    #[test]
+    fn a_snapshot_without_digests_is_not_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, key) = built_snapshot(dir.path());
+        let legacy = serde_json::json!({
+            "key": key, "keyhash": key.keyhash(), "summary": key.summary(),
+            "created_unix": 1_700_000_000u64,
+            "vmstate_bytes": std::fs::metadata(&a.vmstate).unwrap().len(),
+            "memfile_bytes": std::fs::metadata(&a.memfile).unwrap().len(),
+        });
+        std::fs::write(&a.meta, legacy.to_string()).unwrap();
+        assert!(!a.is_usable());
+        let err = a.verify(Integrity::Fast).unwrap_err().to_string();
+        assert!(err.contains("predates integrity digests"), "{err}");
+    }
+
+    /// The env hook selects how hard the resume path checks, and defaults to
+    /// the level that keeps a warm resume faster than the cold boot it replaces.
+    #[test]
+    fn the_hot_path_defaults_to_fast() {
+        // Not asserted against the process environment, which other tests
+        // share; the mapping itself is the contract.
+        assert_eq!(hot_path_integrity(), Integrity::Fast);
     }
 
     // --- the build lock (dogfood finding #32) ---------------------------
@@ -1152,6 +1500,17 @@ mod tests {
     fn artifacts_in(dir: &Path) -> SnapshotArtifacts {
         std::fs::create_dir_all(dir).expect("mkdir");
         SnapshotArtifacts::in_dir(dir.to_path_buf())
+    }
+
+    /// Publish a snapshot the way the build path does — files, then `meta.json`
+    /// from [`write_meta`]. Writing `b"x"` into all three and a hand-made
+    /// `meta.json` produced a shape the writer never emits, so a reuse test
+    /// built that way stopped meaning anything the moment reuse started
+    /// verifying digests.
+    fn publish_through_the_writer(a: &SnapshotArtifacts) {
+        std::fs::write(&a.vmstate, b"vmstate").expect("publish vmstate");
+        std::fs::write(&a.memfile, b"memfile").expect("publish memfile");
+        write_meta(&sample_key(), a).expect("publish meta");
     }
 
     #[tokio::test]
@@ -1287,9 +1646,7 @@ mod tests {
             let a = SnapshotArtifacts::in_dir(a.dir.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                for f in [&a.vmstate, &a.memfile, &a.meta] {
-                    std::fs::write(f, b"x").expect("publish");
-                }
+                publish_through_the_writer(&a);
                 drop(held);
             })
         };
@@ -1322,9 +1679,7 @@ mod tests {
         // slower or lock-dependent by any of this.
         let tmp = tempfile::tempdir().expect("tempdir");
         let a = artifacts_in(&tmp.path().join("keyhash"));
-        for f in [&a.vmstate, &a.memfile, &a.meta] {
-            std::fs::write(f, b"x").expect("publish");
-        }
+        publish_through_the_writer(&a);
         let key = sample_key();
         let ctx = unusable_ctx(&key);
         let (_, built) = ensure_at(

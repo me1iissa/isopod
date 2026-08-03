@@ -17,7 +17,7 @@ pub use import::{
     adapt, import, imported_image_path, pack_and_stamp, read_provenance, remove_imported, slug_for,
     AdaptReport, ImportOutcome, ImportSource, ImportSpec, OciProvenance, RemoveImportOutcome,
 };
-pub use kernel::{fetch_kernel, FetchKernelOutcome};
+pub use kernel::{fetch_kernel, require_vmfork_reseed, FetchKernelOutcome};
 pub use rootfs::{
     base_content_id, base_image_path, build_rootfs, check_image_proto, list_images,
     make_scratch_ext4, read_image_meta, BuildRootfsOutcome, ImageEntry, ImageList, ImageMeta,

@@ -94,15 +94,94 @@ pub fn fetch_kernel(series: &str, force: bool, allow_unpinned: bool) -> Result<F
         .build()
         .context("building HTTP client")?;
 
-    if allow_unpinned {
+    let outcome = if allow_unpinned {
         eprintln!(
             "fetch-kernel: WARNING: --allow-unpinned fetches the newest upstream build with \
              no digest verification; use only to discover a digest for a new pin"
         );
-        fetch_unpinned(&client, &images, series, force)
+        fetch_unpinned(&client, &images, series, force)?
     } else {
-        fetch_pinned(&client, &images, force)
+        fetch_pinned(&client, &images, force)?
+    };
+    require_vmfork_reseed(&outcome.kernel_path)?;
+    Ok(outcome)
+}
+
+/// The marker that a kernel will reseed its CSPRNG when the hypervisor tells it
+/// the VM was forked or resumed.
+///
+/// It is the `pr_notice` inside `add_vmfork_randomness()`, which the kernel
+/// compiles only under `CONFIG_VMGENID`. Its presence therefore says the option
+/// was on; its absence says the reseed path does not exist in this image.
+const VMFORK_RESEED_MARKER: &[u8] = b"crng reseeded due to virtual machine fork";
+
+/// Refuse a guest kernel that cannot reseed after a snapshot resume.
+///
+/// **Why this is checked at all.** isopod's warm pool resumes one memory image
+/// many times. If the guest CSPRNG were restored identically on each resume,
+/// every warm sandbox would share `/dev/urandom`, `getrandom()`, ASLR offsets
+/// and TCP sequence numbers with every other — the failure mode a competing
+/// snapshot-fork sandbox shipped, and the reason its userspace half cannot be
+/// fixed without giving up its design.
+///
+/// isopod avoids it, but not by writing anything: Firecracker attaches a VMGenID
+/// device to every microVM, and a `CONFIG_VMGENID` kernel reseeds when that
+/// generation counter changes. That is an **inherited** property, and an
+/// inherited property nobody asserts is one upstream config change away from
+/// silently disappearing — with every warm resume still succeeding. `--allow-unpinned`
+/// selects whatever the CI bucket currently offers for a series, so this is a
+/// live path, not a hypothetical one.
+///
+/// # Errors
+/// If the image cannot be read, or carries no VMGenID reseed path.
+pub fn require_vmfork_reseed(vmlinux: &std::path::Path) -> Result<()> {
+    if contains_bytes(vmlinux, VMFORK_RESEED_MARKER)? {
+        return Ok(());
     }
+    bail!(
+        "{} has no VMGenID reseed path (CONFIG_VMGENID), so a guest resumed from a warm-pool \
+         snapshot would keep the CSPRNG state captured in that snapshot: every warm sandbox \
+         built on it would share /dev/urandom, getrandom(), ASLR offsets and TCP sequence \
+         numbers. Refusing to install it. Use the pinned kernel, or build one with \
+         CONFIG_VMGENID=y",
+        vmlinux.display()
+    )
+}
+
+/// Whether `path` contains `needle` anywhere.
+///
+/// Streamed with an overlap, because the interesting failure is silent: read in
+/// fixed blocks and compare each in isolation and a marker straddling a block
+/// boundary is missed, which here would reject a perfectly good kernel — or, if
+/// the sense were ever inverted, accept a bad one.
+fn contains_bytes(path: &std::path::Path, needle: &[u8]) -> Result<bool> {
+    use std::io::Read;
+    const BLOCK: usize = 1 << 20;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {} to scan", path.display()))?;
+    let overlap = needle.len().saturating_sub(1);
+    let mut buf = vec![0u8; BLOCK + overlap];
+    let mut carry = 0usize;
+    loop {
+        let n = match file.read(&mut buf[carry..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("scanning {}", path.display())))
+            }
+        };
+        let filled = carry + n;
+        if buf[..filled].windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        // Keep the last `overlap` bytes so a marker split across two reads is
+        // still seen whole on the next pass.
+        carry = filled.min(overlap);
+        let start = filled - carry;
+        buf.copy_within(start..filled, 0);
+    }
+    Ok(false)
 }
 
 /// The default path: download (or verify the cached copy of) the one blessed
@@ -326,4 +405,67 @@ fn download_to(
         .with_context(|| format!("renaming into {}", dest.display()))?;
 
     Ok(got)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_kernel_carrying_the_reseed_marker_is_accepted() {
+        let d = tempfile::tempdir().unwrap();
+        let mut img = vec![0u8; 4096];
+        img.extend_from_slice(VMFORK_RESEED_MARKER);
+        img.extend_from_slice(&[0u8; 4096]);
+        require_vmfork_reseed(&write(&d, "vmlinux-good", &img)).expect("accepted");
+    }
+
+    /// The whole point. A kernel built without `CONFIG_VMGENID` resumes every
+    /// warm snapshot with the CSPRNG state frozen into it, and nothing at
+    /// runtime would fail — so the refusal has to happen here.
+    #[test]
+    fn a_kernel_without_the_reseed_path_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let img = vec![0x41u8; 1 << 20];
+        let err = require_vmfork_reseed(&write(&d, "vmlinux-bad", &img))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONFIG_VMGENID"), "names the option: {err}");
+        assert!(err.contains("/dev/urandom"), "names the consequence: {err}");
+    }
+
+    /// The subtle one. The scan reads in blocks, and a marker lying across a
+    /// block boundary is invisible to a naive per-block search — which would
+    /// reject a good kernel for a reason nobody could reproduce by hand.
+    #[test]
+    fn a_marker_straddling_a_read_boundary_is_still_found() {
+        let d = tempfile::tempdir().unwrap();
+        const BLOCK: usize = 1 << 20;
+        for split in [
+            1usize,
+            VMFORK_RESEED_MARKER.len() / 2,
+            VMFORK_RESEED_MARKER.len() - 1,
+        ] {
+            let head = BLOCK - split;
+            let mut img = vec![0u8; head];
+            img.extend_from_slice(VMFORK_RESEED_MARKER);
+            img.extend_from_slice(&[0u8; 32]);
+            let p = write(&d, &format!("vmlinux-split-{split}"), &img);
+            require_vmfork_reseed(&p)
+                .unwrap_or_else(|e| panic!("split at {split} was missed: {e}"));
+        }
+    }
+
+    /// An image shorter than the marker must not panic on the sliding window.
+    #[test]
+    fn an_image_smaller_than_the_marker_is_refused_not_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(require_vmfork_reseed(&write(&d, "vmlinux-tiny", b"short")).is_err());
+    }
 }

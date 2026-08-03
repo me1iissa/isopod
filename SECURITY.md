@@ -108,9 +108,30 @@ It requires an environment that supports it: unprivileged user namespaces, a del
 
 isopod v1 is honest about its posture. State these before running anything genuinely hostile:
 
-- **Without `ISOPOD_JAIL=1`, isolation is single-layer.** The default path relies on Firecracker's seccomp filter + KVM alone; a hypothetical VMM/KVM escape would land as your own user account with access to the whole `~/.isopod` store. Enable the jail (above) — or treat the host as **single-tenant** — before running mutually distrusting workloads.
+- **Without `ISOPOD_JAIL=1`, isolation is single-layer.** The default path relies on Firecracker's seccomp filter + KVM alone; a hypothetical VMM/KVM escape would land as your own user account with access to the whole `~/.isopod` store. That store includes the warm-pool snapshots later runs resume from, so an escape there reaches beyond the run that produced it — see *Warm resume*, below. Enable the jail (above) — or treat the host as **single-tenant** — before running mutually distrusting workloads.
+- **The exec channel has no in-band authentication.** Access to a live sandbox is whoever can `connect()` to its `~/.isopod/vms/<id>/vsock.sock`; the containment is that `~/.isopod/vms` is `0700`. Identical on the cold and warm paths. Do not relax the permissions on that tree.
 - **Guest-controlled host sinks are capped, but retention is manual.** Exec output logs are capped at **64 MiB per stream** and serial console logs at **16 MiB** (beyond the cap, bytes are counted but not persisted); every guest RPC the host waits on is **time-bounded**, and each run's wall budget is capped at **3600 s**. Capped logs are still retained per VM until pruned — run `vm_gc` regularly; automatic log retention/GC is not yet wired.
 - **No global governor across concurrent VMs.** The jail's `memory.max` bounds each VM, but many unjailed VMs can still over-commit host RAM. Per-drive/NIC bandwidth rate limiters are also not yet wired. Prefer bounded workloads until these land.
+
+---
+
+## Warm resume — what one memory image resumed many times does and does not share
+
+A qualifying `sandbox_run` resumes a **full-VM memory snapshot** of a booted-idle guest instead of cold-booting. One image is resumed by many later sandboxes, which raises a question every snapshot-forking sandbox has to answer: what state do those sandboxes inherit from each other?
+
+### What holds
+
+- **The guest CSPRNG is reseeded on every resume**, so `/dev/urandom`, `getrandom()`, ASLR offsets, TCP sequence numbers and `boot_id` differ between sandboxes resumed from the same snapshot. Verified by measurement, including across a snapshot resumed days after it was built.
+- **This is inherited, not implemented here, and that is the risk.** Firecracker attaches a VMGenID device to every microVM, and a kernel built with `CONFIG_VMGENID` reseeds when the generation counter changes. isopod contains no entropy code at all. **`CONFIG_VMGENID` in the guest kernel is therefore load-bearing**: a kernel without it would resume every warm sandbox with the CSPRNG state frozen into the snapshot, and *nothing at runtime would fail*. `isopod image fetch-kernel` refuses to install a kernel lacking the reseed path, and a live test asserts it for every installed kernel, with a control that must be rejected.
+- **User code seeds after the reseed.** The snapshot holds the kernel and the guest agent; the command is a fresh process started *after* resume, so language runtimes and TLS libraries draw from the already-reseeded kernel rather than from a pool captured at snapshot time.
+- **The guest clock is resynced** over vsock on every resume, so a resumed sandbox does not believe it is snapshot-day.
+- **Snapshots are integrity-checked before they are trusted.** `vmstate` — which carries the vCPU register state the guest resumes at — is digested in full on every resume. The memory file's digest is recorded at build time and its identity checked on the hot path. Any mismatch is not an error the caller sees: the snapshot is rebuilt and the run cold-boots.
+
+### What is explicitly **not** claimed
+
+- **The hot-path memory-file check is identity, not cryptography.** A full blake3 of the memory file costs ~315 ms per 512 MiB on the reference host — more than the ~410 ms cold boot the warm path exists to beat — so a resume checks that it is the same file it hashed (size and mtime), not that the bytes still hash the same. That detects truncation, partial writes and ordinary processes; it does **not** detect an attacker who restores the metadata. Set `ISOPOD_VERIFY_SNAPSHOT=1` to digest both files in full on every resume and pay that cost deliberately.
+- **On the unjailed path the snapshot store is writable by your own account.** Anything that can write `~/.isopod/snapshots/*/memfile` and defeat the identity check has code execution in later warm sandboxes. The durable containment is `ISOPOD_JAIL=1`, whose read-only bind of `~/.isopod` — recursive, including every submount — denies the write outright.
+- **Pre-snapshot process state is shared and is not protected.** The guest agent's own ASLR layout and hash seeds are identical across resumes of one snapshot. Consistent with the boundary above, nothing *inside* the guest is defended; snapshots are built only from a pristine base with no committed layers and no scratch, so no lower-trust workload can influence a snapshot a later run resumes.
 
 ---
 
