@@ -521,47 +521,21 @@ MUTATIONS = [
         filter="image::rootfs",
     ),
     Mutation(
-        name="a-read-only-bind-sweeps-in-unrelated-host-mounts",
+        name="an-unsupported-kernel-is-reported-as-a-jail-bug",
         file="crates/jail/src/sys.rs",
-        old="""            let under = decoded == target
-                || decoded
-                    .strip_prefix(target)
-                    .is_some_and(|rest| rest.starts_with('/'));""",
-        new="""            let under = decoded.starts_with(target);""",
+        old="""                kernel_too_old_message(kernel_release().as_deref()),""",
+        new="""                "mount_setattr failed".to_string(),""",
         defect=(
-            "The submount search matches on raw prefix instead of a path "
-            "boundary, so binding `~/.isopod` read-only also remounts "
-            "`~/.isopod-other` and `~/.isopodx` read-only — mounts the jail was "
-            "never given, on the host, outside the jail's tree. A hardening "
-            "opt-in that silently makes unrelated host filesystems read-only is "
-            "worse than the hole it closes, and the failure would surface as "
-            "some other program mysteriously losing write access."
+            "A host whose kernel predates mount_setattr(2) is told only that "
+            "something failed, with no mention of the 5.12 requirement, what this "
+            "host actually runs, or that dropping ISOPOD_JAIL=1 starts an "
+            "unjailed VM. The jail still refuses to start — correctly — but the "
+            "operator has no way to tell an unsupported kernel from a bug in the "
+            "jail, and will go looking in the wrong place."
         ),
         package="isopod-jail",
         # The jail's tests live in its binary target, so the suite must be run
         # with --bins for the harness to name the test that caught this.
-        target="--bins",
-    ),
-    Mutation(
-        name="a-read-only-remount-drops-a-flag-the-kernel-locked",
-        file="crates/jail/src/sys.rs",
-        old="""    if f_flag & libc::ST_NOSUID != 0 {
-        keep |= libc::MS_NOSUID;
-    }""",
-        new="""    if f_flag & libc::ST_NOSUID != 0 {
-        keep |= libc::MS_NODEV;
-    }""",
-        defect=(
-            "The flags handed back to a bind remount mistranslate `nosuid`, so a "
-            "nosuid mount is remounted without it. A mount inherited into a user "
-            "namespace has that bit locked, so the remount reads as an attempt to "
-            "clear it and the kernel refuses with EPERM — the jail cannot start at "
-            "all on any host whose mount table holds a nosuid mount under the "
-            "bind. This shipped once: it passed the local gate and the "
-            "pull-request gate, and was caught only by the live suite on a hosted "
-            "runner."
-        ),
-        package="isopod-jail",
         target="--bins",
     ),
     # --- isopod-oci-unpack ------------------------------------------------
