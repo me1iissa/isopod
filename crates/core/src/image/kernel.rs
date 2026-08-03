@@ -440,25 +440,30 @@ mod tests {
         assert!(err.contains("/dev/urandom"), "names the consequence: {err}");
     }
 
-    /// The subtle one. The scan reads in blocks, and a marker lying across a
-    /// block boundary is invisible to a naive per-block search — which would
-    /// reject a good kernel for a reason nobody could reproduce by hand.
+    /// The subtle one — and a sweep rather than one placement, for a reason.
+    ///
+    /// The first version put the marker just before a 1 MiB multiple and passed
+    /// against deliberately broken code, because the first read fills
+    /// `BLOCK + overlap` bytes: nothing straddled anything and the test asserted
+    /// nothing. The mutation `a-read-boundary-hides-the-vmgenid-marker` is what
+    /// exposed it. Sweeping offsets across two boundaries does not depend on
+    /// knowing where the reads land, which is the property the first version
+    /// silently assumed.
     #[test]
-    fn a_marker_straddling_a_read_boundary_is_still_found() {
+    fn a_marker_straddling_any_read_boundary_is_still_found() {
         let d = tempfile::tempdir().unwrap();
         const BLOCK: usize = 1 << 20;
-        for split in [
-            1usize,
-            VMFORK_RESEED_MARKER.len() / 2,
-            VMFORK_RESEED_MARKER.len() - 1,
-        ] {
-            let head = BLOCK - split;
-            let mut img = vec![0u8; head];
-            img.extend_from_slice(VMFORK_RESEED_MARKER);
-            img.extend_from_slice(&[0u8; 32]);
-            let p = write(&d, &format!("vmlinux-split-{split}"), &img);
-            require_vmfork_reseed(&p)
-                .unwrap_or_else(|e| panic!("split at {split} was missed: {e}"));
+        let len = VMFORK_RESEED_MARKER.len();
+        for base in [BLOCK, 2 * BLOCK] {
+            for delta in (0..=(2 * len)).step_by(7) {
+                let at = base + delta - len;
+                let mut img = vec![0u8; at];
+                img.extend_from_slice(VMFORK_RESEED_MARKER);
+                img.extend_from_slice(&[0u8; 64]);
+                let p = write(&d, "vmlinux-sweep", &img);
+                require_vmfork_reseed(&p)
+                    .unwrap_or_else(|e| panic!("marker at offset {at} was missed: {e}"));
+            }
         }
     }
 
