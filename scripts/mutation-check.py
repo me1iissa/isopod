@@ -538,6 +538,86 @@ MUTATIONS = [
         # with --bins for the harness to name the test that caught this.
         target="--bins",
     ),
+    Mutation(
+        name="a-read-boundary-hides-the-vmgenid-marker",
+        file="crates/core/src/image/kernel.rs",
+        old="""        carry = filled.min(overlap);""",
+        new="""        carry = 0;""",
+        defect=(
+            "The scan for the VMGenID reseed marker drops its inter-block "
+            "overlap, so a marker lying across a read boundary is missed. The "
+            "guard then refuses a perfectly good guest kernel for a reason "
+            "nobody can reproduce by hand — and if the sense were ever "
+            "inverted, the same bug would accept a kernel that cannot reseed."
+        ),
+        package="isopod-core",
+        filter="image::kernel",
+    ),
+    Mutation(
+        name="a-kernel-that-cannot-reseed-is-installed-anyway",
+        file="crates/core/src/image/kernel.rs",
+        old="""    if contains_bytes(vmlinux, VMFORK_RESEED_MARKER)? {
+        return Ok(());
+    }""",
+        new="""    if contains_bytes(vmlinux, VMFORK_RESEED_MARKER).unwrap_or(true) {
+        return Ok(());
+    }""",
+        defect=(
+            "A kernel whose reseed path cannot be confirmed is installed as if "
+            "it had one. Every warm resume then keeps the CSPRNG state frozen "
+            "into the snapshot — shared /dev/urandom, getrandom(), ASLR and TCP "
+            "sequence numbers across every warm sandbox — and nothing at "
+            "runtime fails, which is the entire reason this guard exists."
+        ),
+        package="isopod-core",
+        filter="image::kernel",
+    ),
+    Mutation(
+        name="a-tampered-vmstate-is-never-digested",
+        file="crates/core/src/snapshot.rs",
+        old="""        let vmstate_b3 = digest_file(&self.vmstate)?;""",
+        new="""        let vmstate_b3 = meta.vmstate_b3.clone();""",
+        defect=(
+            "The vmstate digest is taken from the metadata instead of the file, "
+            "so it always matches. vmstate carries the vCPU register state the "
+            "guest resumes at, so this is the most direct path from a writable "
+            "snapshot store to code execution in every later warm run, and the "
+            "check that closed it now passes unconditionally."
+        ),
+        package="isopod-core",
+        filter="snapshot::",
+    ),
+    Mutation(
+        name="a-rewritten-memory-file-passes-the-hot-path-check",
+        file="crates/core/src/snapshot.rs",
+        old="""                let mtime_ns = mtime_ns(&mem_meta);
+                if mtime_ns != meta.memfile_mtime_ns {""",
+        new="""                let mtime_ns = mtime_ns(&mem_meta);
+                if false && mtime_ns != meta.memfile_mtime_ns {""",
+        defect=(
+            "The hot path stops noticing that the memory file was rewritten "
+            "after it was digested. Since a full digest is too expensive to run "
+            "on every resume, identity is the only thing standing between a "
+            "rewritten memfile and being mapped as guest RAM."
+        ),
+        package="isopod-core",
+        filter="snapshot::",
+    ),
+    Mutation(
+        name="a-socket-path-too-long-for-the-kernel-is-accepted",
+        file="crates/core/src/paths.rs",
+        old="""    if len <= SUN_PATH_MAX {""",
+        new="""    if len <= SUN_PATH_MAX + 1 {""",
+        defect=(
+            "The socket-path budget is off by one, so a vm_dir whose vsock path "
+            "is exactly one byte over the kernel's sun_path limit is accepted. "
+            "Firecracker then cannot bind, and the run fails ten seconds later "
+            "as a timeout naming the path but not the reason — the exact "
+            "failure this guard exists to replace."
+        ),
+        package="isopod-core",
+        filter="paths::",
+    ),
     # --- isopod-oci-unpack ------------------------------------------------
     # This crate writes attacker-authored bytes onto the host as the operator's
     # user, before any VM exists, so every guard below is load-bearing on its

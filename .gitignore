@@ -11,3 +11,7 @@ _site/
 
 # Python bytecode from scripts/ — never a build product worth keeping.
 __pycache__/
+
+# Local scratch tooling that has repeatedly been swept in by `git add -A`.
+scripts/check-mermaid.mjs
+scripts/mcp-probe.py

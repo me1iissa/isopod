@@ -354,6 +354,9 @@ async fn run_boot(
 ) -> Result<DevBootReport> {
     let vm_id = generate_vm_id()?;
     let vm_dir = paths::vms_dir()?.join(&vm_id);
+    // Before anything is created: a VM directory too deep for `sun_path` fails
+    // ten seconds later as an unexplained Firecracker timeout.
+    paths::check_socket_path_fits(&vm_dir)?;
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
     let vanity = assign_vanity_name(&vm_id, &vm_dir, &rootfs_flavor)?;
@@ -1546,6 +1549,9 @@ async fn run_exec(
 
     let vm_id = generate_vm_id()?;
     let vm_dir = paths::vms_dir()?.join(&vm_id);
+    // Before anything is created: a VM directory too deep for `sun_path` fails
+    // ten seconds later as an unexplained Firecracker timeout.
+    paths::check_socket_path_fits(&vm_dir)?;
     std::fs::create_dir_all(&vm_dir)
         .with_context(|| format!("creating VM dir {}", vm_dir.display()))?;
     // Record the owning pid so the reaper can tell a live run's VMM from an
