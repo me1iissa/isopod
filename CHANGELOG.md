@@ -45,6 +45,16 @@ hosted runner, after passing on a maintainer's laptop and in the pull-request
 gate. `mount_setattr` sidesteps the rule entirely by only ever *adding* the
 read-only attribute. Dogfood finding #53.
 
+The flags come from `statvfs(2)`, not from the mount's line in
+`/proc/self/mountinfo`. Those are not the same thing: **two mounts can share one
+mount point** — a systemd autofs with the real filesystem mounted over it, which
+is exactly what `/proc/sys/fs/binfmt_misc` is on a hosted runner — and a remount
+by path reaches only the topmost. Reading flags off a mountinfo line applied the
+lower mount's flags to the upper mount and earned the same `EPERM` a second time.
+`statvfs` resolves a path the way `mount` does, so it always describes the mount
+about to be remounted; mountinfo is left to enumerate paths, which is the one job
+it can do reliably.
+
 `ISOPOD_JAIL_FORCE_REMOUNT_WALK=1` forces the fallback path. It exists so the
 live probe can exercise both implementations on any host, rather than leaving the
 older one to run only where nobody tests; it selects which implementation makes
@@ -78,8 +88,8 @@ The mountinfo parser is pure and tested, including the ways it can be subtly
 wrong. Matching on raw prefix would make `~/.isopod-other` and `~/.isopodx` read-only
 too — unrelated host mounts, outside the jail, silently losing write access.
 mountinfo octal-escapes its mount points, so comparing the raw text would miss
-a submount under any directory with a space in its name. And a remount that drops
-a flag the kernel locked is refused outright, so the flags are read back per mount.
+a submount under any directory with a space in its name. And a mount point can
+appear twice, so it is listed once — the duplicate names the same reachable mount.
 
 The live probe now asserts what it never did: that a *submount* of the read-only
 bind is read-only, checked against `/dev/shm` — a tmpfs under `/` that is also

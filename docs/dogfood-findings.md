@@ -1033,11 +1033,33 @@ flowchart LR
     | `MS_RDONLY` + the three flags passed back | ok, and the mount is `ro` |
 
     → FIX: `mount_setattr(2)` with `AT_RECURSIVE` only ever *adds*
-    `MOUNT_ATTR_RDONLY` and clears nothing, so it cannot engage the rule at all;
-    the pre-5.12 fallback reads each mount's flags out of mountinfo and hands
-    them back. Atime is deliberately not parsed — `mount(2)` preserves it for a
-    remount that names no atime flag, so parsing it could only add a way to get
-    it wrong.
+    `MOUNT_ATTR_RDONLY` and clears nothing, so it cannot engage the rule at all.
+    Atime needs no help either way — `mount(2)` preserves it for a remount that
+    names no atime flag, so repeating it could only add a way to get it wrong.
+
+    **The pre-5.12 fallback then failed the same way a second time**, on the same
+    mount, for a different reason — and the second reason is the interesting one.
+    Reading each mount's flags out of its mountinfo line looks obviously correct
+    and is not: **two mounts can share one mount point**, and a remount by path
+    reaches only the topmost. `/proc/sys/fs/binfmt_misc` is exactly that shape on
+    a hosted runner — a systemd autofs with the real filesystem mounted over it —
+    so the walk applied the *lower* mount's flags to the *upper* mount:
+
+    ```
+    /tmp/dst/sub  rw,relatime                     keep=0   <- lower
+    /tmp/dst/sub  rw,nosuid,nodev,noexec,relatime  keep=14  <- topmost
+    remount /tmp/dst/sub keep=0  -> EPERM
+    remount /tmp/dst/sub keep=14 -> ok
+    ```
+
+    The fallback now asks `statvfs(2)` for the flags instead. It resolves a path
+    exactly as `mount(2)` does, so it always describes the mount about to be
+    remounted — the correlation problem cannot arise. mountinfo is left to do the
+    one job it can do reliably: enumerate which paths exist.
+
+    Reproduced locally by stacking two tmpfs mounts at one path inside a user
+    namespace and running the real jail binary against it: the committed code
+    fails at that path, the fix passes.
 
     The fallback is now forced by an environment variable in the live probe, so
     both paths run on every host that can run the probe at all, instead of the

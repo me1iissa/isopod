@@ -241,17 +241,37 @@ fn remount_readonly_walk(dst: &str) -> io::Result<()> {
     // The bind itself may not be listed yet if the caller is racing its own
     // mount table read; remounting it is idempotent, so ensure it is included.
     let dst_norm = dst.trim_end_matches('/');
-    if !dst_norm.is_empty() && !targets.iter().any(|t| t.path == dst_norm) {
-        targets.push(Submount {
-            path: dst_norm.to_string(),
-            keep: 0,
-        });
+    if !dst_norm.is_empty() && !targets.iter().any(|t| t == dst_norm) {
+        targets.push(dst_norm.to_string());
     }
     for target in &targets {
-        remount_readonly(&target.path, target.keep)
-            .map_err(|e| annotate(e, &format!("remounting {} read-only", target.path)))?;
+        // Ask the kernel what this mount carries rather than reading it off the
+        // mountinfo line the path came from. Those are not the same thing: two
+        // mounts can share one mount point, and a remount by path reaches only
+        // the topmost. `statvfs` resolves the path exactly as `mount` will, so
+        // it always describes the mount about to be remounted.
+        let keep = mount_flags_at(target)
+            .map_err(|e| annotate(e, &format!("reading the mount flags of {target}")))?;
+        remount_readonly(target, keep)
+            .map_err(|e| annotate(e, &format!("remounting {target} read-only")))?;
     }
     Ok(())
+}
+
+/// The `MS_*` bits that a bind remount of the mount at `path` must repeat.
+fn mount_flags_at(path: &str) -> io::Result<libc::c_ulong> {
+    let path = cstr(path)?;
+    // SAFETY: `statvfs` fills the buffer it is given; an all-zero `statvfs` is a
+    // valid starting value, and `path` is a NUL-terminated C string valid for the
+    // call. The result is only read after a success return.
+    let st = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        st
+    };
+    Ok(preserved_flags(st.f_flag))
 }
 
 /// Remount the existing bind at `dst` read-only, repeating the per-mount flags
@@ -264,10 +284,14 @@ fn remount_readonly_walk(dst: &str) -> io::Result<()> {
 /// `nosuid,nodev,noexec` submount rejects `MS_RDONLY` alone and accepts the same
 /// remount the moment the three bits are passed back.
 ///
+/// `keep` must describe the mount this call will actually reach — see
+/// [`mount_flags_at`], which asks the kernel rather than inferring it from a
+/// mount table that can list two mounts at one path.
+///
 /// Atime flags are deliberately absent. `mount(2)` specifies that a remount
 /// naming none of `MS_NOATIME`/`MS_NODIRATIME`/`MS_RELATIME`/`MS_STRICTATIME`
 /// preserves the mount's existing atime setting — which is exactly what the same
-/// locking rule requires, so parsing them could only introduce a way to get it
+/// locking rule requires, so repeating them could only introduce a way to get it
 /// wrong.
 pub fn remount_readonly(dst: &str, keep: libc::c_ulong) -> io::Result<()> {
     let dst = cstr(dst)?;
@@ -309,76 +333,63 @@ pub fn remount_readonly(dst: &str, keep: libc::c_ulong) -> io::Result<()> {
 /// Deepest-first because a remount must not be shadowed by a later remount of
 /// its parent.
 #[must_use]
-pub fn submounts_of(mountinfo: &str, target: &str) -> Vec<Submount> {
+pub fn submounts_of(mountinfo: &str, target: &str) -> Vec<String> {
     // Trimming `/` to the empty string is what makes the separator test below
     // treat every mount as being under the root, as it should.
     let target = target.trim_end_matches('/');
-    let mut found: Vec<Submount> = mountinfo
+    let mut found: Vec<String> = mountinfo
         .lines()
         .filter_map(|line| {
-            // Fields before the optional run: id, parent, dev, root, mountpoint,
-            // then the per-mount options.
-            let mut fields = line.split(' ');
-            let mount_point = fields.nth(4)?;
-            // A line truncated after the mount point still names a real mount.
-            // Yielding it with no flags fails closed — the remount errors and
-            // the jail refuses to start — where skipping it would silently leave
-            // that mount writable.
-            let options = fields.next().unwrap_or("");
+            // Fields before the optional run: id, parent, dev, root, mountpoint.
+            let mount_point = line.split(' ').nth(4)?;
             let decoded = unescape_octal(mount_point);
             let under = decoded == target
                 || decoded
                     .strip_prefix(target)
                     .is_some_and(|rest| rest.starts_with('/'));
-            under.then(|| Submount {
-                path: decoded,
-                keep: preserved_flags(options),
-            })
+            under.then_some(decoded)
         })
         .collect();
     // Deepest first: a parent remounted after its child would shadow the child.
     found.sort_by(|a, b| {
-        b.path
-            .matches('/')
+        b.matches('/')
             .count()
-            .cmp(&a.path.matches('/').count())
-            .then_with(|| a.path.cmp(&b.path))
+            .cmp(&a.matches('/').count())
+            .then_with(|| a.cmp(b))
     });
+    // Two mounts can share one mount point. A remount by path reaches only the
+    // topmost, so the duplicate would be a second remount of the same mount —
+    // harmless, but the deduplicated list says what is actually reachable.
     found.dedup();
     found
 }
 
-/// One mount to make read-only: where it is, and the per-mount flags a remount
-/// of it must repeat.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Submount {
-    /// Mount point, with mountinfo's octal escapes already decoded.
-    pub path: String,
-    /// `MS_*` bits this mount already carries. See [`remount_readonly`] for why
-    /// dropping one turns a remount into an `EPERM`.
-    pub keep: libc::c_ulong,
-}
-
-/// The `MS_*` bits a bind remount must repeat, read from mountinfo's per-mount
-/// options field (`rw,nosuid,nodev,noexec,relatime`).
+/// Translate `statvfs(2)`'s `f_flag` into the `MS_*` bits a bind remount must
+/// repeat.
 ///
-/// Deliberately narrow: the three flags the kernel *locks* on a mount inherited
-/// into a user namespace, plus `nosymfollow` — which is not locked, and so fails
-/// differently and worse. Omitting it does not error; it silently clears the
-/// flag, turning a remount meant to tighten a mount into one that loosens it.
+/// Exactly the three flags the kernel *locks* on a mount inherited into a user
+/// namespace. Atime is locked too but needs no help: `mount(2)` preserves it for
+/// a remount that names no atime flag, so repeating it could only add a way to
+/// get it wrong.
 ///
-/// Atime options are not parsed at all; see [`remount_readonly`].
+/// `nosymfollow` is **not** preserved, because `statvfs` does not report it. That
+/// is a deliberate trade for asking the kernel which mount it is rather than
+/// guessing from a mount table, and it is narrow: this path runs only on kernels
+/// without `mount_setattr(2)` (< 5.12), and `nosymfollow` did not exist before
+/// 5.10, so at most two releases are affected.
 #[must_use]
-fn preserved_flags(options: &str) -> libc::c_ulong {
-    options.split(',').fold(0, |keep, opt| {
-        keep | match opt {
-            "nosuid" => libc::MS_NOSUID,
-            "nodev" => libc::MS_NODEV,
-            "noexec" => libc::MS_NOEXEC,
-            "nosymfollow" => libc::MS_NOSYMFOLLOW,
-            _ => 0,
-        }
-    })
+fn preserved_flags(f_flag: libc::c_ulong) -> libc::c_ulong {
+    let mut keep = 0;
+    if f_flag & libc::ST_NOSUID != 0 {
+        keep |= libc::MS_NOSUID;
+    }
+    if f_flag & libc::ST_NODEV != 0 {
+        keep |= libc::MS_NODEV;
+    }
+    if f_flag & libc::ST_NOEXEC != 0 {
+        keep |= libc::MS_NOEXEC;
+    }
+    keep
 }
 
 /// Decode mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline,
@@ -576,14 +587,9 @@ mod tests {
 31 30 0:27 / /home/u/.isopodx rw,relatime - ext4 /dev/sda4 rw
 ";
 
-    /// Mount points only, for the tests that are about *which* mounts are found.
-    fn paths(found: &[Submount]) -> Vec<String> {
-        found.iter().map(|s| s.path.clone()).collect()
-    }
-
     #[test]
     fn submounts_include_the_target_and_everything_under_it() {
-        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
         assert!(got.contains(&"/home/u/.isopod".to_string()));
         assert!(got.contains(&"/home/u/.isopod/images".to_string()));
         assert!(got.contains(&"/home/u/.isopod/images/deep".to_string()));
@@ -593,46 +599,51 @@ mod tests {
     /// into a user namespace has `nosuid`/`nodev`/`noexec` locked, so a remount
     /// that does not name them again is read as an attempt to clear them and is
     /// refused with `EPERM` — turning a fix for a silent hole into a jail that
-    /// will not start. The flags have to come back out of mountinfo.
+    /// will not start.
     #[test]
-    fn the_flags_the_kernel_locks_are_read_back_from_the_mount_options() {
-        let got = submounts_of(MOUNTINFO, "/proc");
+    fn the_flags_the_kernel_locks_are_carried_into_the_remount() {
         assert_eq!(
-            got[0].keep,
+            preserved_flags(libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC),
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             "a locked flag dropped here is an EPERM at the syscall"
         );
     }
 
-    /// Atime is locked too, but `mount(2)` preserves it for a remount that names
-    /// no atime flag. Parsing them could only add a way to get it wrong.
+    /// Each flag is carried on its own, so a mount with one locked flag is not
+    /// handed the other two — tightening a mount the jail was not asked to touch.
     #[test]
-    fn atime_is_left_for_the_kernel_to_preserve() {
-        assert_eq!(preserved_flags("rw,relatime"), 0);
-        assert_eq!(preserved_flags("rw,noatime,nodiratime"), 0);
+    fn each_locked_flag_is_carried_independently() {
+        assert_eq!(preserved_flags(libc::ST_NOSUID), libc::MS_NOSUID);
+        assert_eq!(preserved_flags(libc::ST_NODEV), libc::MS_NODEV);
+        assert_eq!(preserved_flags(libc::ST_NOEXEC), libc::MS_NOEXEC);
+        assert_eq!(preserved_flags(0), 0);
     }
 
-    /// `nosymfollow` is *not* locked, so omitting it does not fail loudly — it
-    /// clears the flag, quietly loosening a mount this call exists to tighten.
+    /// Atime is locked too, but `mount(2)` preserves it for a remount naming no
+    /// atime flag, so repeating it could only add a way to get it wrong.
+    /// `ST_RDONLY` is likewise not carried — the remount sets it unconditionally.
     #[test]
-    fn nosymfollow_is_repeated_so_the_remount_cannot_clear_it() {
-        assert_eq!(preserved_flags("ro,nosymfollow"), libc::MS_NOSYMFOLLOW);
+    fn atime_and_readonly_are_left_to_the_kernel() {
+        assert_eq!(preserved_flags(libc::ST_RELATIME), 0);
+        assert_eq!(preserved_flags(libc::ST_NOATIME | libc::ST_NODIRATIME), 0);
+        assert_eq!(preserved_flags(libc::ST_RDONLY), 0);
     }
 
-    /// An unknown option contributes nothing rather than being guessed at.
+    /// Two mounts can share one mount point — a systemd autofs and the real
+    /// filesystem mounted over it both sit on `/proc/sys/fs/binfmt_misc`, which
+    /// is precisely where this failed on a hosted runner. A remount by path
+    /// reaches only the topmost, so the path is listed once and its flags come
+    /// from `statvfs` rather than from either line.
     #[test]
-    fn unrecognised_options_contribute_no_flags() {
-        assert_eq!(preserved_flags("rw,seclabel,inode64,idmapped"), 0);
-    }
-
-    /// A line truncated after the mount point still names a real mount. It is
-    /// kept, with no flags, so the remount fails and the jail refuses to start —
-    /// dropping it would leave that mount writable and report success.
-    #[test]
-    fn a_line_with_no_options_field_still_yields_the_mount() {
-        let got = submounts_of("25 30 0:22 / /proc\n", "/proc");
-        assert_eq!(paths(&got), vec!["/proc".to_string()]);
-        assert_eq!(got[0].keep, 0);
+    fn a_mount_point_that_appears_twice_is_listed_once() {
+        let mi = "\
+25 30 0:22 / /home/u/.isopod/x rw,relatime - autofs systemd-1 rw
+26 30 0:23 / /home/u/.isopod/x rw,nosuid,nodev,noexec,relatime - tmpfs none rw
+";
+        assert_eq!(
+            submounts_of(mi, "/home/u/.isopod"),
+            vec!["/home/u/.isopod/x".to_string()]
+        );
     }
 
     /// A prefix match on the raw string would sweep in `/home/u/.isopod-other`
@@ -641,7 +652,7 @@ mod tests {
     /// a path separator, not a character count.
     #[test]
     fn a_sibling_that_merely_shares_a_prefix_is_not_a_submount() {
-        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
         assert!(
             !got.iter().any(|m| m == "/home/u/.isopod-other"),
             "a prefix match would remount an unrelated mount: {got:?}"
@@ -657,7 +668,7 @@ mod tests {
     /// this function exists to close, reintroduced by ordering alone.
     #[test]
     fn deepest_mounts_come_first() {
-        let got = paths(&submounts_of(MOUNTINFO, "/home/u/.isopod"));
+        let got = submounts_of(MOUNTINFO, "/home/u/.isopod");
         let deep = got.iter().position(|m| m == "/home/u/.isopod/images/deep");
         let mid = got.iter().position(|m| m == "/home/u/.isopod/images");
         let top = got.iter().position(|m| m == "/home/u/.isopod");
@@ -673,7 +684,7 @@ mod tests {
 40 30 0:30 / /home/u/my\\040stage rw,relatime - ext4 /dev/sda5 rw
 41 40 0:31 / /home/u/my\\040stage/inner rw,relatime - tmpfs none rw
 ";
-        let got = paths(&submounts_of(mi, "/home/u/my stage"));
+        let got = submounts_of(mi, "/home/u/my stage");
         assert_eq!(
             got,
             vec![
@@ -699,10 +710,7 @@ mod tests {
     /// something to remount and never silently does nothing.
     #[test]
     fn a_target_with_no_submounts_still_returns_itself() {
-        assert_eq!(
-            paths(&submounts_of(MOUNTINFO, "/proc")),
-            vec!["/proc".to_string()]
-        );
+        assert_eq!(submounts_of(MOUNTINFO, "/proc"), vec!["/proc".to_string()]);
     }
 
     /// Garbage in must not panic: this parses a kernel file on the security
@@ -710,7 +718,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let mi = "short line\n\n25 30 0:22 /\n25 30 0:22 / /proc rw - proc proc rw\n";
-        assert_eq!(paths(&submounts_of(mi, "/proc")), vec!["/proc".to_string()]);
+        assert_eq!(submounts_of(mi, "/proc"), vec!["/proc".to_string()]);
     }
 
     /// A trailing slash on the target is the same target. Without normalising,
@@ -730,7 +738,7 @@ mod tests {
     /// success over an entirely writable tree.
     #[test]
     fn binding_the_root_finds_every_mount() {
-        let got = paths(&submounts_of(MOUNTINFO, "/"));
+        let got = submounts_of(MOUNTINFO, "/");
         assert_eq!(got.len(), MOUNTINFO.lines().count(), "got {got:?}");
         assert!(got.contains(&"/proc".to_string()));
         assert!(got.contains(&"/home/u/.isopodx".to_string()));

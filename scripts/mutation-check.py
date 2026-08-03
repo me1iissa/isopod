@@ -545,16 +545,21 @@ MUTATIONS = [
     Mutation(
         name="a-read-only-remount-drops-a-flag-the-kernel-locked",
         file="crates/jail/src/sys.rs",
-        old="""            "nosuid" => libc::MS_NOSUID,""",
-        new="""            "nosuid" => 0,""",
+        old="""    if f_flag & libc::ST_NOSUID != 0 {
+        keep |= libc::MS_NOSUID;
+    }""",
+        new="""    if f_flag & libc::ST_NOSUID != 0 {
+        keep |= libc::MS_NODEV;
+    }""",
         defect=(
-            "The per-mount flags handed back to a bind remount lose `nosuid`. A "
-            "mount inherited into a user namespace has that bit locked, so a "
-            "remount omitting it reads as an attempt to clear it and the kernel "
-            "refuses with EPERM — the jail cannot start at all on any host whose "
-            "mount table holds a nosuid mount under the bind. This shipped once: "
-            "it passed the local gate and the pull-request gate, and was caught "
-            "only by the live suite on a hosted runner."
+            "The flags handed back to a bind remount mistranslate `nosuid`, so a "
+            "nosuid mount is remounted without it. A mount inherited into a user "
+            "namespace has that bit locked, so the remount reads as an attempt to "
+            "clear it and the kernel refuses with EPERM — the jail cannot start at "
+            "all on any host whose mount table holds a nosuid mount under the "
+            "bind. This shipped once: it passed the local gate and the "
+            "pull-request gate, and was caught only by the live suite on a hosted "
+            "runner."
         ),
         package="isopod-jail",
         target="--bins",
