@@ -17,7 +17,7 @@
   ],
   "mcpServers": {
     "isopod": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/target/release/isopod-mcp",
+      "command": "${CLAUDE_PLUGIN_ROOT}/isopod-mcp",
       "args": []
     }
   }
