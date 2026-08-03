@@ -8,6 +8,16 @@ Versioning for the policy.
 
 ## [0.19.0] — 2026-08-03
 
+> **Releases 0.15.0 through 0.18.0 were never tagged or published.** They landed
+> on `main` as steps of one piece of work and are kept below as the record of what
+> changed when. This is the version that ships them, so **upgrading from 0.14.0
+> means taking all of it** — read those sections too, they describe behaviour in
+> this release.
+>
+> 0.18.0 in particular shipped a fallback that let the jail run on kernels older
+> than 5.12. It is removed here, and because 0.18.0 was never published, no
+> released version ever offered it.
+
 ### Changed — the rootless jail requires Linux 5.12 (`ISOPOD_JAIL=1` only)
 
 **Breaking for jail users on older kernels; nothing else changes.** The jail is
@@ -51,11 +61,6 @@ exists because a mutation proved the first was not enough: the message was
 covered, the call site was not, so deleting the call left every test passing.
 
 ## [0.18.0] — 2026-07-30
-
-> **Releases 0.15.0 through 0.17.0 were never tagged or published.** They landed
-> on `main` as steps of one piece of work and are kept below as the record of what
-> changed when. This is the version that ships them; if you are upgrading from
-> 0.14.0, read those sections too — they describe behaviour in this release.
 
 ### Fixed — every submount of a read-only jail bind was writable
 

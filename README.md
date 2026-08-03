@@ -28,12 +28,14 @@ the VM away. Isolation is the KVM hardware boundary, not a shared kernel.
 sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted.org"])
 ```
 
-> Pre-1.0 and moving quickly; `main` is the supported line. Newest: host-declared
-> credentials a run can spend but never read (0.10.0 — [docs](docs/credentials.md)),
-> hardened in 0.11.0 after an adversarial review of the shipped code
-> ([changelog](CHANGELOG.md)). **0.11.0 needs one `sudo isopod setup` on an existing
-> host** — a filtered run now verifies the kernel's own forwarding guard and fails
-> closed without it.
+> Pre-1.0 and moving quickly; `main` is the supported line. Newest (0.19.0,
+> [changelog](CHANGELOG.md)): a read-only jail bind is now read-only *including
+> every mount beneath it* — it was not, and said nothing — which makes
+> **Linux 5.12 a requirement for the opt-in jail** and for nothing else. Also
+> since 0.14.0: guest egress survives a coexisting Docker install, which used to
+> swallow it silently, and a NAT run gets a host-side DNS resolver instead of
+> baked-in public ones. **An existing host needs one `sudo isopod setup`** to pick
+> up the forward-hook and resolver provisioning.
 
 ---
 
