@@ -169,16 +169,24 @@ pub fn bind_mount(src: &str, dst: &str) -> io::Result<()> {
 /// on a kernel older than 5.12. **Fails closed**: a jail that cannot prove the
 /// tree is read-only must not report that it is.
 pub fn remount_readonly_recursive(dst: &str) -> io::Result<()> {
-    mount_setattr_readonly_recursive(dst).map_err(|e| {
-        if e.raw_os_error() == Some(libc::ENOSYS) {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                kernel_too_old_message(kernel_release().as_deref()),
-            )
-        } else {
-            annotate(e, "mount_setattr(AT_RECURSIVE)")
-        }
-    })
+    mount_setattr_readonly_recursive(dst).map_err(explain_setattr_failure)
+}
+
+/// Turn a `mount_setattr` failure into the error the operator should see.
+///
+/// Split out from the call site so the *decision* is testable and not only the
+/// message: `ENOSYS` means the kernel has no such syscall and the operator needs
+/// [`kernel_too_old_message`], while anything else is a real refusal that must
+/// keep its own errno rather than be blamed on the kernel version.
+fn explain_setattr_failure(e: io::Error) -> io::Error {
+    if e.raw_os_error() == Some(libc::ENOSYS) {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            kernel_too_old_message(kernel_release().as_deref()),
+        )
+    } else {
+        annotate(e, "mount_setattr(AT_RECURSIVE)")
+    }
 }
 
 /// What to tell an operator whose kernel predates `mount_setattr(2)`.
@@ -443,6 +451,32 @@ mod tests {
         let msg = kernel_too_old_message(None);
         assert!(msg.contains("unknown"), "{msg}");
         assert!(msg.contains("5.12"), "{msg}");
+    }
+
+    /// Testing the message is not enough — the call site has to *reach* it. A
+    /// jail that refuses on an old kernel while reporting a bare syscall error
+    /// is still correct and still useless, so the decision is asserted, not just
+    /// the string it produces.
+    #[test]
+    fn enosys_is_explained_as_an_unsupported_kernel() {
+        let mapped = explain_setattr_failure(io::Error::from_raw_os_error(libc::ENOSYS));
+        assert_eq!(mapped.kind(), io::ErrorKind::Unsupported);
+        let msg = mapped.to_string();
+        assert!(msg.contains("5.12"), "{msg}");
+        assert!(msg.contains("mount_setattr"), "{msg}");
+        assert!(msg.contains("ISOPOD_JAIL"), "{msg}");
+    }
+
+    /// The other direction. A refusal that is not `ENOSYS` must keep its own
+    /// errno: telling someone to upgrade a kernel that is already new enough
+    /// sends them away from whatever actually went wrong.
+    #[test]
+    fn any_other_refusal_keeps_its_own_errno() {
+        let mapped = explain_setattr_failure(io::Error::from_raw_os_error(libc::EPERM));
+        assert_ne!(mapped.kind(), io::ErrorKind::Unsupported);
+        let msg = mapped.to_string();
+        assert!(!msg.contains("5.12"), "must not blame the kernel: {msg}");
+        assert!(msg.contains("mount_setattr(AT_RECURSIVE)"), "{msg}");
     }
 
     /// The release really is readable here, so the case above is a fallback and

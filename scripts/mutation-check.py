@@ -523,8 +523,8 @@ MUTATIONS = [
     Mutation(
         name="an-unsupported-kernel-is-reported-as-a-jail-bug",
         file="crates/jail/src/sys.rs",
-        old="""                kernel_too_old_message(kernel_release().as_deref()),""",
-        new="""                "mount_setattr failed".to_string(),""",
+        old="""            kernel_too_old_message(kernel_release().as_deref()),""",
+        new="""            "mount_setattr failed".to_string(),""",
         defect=(
             "A host whose kernel predates mount_setattr(2) is told only that "
             "something failed, with no mention of the 5.12 requirement, what this "
