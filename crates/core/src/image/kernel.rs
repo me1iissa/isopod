@@ -467,6 +467,23 @@ mod tests {
         }
     }
 
+    /// "Could not check" must never become "checked and fine". If the image
+    /// cannot be read at all, the guard has to refuse — otherwise an unreadable
+    /// kernel is installed as though its reseed path had been confirmed, which
+    /// is the one outcome worse than refusing a good one.
+    #[test]
+    fn a_kernel_that_cannot_be_read_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            require_vmfork_reseed(&d.path().join("vmlinux-not-here")).is_err(),
+            "a missing image must be refused, not assumed good"
+        );
+        assert!(
+            require_vmfork_reseed(d.path()).is_err(),
+            "a path that is not a readable file must be refused"
+        );
+    }
+
     /// An image shorter than the marker must not panic on the sliding window.
     #[test]
     fn an_image_smaller_than_the_marker_is_refused_not_fatal() {
