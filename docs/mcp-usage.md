@@ -98,13 +98,36 @@ Tools registered via the plugin appear scoped as
 `mcp__plugin_<plugin-name>_<server-name>__<tool>`; isopod uses the same name
 for both, hence `isopod_isopod`).
 
-Note on distribution: `--plugin-dir` loads the plugin **in place**, so
-`${CLAUDE_PLUGIN_ROOT}/target/release/isopod-mcp` only exists if you've
-built it in that checkout first. A marketplace-style install copies the
-plugin into `~/.claude/plugins/cache` without running `cargo build`, so a
-cache-installed copy would need a prebuilt binary vendored into the package —
-out of scope for v1; local dev via `--plugin-dir` (or the project-scope
-`.mcp.json`) is the supported path today.
+The repo also self-hosts a one-plugin marketplace, so the whole thing is two
+commands once isopod itself is installed:
+
+```
+/plugin marketplace add me1iissa/isopod
+/plugin install isopod@isopod
+```
+
+`source` is `./` — the plugin *is* this repo — so an install copies the tracked
+tree, 2.8 MB. The 1.2 GB `vendor/firecracker` build output nearby is untracked
+and a submodule gitlink, so none of it travels.
+
+The marketplace entry deliberately carries **no `version`**. `plugin.json` already
+declares one and the release tooling keeps it in lockstep with the workspace;
+a second copy here would be a third place to bump and the first to drift.
+
+Note on distribution: the plugin's `command` is a small launcher,
+`${CLAUDE_PLUGIN_ROOT}/isopod-mcp`, which finds the server wherever isopod was
+installed. It prefers a `target/release` build in the plugin root (so a dev
+checkout loaded with `--plugin-dir` uses your own build), then `$ISOPOD_MCP_BIN`,
+then `isopod-mcp` on `PATH`, then the usual install locations — which matters for
+a client launched from a desktop environment that did not inherit your shell's
+`PATH`. With none of them it exits non-zero and prints how to install isopod.
+
+It resolves rather than vendors deliberately. Shipping a prebuilt `isopod-mcp`
+inside the plugin would make the *server* start and change nothing else: a
+sandbox still needs `/dev/kvm`, a Firecracker binary, guest images and one
+`sudo isopod setup`. That plugin would connect cleanly and then fail on the
+first `sandbox_run`, which is a worse failure than refusing at startup — it
+arrives later and looks like a bug rather than a missing install.
 
 ## What one `sandbox_run` call does
 

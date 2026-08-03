@@ -1,0 +1,67 @@
+#!/bin/sh
+# Locate the isopod MCP server, whichever way isopod got onto this machine.
+#
+# The plugin manifest used to point straight at
+# `$CLAUDE_PLUGIN_ROOT/target/release/isopod-mcp`, which exists only in a
+# checkout somebody has already run `cargo build --release` in. A marketplace
+# install copies the plugin into `~/.claude/plugins/cache` and never builds, so
+# that path named a binary that was never going to be there and the server
+# failed to start with no explanation.
+#
+# Vendoring a prebuilt binary into the plugin would not fix the real problem
+# either. isopod is not self-contained by nature: a sandbox needs `/dev/kvm`,
+# a Firecracker binary, guest images and one `sudo isopod setup`. A plugin that
+# shipped its own `isopod-mcp` would connect happily and then fail on the first
+# `sandbox_run` — a worse failure, because it happens later and looks like a bug
+# rather than a missing install.
+#
+# So this resolves an isopod that is actually installed, and when there is none
+# it says so in the one place the operator will see it.
+set -eu
+
+# A dev checkout wins: someone working on isopod wants their own build.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/target/release/isopod-mcp" ]; then
+    exec "$CLAUDE_PLUGIN_ROOT/target/release/isopod-mcp" "$@"
+fi
+
+# Then an explicit override, for installs that are not on PATH.
+if [ -n "${ISOPOD_MCP_BIN:-}" ]; then
+    if [ -x "$ISOPOD_MCP_BIN" ]; then
+        exec "$ISOPOD_MCP_BIN" "$@"
+    fi
+    echo "isopod: \$ISOPOD_MCP_BIN is set to '$ISOPOD_MCP_BIN' but that is not an executable file." >&2
+    exit 1
+fi
+
+# Then a normal install.
+if command -v isopod-mcp >/dev/null 2>&1; then
+    exec isopod-mcp "$@"
+fi
+
+# Common install locations, for a PATH that a GUI-launched client did not inherit.
+for candidate in "$HOME/.local/bin/isopod-mcp" /usr/local/bin/isopod-mcp /usr/bin/isopod-mcp; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+cat >&2 <<'EOF'
+isopod: the MCP server is not installed on this machine.
+
+The plugin wires isopod into your client; it does not contain isopod itself,
+because a sandbox also needs /dev/kvm, a Firecracker binary, guest images and
+one `sudo isopod setup`. Install those first and this will find the server.
+
+  1. Download the release for your platform (Linux x86_64):
+       https://github.com/me1iissa/isopod/releases/latest
+  2. Put `isopod`, `isopod-mcp` and `isopod-jail` on your PATH
+     (~/.local/bin is a good choice — no sudo needed).
+  3. Fetch the guest images and provision host networking:
+       isopod image fetch-kernel
+       sudo isopod setup
+
+Full instructions: https://github.com/me1iissa/isopod/blob/main/docs/getting-started.md
+
+If isopod-mcp is installed somewhere unusual, set ISOPOD_MCP_BIN to its path.
+EOF
+exit 1

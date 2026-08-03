@@ -1,0 +1,30 @@
+{
+  "name": "isopod",
+  "owner": {
+    "name": "me1iissa",
+    "url": "https://github.com/me1iissa"
+  },
+  "description": "Firecracker microVM sandboxes for coding agents: one disposable VM per action, with an egress boundary the guest cannot edit.",
+  "plugins": [
+    {
+      "name": "isopod",
+      "source": "./",
+      "description": "Run a command in a hardware-isolated microVM that is destroyed afterwards. Content-addressed stages fork an environment like a branch, and a default-deny egress allowlist enforced outside the guest returns a ledger of every destination the run tried. Needs Linux x86_64, /dev/kvm, and one `sudo isopod setup` — install isopod before enabling this plugin.",
+      "category": "development",
+      "tags": [
+        "sandbox",
+        "firecracker",
+        "microvm",
+        "isolation",
+        "egress-control",
+        "code-execution"
+      ],
+      "homepage": "https://me1iissa.github.io/isopod/",
+      "license": "Apache-2.0",
+      "author": {
+        "name": "me1iissa",
+        "url": "https://github.com/me1iissa"
+      }
+    }
+  ]
+}
