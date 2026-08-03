@@ -72,12 +72,27 @@ sudo ./target/release/isopod setup
   python3 -c 'print("hello from a microVM")'
 ```
 
-To drive it from **Claude Code**, register the MCP server and restart your session:
+To drive it from **Claude Code**, install the plugin — it registers the MCP server
+and a workflow skill in one step:
+
+```
+/plugin marketplace add me1iissa/isopod
+/plugin install isopod@isopod
+/reload-plugins
+# then:  sandbox_run(cmd="echo hi")
+```
+
+Install isopod itself first, using either option above. The plugin wires isopod
+into your client; it does not contain isopod, because a sandbox also needs
+`/dev/kvm`, a Firecracker binary, guest images and one `sudo isopod setup`. If the
+server cannot be found, the plugin says so and prints these steps rather than
+failing silently.
+
+Or register the MCP server directly, without the plugin:
 
 ```bash
 claude mcp add --scope local isopod -- /usr/bin/isopod-mcp            # package install
 claude mcp add --scope local isopod -- "$PWD/target/release/isopod-mcp"  # source checkout
-# then, inside Claude Code:  sandbox_run(cmd="echo hi")
 ```
 
 ---

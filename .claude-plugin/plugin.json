@@ -5,6 +5,10 @@
   "version": "0.20.0",
   "description": "Firecracker-microVM sandbox for Claude Code: ephemeral sandbox_run plus content-addressed environment stages (commit/fork), exposed as MCP tools with a workflow skill.",
   "license": "Apache-2.0",
+  "author": {
+    "name": "me1iissa",
+    "url": "https://github.com/me1iissa"
+  },
   "keywords": [
     "sandbox",
     "firecracker",
@@ -20,5 +24,7 @@
       "command": "${CLAUDE_PLUGIN_ROOT}/isopod-mcp",
       "args": []
     }
-  }
+  },
+  "homepage": "https://me1iissa.github.io/isopod/",
+  "repository": "https://github.com/me1iissa/isopod"
 }
