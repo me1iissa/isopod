@@ -42,14 +42,14 @@ jobs:
     permissions:
       contents: write # force-pushes the badge endpoint to the orphan `badges` branch
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add llvm-tools
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-llvm-cov
       # Caching here is fine, unlike in release.yml: nothing this job produces
@@ -103,7 +103,7 @@ jobs:
           git push -q --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" badges
           echo "published $(jq -r .message coverage.json) to the badges branch"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-lcov
           path: lcov.info
