@@ -52,9 +52,14 @@ jobs:
       - name: Build
         run: python3 scripts/build-docs-site.py --out _site --check
 
+      # v4.0.0 of this action started excluding dotfiles from the artifact by
+      # default. The renderer writes a `.nojekyll` into _site (see
+      # build-docs-site.py); keep shipping it so the deployed tree is what was
+      # built and checked, not that tree minus one file.
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: _site
+          include-hidden-files: true
 
   deploy:
     name: Deploy
