@@ -28,9 +28,11 @@ the VM away. Isolation is the KVM hardware boundary, not a shared kernel.
 sandbox_run(cmd="pip install requests", allow_hosts=["pypi.org", "*.pythonhosted.org"])
 ```
 
-> Pre-1.0 and moving quickly; `main` is the supported line. Newest (0.19.0,
-> [changelog](CHANGELOG.md)): a read-only jail bind is now read-only *including
-> every mount beneath it* — it was not, and said nothing — which makes
+> Pre-1.0 and moving quickly; `main` is the supported line. Newest (0.20.1,
+> [changelog](CHANGELOG.md)): `image build-all` works again — Alpine's CDN had
+> superseded the pinned `apk-tools-static`, so every `base-alpine` build 404'd —
+> and rustls is updated for RUSTSEC-2026-0285. Since 0.19.0: a read-only jail
+> bind is read-only *including every mount beneath it* — it was not, and said nothing — which makes
 > **Linux 5.12 a requirement for the opt-in jail** and for nothing else. Also
 > since 0.14.0: guest egress survives a coexisting Docker install, which used to
 > swallow it silently, and a NAT run gets a host-side DNS resolver instead of

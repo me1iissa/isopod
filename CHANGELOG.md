@@ -6,6 +6,31 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.20.1] — 2026-09-15
+
+Maintenance. Nothing in the tree changed; two things it depends on did, and
+both went red on the front-page badges rather than in anyone's build.
+
+### Fixed — `image build-all` failed: the pinned `apk-tools-static` was gone
+
+Alpine's CDN keeps only the current revision of each package. When
+`apk-tools-static` 3.0.7-r0 was superseded by 3.0.8-r0 (around 5 September),
+the pinned download started returning 404 and every `base-alpine` rootfs build
+failed — the nightly boot probe was red from that day on. Re-pinned to
+3.0.8-r0 with its digest. The pin still verifies; this is the pin working as
+designed, and the error it prints says exactly this.
+
+### Security — rustls updated for RUSTSEC-2026-0285
+
+rustls 0.23.42 accepted TLS 1.3 handshake messages sent at the wrong encryption
+level ([GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)).
+isopod only ever uses rustls as a TLS *client*, via reqwest, for registry pulls
+and the pinned kernel download; the handshake transcript stays authenticated,
+so a network attacker cannot alter or complete a handshake with this. The
+Advisories job was red regardless. `Cargo.lock` now carries rustls 0.23.45,
+which pulls aws-lc-rs 1.18.1, aws-lc-sys 0.45.0 and rustls-webpki 0.103.15
+with it.
+
 ## [0.20.0] — 2026-08-03
 
 Two findings from a competitive audit against another Firecracker sandbox, both
