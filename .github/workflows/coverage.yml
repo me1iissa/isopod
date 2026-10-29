@@ -49,13 +49,13 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add llvm-tools
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-llvm-cov
       # Caching here is fine, unlike in release.yml: nothing this job produces
       # is shipped, signed, or attested — a poisoned cache can only corrupt a
       # number that gates nothing.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Coverage
         run: |
           cargo llvm-cov --workspace --locked --summary-only \
@@ -103,7 +103,7 @@ jobs:
           git push -q --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" badges
           echo "published $(jq -r .message coverage.json) to the badges branch"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-lcov
           path: lcov.info
