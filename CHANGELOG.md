@@ -6,6 +6,17 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.20.2] — 2026-11-03
+
+Dependency maintenance.
+
+### Changed — rustls 0.23.45 → 0.23.46
+
+Picks up upstream fixes to TLS 1.3 key updates within fragmented writes, write
+and flush behaviour on connections that have already errored, receive-side
+backpressure, HPKE sequence handling, and removes a secret from a `Debug`
+implementation. No isopod code changed; `Cargo.lock` only.
+
 ## [0.20.1] — 2026-09-15
 
 Maintenance. Nothing in the tree changed; two things it depends on did, and
