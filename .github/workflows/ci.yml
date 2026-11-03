@@ -141,7 +141,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format
         run: cargo fmt --all --check
@@ -287,14 +287,14 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add llvm-tools
 
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         if: steps.facts.outputs.code_changed == 'true'
         with:
           tool: cargo-llvm-cov
 
       # Same reasoning as coverage.yml: a poisoned cache here can only corrupt a
       # number that gates nothing, and nothing this job produces is shipped.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.facts.outputs.code_changed == 'true'
 
       # continue-on-error: coverage failing is a missing section in the digest,
