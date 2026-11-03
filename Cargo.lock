@@ -884,7 +884,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isopod-cli"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-core"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-fc"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "libc",
  "reqwest",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-guest-agent"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "isopod-core",
  "isopod-fc",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-jail"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "libc",
  "tempfile",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-mcp"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "anyhow",
  "isopod-core",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-registry"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "flate2",
  "hex",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-oci-unpack"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "flate2",
  "hex",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "isopod-proto"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "base64",
  "serde",
@@ -1632,9 +1632,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2019,9 +2019,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -2337,9 +2337,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]

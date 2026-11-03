@@ -6,6 +6,26 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.20.3] — 2026-11-03
+
+Security maintenance. Lockfile only; no isopod code changed.
+
+### Security — three RustSec advisories closed
+
+The scheduled advisories check went red on three dependencies. All three are
+patch-level lockfile updates.
+
+- `webpki-root-certs` 1.0.9 → 1.0.11 — RUSTSEC-2026-0383: the bundled roots
+  included `emSign ECC Root CA - G3`, which allows certificate paths through
+  distrusted emSign intermediates.
+- `rustls-webpki` 0.103.15 → 0.103.16 — RUSTSEC-2026-0382: certificate
+  verification could accept distrusted intermediates.
+- `tokio` 1.53.1 → 1.54.1 — RUSTSEC-2026-0386: `AsyncFd::new` and related
+  constructors violated I/O safety (an unsoundness advisory).
+
+The first two sit on the TLS path used by the credential endpoint's upstream
+HTTPS client.
+
 ## [0.20.2] — 2026-11-03
 
 Dependency maintenance.
