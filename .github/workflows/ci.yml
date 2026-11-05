@@ -287,7 +287,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add llvm-tools
 
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         if: steps.facts.outputs.code_changed == 'true'
         with:
           tool: cargo-llvm-cov
