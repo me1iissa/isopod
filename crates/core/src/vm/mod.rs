@@ -35,10 +35,12 @@ use crate::stage::{self, StageMeta};
 
 mod build_fc;
 pub(crate) mod console;
+mod fetch_fc;
 mod registry;
 mod resources;
 
 pub use build_fc::{build_fc, BinPaths, BuildFcOutcome};
+pub use fetch_fc::{fetch_fc, require_filtered, FetchFcOutcome, FC_RELEASE_VERSION};
 pub use registry::{gc as vm_gc, list as vm_list, reap_orphans, GcReport, VmRecord};
 pub use resources::{Resources, DEFAULT_MEM_MIB, DEFAULT_VCPUS};
 
@@ -67,7 +69,8 @@ const DEV_FLAVOR: RootfsFlavor = RootfsFlavor::DevBusybox;
 pub enum FcProvenance {
     /// From the `$ISOPOD_FC_BIN` override.
     Env,
-    /// From `~/.isopod/bin/firecracker` (produced by `isopod dev build-fc`).
+    /// From `~/.isopod/bin/firecracker` (installed by `isopod image fetch-fc`,
+    /// or produced by `isopod dev build-fc`).
     VendoredBuild,
     /// From `/usr/lib/isopod/firecracker` (shipped by the distro package).
     SystemPackage,
@@ -168,13 +171,16 @@ fn resolve_fc_bin() -> Result<FcBinary> {
     let env = std::env::var_os("ISOPOD_FC_BIN")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
-    resolve_fc_bin_from(
+    let fc = resolve_fc_bin_from(
         env,
         home.join("bin/firecracker"),
         PathBuf::from(SYSTEM_FC_BIN),
         home.join("m0/bin/firecracker"),
         &|p| p.exists(),
-    )
+    )?;
+    // Wherever it came from, it does not run without a seccomp filter.
+    fetch_fc::require_filtered(&fc.path)?;
+    Ok(fc)
 }
 
 /// Pure resolution of the firecracker binary, split out so precedence is
@@ -221,7 +227,7 @@ fn resolve_fc_bin_from(
         });
     }
     bail!(
-        "no firecracker binary found: set $ISOPOD_FC_BIN, run `isopod dev build-fc`, \
+        "no firecracker binary found: run `isopod image fetch-fc`, set $ISOPOD_FC_BIN, \
          install the isopod package (provides {}), or provide {} or {}",
         system.display(),
         vendored.display(),
@@ -2126,7 +2132,15 @@ fn build_egress_report(
     // not be shaped by the inline caps.
     match serialize_egress_jsonl(&events) {
         Ok(body) => {
-            if let Err(e) = std::fs::write(&log_path, body) {
+            // Exclusive create after clearing the name: `fs::write` follows a
+            // symbolic link, and this directory was writable by the VMM.
+            let _ = std::fs::remove_file(&log_path);
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&log_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_ref()));
+            if let Err(e) = written {
                 eprintln!("run: could not write {}: {e}", log_path.display());
             }
         }
@@ -2973,18 +2987,30 @@ async fn run_command(
 /// slurping it whole was a host-OOM lever (F3).
 async fn capture_from_log(path: &Path, cap: usize) -> Result<StreamCapture> {
     use tokio::io::AsyncReadExt;
-    let mut file = match tokio::fs::File::open(path).await {
+    // The log lives in the VM directory, which the VMM process can write to. Its
+    // contents go back to the caller as the command's output, so a symbolic link
+    // swapped in at this name would return any file the operator can read.
+    // O_NOFOLLOW refuses a link; O_NONBLOCK keeps a FIFO from hanging the open.
+    let opened = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await;
+    let mut file = match opened {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(StreamCapture::from_bytes(&[], cap));
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", path.display()))),
     };
-    let total_bytes = file
+    let md = file
         .metadata()
         .await
-        .with_context(|| format!("stat {}", path.display()))?
-        .len();
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !md.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let total_bytes = md.len();
     let mut inline = Vec::new();
     (&mut file)
         .take(cap as u64)

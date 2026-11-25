@@ -6,6 +6,73 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.21.0] — 2026-11-25
+
+Security. A second, deeper review, aimed at the VM boundary itself and at what
+an attacker has after crossing it. **Existing installs must run
+`isopod image fetch-fc`** (source installs) or upgrade the package, and re-run
+`sudo isopod setup`.
+
+### Security — Firecracker was running with an allow-everything seccomp filter
+
+Firecracker compiles its seccomp rules in per target and ships them only for
+musl. `isopod dev build-fc` ran a plain `cargo build`, which on a glibc host
+builds the gnu target; upstream's build script does not fail there, it
+substitutes a filter with `default_action: allow` and no rules. Every source
+install and every released package through 0.20.4 ran that binary. It reports
+`Seccomp: 2`, which is how the July assessment recorded the filter as on.
+
+- New `isopod image fetch-fc` installs upstream's static release (v1.16.2),
+  pinned by sha256 for the archive and the binary, as the kernel is.
+- The release packages and the nightly probe ship and test that binary.
+- A dynamically linked Firecracker is refused at run time, naming the fix;
+  `ISOPOD_ALLOW_UNFILTERED_FC=1` overrides. **This breaks existing source
+  installs until `fetch-fc` is run** — deliberately.
+- `dev build-fc` remains for working on Firecracker; its output is refused.
+
+### Security — the VMM inherited the supervisor's environment
+
+Firecracker (and the jail launcher) were spawned with the caller's full
+environment: credentials declared as `env:NAME`, and whatever an MCP client
+was started with. It now starts with none.
+
+### Security — files in the VM directory were trusted after the VMM could write them
+
+The supervisor read `exec-*.log` back as the command's output, hashed and
+copied `scratch.ext4` into the stage store, and wrote `egress.jsonl`, all by
+path and all following symbolic links, in a directory the VMM process can
+write. Each is now opened without following links and must be a regular file.
+
+### Security — a stage label could capture another stage's references
+
+An exact label wins over a prefix, so committing `py` when `python-env` exists
+moved `--stage py` onto new content, to be run by the next caller with their
+credentials and allowlist. A label that is a proper prefix of an existing one
+is now refused. **Breaking** for workflows that relied on it.
+
+### Security — the egress broker could be pointed at the host itself
+
+The destination floor judged ranges, so an allowlisted name resolving to the
+host's own public or LAN address was dialled from the host and reached its
+services. The broker now refuses any of the host's own addresses, plus
+`0.0.0.0/8`, `192.0.0.0/24`, `192.88.99.0/24`, `198.18.0.0/15`, `240.0.0.0/4`
+and `168.63.129.16`, and judges NAT64, 6to4 and IPv4-compatible IPv6 addresses
+as the IPv4 address they carry. The nftables guard drops the same reserved set
+even with `--allow-lan-egress`.
+
+### Security — guest-authored text
+
+Error messages from the guest agent were unbounded (up to a frame, 8 MiB) and
+unescaped on their way to the terminal and the model. They are cut to 2 KiB
+with control characters replaced. The MCP server's instructions now state that
+everything a sandbox returns is data, not instructions.
+
+### Known and not fixed here
+
+Documented in SECURITY.md: the jail shares the host network namespace and
+does not isolate idle taps; Firecracker's filter permits `io_uring`; the jail
+drops no capabilities of its own; warm-resumed guests share page-cache pages.
+
 ## [0.20.4] — 2026-11-25
 
 Security. Fixes from a fresh review of every host-side path, plus the

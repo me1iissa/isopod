@@ -223,6 +223,14 @@ impl FcProcess {
         let argv = config.build_argv();
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        // Firecracker reads nothing from its environment, and the supervisor's
+        // holds things it must never see: a credential declared as `env:NAME`
+        // lives there, and under an MCP client so does whatever that client was
+        // started with. An inherited environment is readable from
+        // `/proc/self/environ` by anything that gains code execution in the VMM,
+        // jail or no jail, so it starts with none. The jail launcher, when one
+        // prefixes this argv, takes everything from its arguments too.
+        cmd.env_clear();
         cmd.stdin(Stdio::null());
         cmd.stdout(config.stdio.to_stdio());
         cmd.stderr(config.stdio.to_stdio());

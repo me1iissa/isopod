@@ -66,7 +66,7 @@ cd isopod
 git submodule update --init --recursive     # vendored Firecracker v1.16.2
 cargo build --release
 
-./target/release/isopod dev build-fc        # build Firecracker -> ~/.isopod/bin
+./target/release/isopod image fetch-fc      # pinned, digest-verified Firecracker -> ~/.isopod/bin
 ./target/release/isopod image fetch-kernel
 ./target/release/isopod image build-all
 sudo ./target/release/isopod setup

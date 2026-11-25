@@ -247,6 +247,14 @@ enum StageCommand {
 
 #[derive(Subcommand)]
 enum ImageCommand {
+    /// Install the pinned, digest-verified upstream Firecracker (v1.16.2) release
+    /// to ~/.isopod/bin. This is the VMM isopod runs: upstream's static build,
+    /// which carries the seccomp filter a local build does not
+    FetchFc {
+        /// Re-download even if the pinned binary is already installed.
+        #[arg(long)]
+        force: bool,
+    },
     /// Fetch the pinned, digest-verified CI guest kernel
     FetchKernel {
         /// Kernel series (major.minor) to fetch.
@@ -331,7 +339,9 @@ enum DevCommand {
         #[arg(long, default_value = "dev-busybox")]
         flavor: String,
     },
-    /// Build the vendored Firecracker (v1.16.2) and install it to ~/.isopod/bin
+    /// Build the vendored Firecracker (v1.16.2) for development. The result has NO
+    /// seccomp filter (upstream ships one only for musl targets) and is refused at
+    /// run time unless ISOPOD_ALLOW_UNFILTERED_FC=1. Use `image fetch-fc` instead
     BuildFc,
 }
 
@@ -433,6 +443,7 @@ fn run_warmpool(cmd: WarmpoolCommand) -> i32 {
 
 fn run_image(cmd: ImageCommand) -> i32 {
     match cmd {
+        ImageCommand::FetchFc { force } => emit(vm::fetch_fc(force)),
         ImageCommand::FetchKernel {
             series,
             force,

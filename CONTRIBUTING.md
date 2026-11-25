@@ -48,7 +48,7 @@ This produces three binaries under `target/release/`:
 To bring up a working environment (Firecracker binary, guest kernel, guest images), then run once:
 
 ```bash
-./target/release/isopod dev build-fc        # build vendored Firecracker into ~/.isopod/bin
+./target/release/isopod image fetch-fc      # pinned upstream Firecracker release into ~/.isopod/bin
 ./target/release/isopod image fetch-kernel  # pinned, digest-verified guest kernel
 ./target/release/isopod image build-all     # every guest image incl. the squashfs bases (unprivileged)
 sudo ./target/release/isopod setup          # one-time host networking (the only root step)

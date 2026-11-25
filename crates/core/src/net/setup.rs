@@ -58,6 +58,14 @@ const NFT_TABLE: &str = "inet isopod";
 /// Per RFC1918 / RFC6598 (100.64.0.0/10 CGNAT) / RFC3927 (169.254.0.0/16).
 const PRIVATE_V4_DESTS: &str =
     "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10";
+/// Destinations a guest must never reach **whatever** `--allow-lan-egress`
+/// says, because none of them is the operator's LAN: `0.0.0.0/8`, the IETF
+/// protocol block, the deprecated 6to4 relay anycast, the benchmarking block,
+/// `240.0.0.0/4`, and `168.63.129.16` — a platform endpoint inside Azure that
+/// is public by its number and internal by its function. The broker refuses the
+/// same set for traffic it dials itself (`egress::is_dialable`).
+const RESERVED_V4_DESTS: &str =
+    "0.0.0.0/8, 192.0.0.0/24, 192.88.99.0/24, 198.18.0.0/15, 240.0.0.0/4, 168.63.129.16";
 /// Where `ip_forward=1` is persisted across reboots.
 const SYSCTL_CONF: &str = "/etc/sysctl.d/90-isopod.conf";
 /// The live sysctl knob for IPv4 forwarding.
@@ -679,10 +687,14 @@ pub fn build_nft_ruleset(
     }
     // Public-only egress unless the operator explicitly opts out: drop guest
     // packets destined for the host's private LAN / cloud metadata.
+    let reserved_guard =
+        format!("\t\tiifname \"isopod-tap*\" ip daddr {{ {RESERVED_V4_DESTS} }} drop\n");
     let dst_guard = if allow_lan_egress {
-        String::new()
+        reserved_guard
     } else {
-        format!("\t\tiifname \"isopod-tap*\" ip daddr {{ {PRIVATE_V4_DESTS} }} drop\n")
+        format!(
+            "{reserved_guard}\t\tiifname \"isopod-tap*\" ip daddr {{ {PRIVATE_V4_DESTS} }} drop\n"
+        )
     };
 
     // PUBLIC (NAT) slots: send their DNS to a host-side forwarder on their own
@@ -1225,9 +1237,11 @@ mod tests {
     fn nft_ruleset_allow_lan_egress_omits_dest_drops() {
         let rs = build_nft_ruleset("eth0", 4, true, 4);
         assert!(
-            !rs.contains("ip daddr {"),
-            "opt-out must omit the destination guard"
+            !rs.contains("10.0.0.0/8") && !rs.contains("192.168.0.0/16"),
+            "opt-out must omit the private-range guard"
         );
+        // ...but never the reserved set, which is nobody's LAN.
+        assert!(rs.contains("168.63.129.16") && rs.contains("240.0.0.0/4"));
         // Anti-spoof and v6 default-deny remain even when LAN egress is allowed.
         assert!(rs.contains("iifname \"isopod-tap0\" ip saddr != 10.107.0.2 drop"));
         assert!(rs.contains("meta nfproto ipv6 drop"));

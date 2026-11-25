@@ -98,11 +98,11 @@ jobs:
           cargo build --release --locked --target x86_64-unknown-linux-musl -p isopod-guest-agent
           ./target/release/isopod --version
 
-      # The slow step: Firecracker is built from the vendored submodule rather
-      # than downloaded, which is why this probe is dispatch-only.
-      - name: Build vendored Firecracker
+      # The pinned upstream release — the binary that ships. A local build of
+      # the submodule has no seccomp filter and is refused at run time.
+      - name: Fetch the pinned Firecracker release
         run: |
-          ./target/release/isopod dev build-fc
+          ./target/release/isopod image fetch-fc
           ls -l "$HOME/.isopod/bin/firecracker"
 
       - name: Guest images
