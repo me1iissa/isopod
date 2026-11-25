@@ -96,7 +96,7 @@ guest agent) for hosts without a package manager; put the binaries on your
 ```bash
 git clone https://github.com/me1iissa/isopod.git
 cd isopod
-git submodule update --init --recursive   # vendored Firecracker v1.16.1 source
+git submodule update --init --recursive   # vendored Firecracker v1.16.2 source
 cargo build --release
 ```
 
@@ -133,7 +133,7 @@ and each command prints a JSON object on success telling you what it produced.
 `fetch-kernel`.
 
 ```bash
-# (Source builds only.) Compile the vendored Firecracker v1.16.1 and install
+# (Source builds only.) Compile the vendored Firecracker v1.16.2 and install
 # it to ~/.isopod/bin. This is the slowest step (a full Rust release build —
 # typically a few minutes). Verify: ~/.isopod/bin/firecracker --version
 isopod dev build-fc

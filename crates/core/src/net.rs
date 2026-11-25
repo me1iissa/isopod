@@ -711,7 +711,23 @@ fn write_manifest_in(root: &Path, manifest: &Manifest) -> Result<()> {
     let json = serde_json::to_string_pretty(manifest).context("serializing net manifest")?;
     let path = manifest_path_in(root);
     let tmp = root.join("slots.json.partial");
-    fs::write(&tmp, format!("{json}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    // `isopod setup` runs this as root inside a directory the unprivileged user
+    // owns. `fs::write` follows a symbolic link, so one planted at this name
+    // would have root truncate and overwrite whatever it pointed at. Clear the
+    // name, then create it exclusively: O_EXCL refuses any existing entry, a
+    // dangling link included, so the open cannot be redirected.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("clearing {}", tmp.display()))),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    std::io::Write::write_all(&mut file, format!("{json}\n").as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &path).with_context(|| format!("finalizing {}", path.display()))
 }
 

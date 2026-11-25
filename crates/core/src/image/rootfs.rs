@@ -80,10 +80,10 @@ const ALPINE_BRANCH: &str = "v3.24";
 const ALPINE_CDN: &str = "https://dl-cdn.alpinelinux.org/alpine";
 
 /// `apk-tools-static` package version (ships the static `apk.static` bootstrapper).
-const APK_TOOLS_STATIC_VERSION: &str = "3.0.8-r0";
+const APK_TOOLS_STATIC_VERSION: &str = "3.0.9-r0";
 /// sha256 of `apk-tools-static-<version>.apk` under `<branch>/main/x86_64/`.
 const APK_TOOLS_STATIC_SHA256: &str =
-    "c8e2c88c13ba12a12269b79a3543e1190ff8c0ab0beb32b58cadfd5881c619e3";
+    "0a1a0682375f66a83b7b903f6e4638ccfe312547d50d336b5f2be9fc391281be";
 /// `alpine-keys` package version (the repository-signing public keys).
 const ALPINE_KEYS_VERSION: &str = "2.6-r0";
 /// sha256 of `alpine-keys-<version>.apk` under `<branch>/main/x86_64/`.

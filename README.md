@@ -63,7 +63,7 @@ isopod run --stage base --base base-alpine -- python3 -c 'print("hello from a mi
 ```bash
 git clone https://github.com/me1iissa/isopod.git
 cd isopod
-git submodule update --init --recursive     # vendored Firecracker v1.16.1
+git submodule update --init --recursive     # vendored Firecracker v1.16.2
 cargo build --release
 
 ./target/release/isopod dev build-fc        # build Firecracker -> ~/.isopod/bin
@@ -153,7 +153,7 @@ flowchart TB
     end
     CORE -.->|"file-locked state"| STATE[("~/.isopod<br/>stages · snapshots · vms · net")]
     CORE --> FCLIB["isopod-fc<br/>typed Firecracker client"]
-    FCLIB -->|"HTTP/JSON over per-VM unix socket"| FCVMM["firecracker v1.16.1<br/>one process per VM · seccomp on · caps dropped"]
+    FCLIB -->|"HTTP/JSON over per-VM unix socket"| FCVMM["firecracker v1.16.2<br/>one process per VM · seccomp on · caps dropped"]
     FCVMM -->|"virtio-blk · hybrid vsock · virtio-net tap"| GUEST
     subgraph GUEST_BOX["Guest microVM"]
         GUEST["custom vmlinux 6.18<br/>isopod-guest-agent = PID 1<br/>overlay base+stages+scratch · vsock RPC · clock sync"]

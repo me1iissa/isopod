@@ -842,3 +842,41 @@ fn a_failure_to_read_a_layout_is_explained_per_source() {
     let err = open_layout(&dir, &ImportSource::OciLayout(dir.clone())).expect_err("not a layout");
     assert!(!format!("{err:#}").contains("interrupted pull"), "{err:#}");
 }
+
+#[test]
+fn a_symlink_where_the_agent_goes_is_never_written_through() {
+    // The extractor keeps a symbolic link verbatim, so an image can put one
+    // exactly where the agent is installed. The install must not follow it.
+    let t = tempfile::tempdir().expect("tempdir");
+    let victim = t.path().join("victim");
+    std::fs::write(&victim, "operator data").expect("write");
+    let agent = fake_agent(t.path());
+
+    // `/.isopod/init` is a link to a host file: replaced, target untouched.
+    let root = t.path().join("rootfs-file");
+    minimal_image(&root);
+    std::fs::create_dir_all(root.join(".isopod")).expect("mkdir");
+    std::os::unix::fs::symlink(&victim, root.join(".isopod/init")).expect("symlink");
+    adapt(&root, &agent).expect("adapts");
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("read"),
+        "operator data"
+    );
+    assert!(std::fs::symlink_metadata(root.join(".isopod/init"))
+        .expect("stat")
+        .file_type()
+        .is_file());
+
+    // `/.isopod` is itself a link to a host directory: refused, nothing created.
+    let outside = t.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("mkdir");
+    let root = t.path().join("rootfs-dir");
+    minimal_image(&root);
+    std::os::unix::fs::symlink(&outside, root.join(".isopod")).expect("symlink");
+    let err = adapt(&root, &agent).expect_err("must refuse");
+    assert!(
+        format!("{err:#}").contains("symbolic link at /.isopod"),
+        "{err:#}"
+    );
+    assert!(!outside.join("init").exists());
+}

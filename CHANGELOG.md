@@ -6,6 +6,79 @@ All notable changes to isopod. The format follows
 features or breaking changes, patch = fixes). See CONTRIBUTING.md §
 Versioning for the policy.
 
+## [0.20.4] — 2026-11-25
+
+Security. Fixes from a fresh review of every host-side path, plus the
+dependency and pin maintenance that had turned both scheduled jobs red.
+**An existing host needs one `sudo isopod setup`** for the network changes.
+
+### Security — the jail exposed the whole store, including other VMs
+
+`ISOPOD_JAIL=1` bound all of `~/.isopod` read-only into the chroot, and the
+single-id map makes the jailed process the files' owner for permission checks.
+An escaped VMM could therefore read `credentials.json` and connect to every
+other sandbox's `api.sock` and `vsock.sock` — a read-only bind does not stop
+`connect(2)`. SECURITY.md said the opposite. The jail now binds only `bin`,
+`images`, `stages` and `snapshots` read-only, and the VM's own directory
+read-write. SECURITY.md is corrected, including the "unmapped uid" claim: the
+map is the operator's own uid, and the chroot is what confines it.
+
+### Security — `ISOPOD_JAIL=true` silently ran unjailed
+
+Only the exact string `1` enabled the jail, and only `1` enabled
+`ISOPOD_VERIFY_SNAPSHOT`. Any other value now enables the protection, with a
+warning; unset, empty, `0`, `false`, `no` and `off` disable it.
+
+### Security — a guest could hold a run open forever through `copy_out`
+
+Copy-out runs after the exec timeout and was bounded only per frame, and an
+empty chunk reset that bound without counting toward the size ceiling. A
+hostile guest agent could keep a run, its network slot and its Firecracker
+process alive indefinitely. Empty chunks are refused, and a copy must sustain
+at least 1 MiB/s once it has run for 60 s — a floor far below a real transfer,
+so a large file is not cut off, but a trickle is. The whole batch is also capped
+at 3600 s, the same hour that caps a run.
+
+### Security — `image import` wrote the guest agent through an image's symlink
+
+A layer shipping `/.isopod/init` (or `/.isopod`) as a symbolic link to a host
+path had the guest agent copied over the target, mode 0755, as the operator.
+The directory is refused if it is a link and the file is created exclusively.
+
+### Security — network fabric
+
+- The input chain dropped only *new* connections from a tap, so untracked
+  traffic reached the host stack; a root guest could send IPv6 router
+  advertisements to a tap that accepted them. The chain now accepts replies
+  and drops everything else, and `setup` disables IPv6 and `accept_ra` on
+  every tap.
+- `sudo isopod setup` wrote `slots.json.partial` with a call that follows
+  symbolic links, inside a directory the unprivileged user owns. It is now
+  created exclusively.
+- DNS over TCP had no connection bound, unlike the proxy listeners. It is
+  capped at 32 concurrent connections per listener.
+
+### Security — Firecracker v1.16.1 → v1.16.2
+
+Closes GHSA-48ww-rqpp-2mgm (guest access to VMM process memory after a failed
+memory discard). Its stated precondition is a snapshot restore with a balloon
+or virtio-mem device, which isopod never configures, so no supported path was
+exposed; the pin moves regardless.
+
+### Security — RustSec advisories
+
+`url` 2.5.8 → 2.5.9 (RUSTSEC-2026-0592), `quinn-proto` 0.11.16 → 0.11.19 and
+`quinn-udp` 0.5.15 → 0.5.16 (eight advisories; lockfile-only, not compiled
+in), `rustix` 1.1.4 → 1.1.6 (RUSTSEC-2026-0486), `chacha20` 0.10.1 → 0.10.2
+(yanked). **Still open:** RUSTSEC-2026-0457 and -0462 in `rmcp` 2.2, both in
+HTTP-client features isopod does not enable, and `chrono` unmaintained
+(RUSTSEC-2026-0543), which arrives through `rmcp`. Closing them is the
+`rmcp` 3.x migration.
+
+### Fixed — `image build-all` 404'd again
+
+Alpine superseded `apk-tools-static-3.0.8-r0`; re-pinned to `3.0.9-r0`.
+
 ## [0.20.3] — 2026-11-03
 
 Security maintenance. Lockfile only; no isopod code changed.

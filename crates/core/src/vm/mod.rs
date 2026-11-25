@@ -865,6 +865,16 @@ pub struct CopiedFile {
 /// a runaway guest file cannot fill the host disk unboundedly.
 const COPY_OUT_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Hard wall limit for one run's whole `--copy-out` batch, across every file.
+///
+/// Each file is already held to a minimum transfer rate, which ends a trickle
+/// but still lets a guest that really delivers bytes run for as long as the
+/// size ceiling allows — hours per file, times the number of files. The copy
+/// runs after the exec's own timeout has stopped applying, so this is the
+/// outer bound on how long it can keep the slot and the VMM: the same hour
+/// that caps a run. A 16 GiB file needs under 5 MiB/s to fit.
+const COPY_OUT_WALL_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// Which boot path served a run: a warm snapshot resume or a cold boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -2735,10 +2745,18 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
                 isopod.copy.bytes_b2 = Empty,
             );
             let t_copy = Instant::now();
-            match copy_out_files(&vm.agent, &params.opts.copy_out)
-                .instrument(copy_span.clone())
-                .await
-            {
+            let copy = tokio::time::timeout(
+                COPY_OUT_WALL_TIMEOUT,
+                copy_out_files(&vm.agent, &params.opts.copy_out).instrument(copy_span.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "copy-out did not finish within {}s",
+                    COPY_OUT_WALL_TIMEOUT.as_secs()
+                ))
+            });
+            match copy {
                 Ok(copied) => {
                     // One aggregate span for the whole batch — never one span
                     // per file — with count and volume as log2 buckets only.
