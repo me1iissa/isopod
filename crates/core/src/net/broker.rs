@@ -2126,13 +2126,28 @@ impl Drop for DnsForwarder {
     }
 }
 
+/// DNS-over-TCP connections served at once, per listener. A resolver's TCP
+/// fallback is one short exchange; this is far more than a real client opens.
+const MAX_CONCURRENT_DNS_TCP: usize = 32;
+
 /// Accept loop for DNS over TCP, mirroring [`serve_dns_udp`]'s peer gate.
 ///
 /// Separate from [`serve_tcp`] so a resolver is never starved by proxy traffic:
 /// they shared a permit pool, and a run that saturated its tunnels made its own
 /// name resolution time out.
+///
+/// It has its own bound for the same reason the proxies have theirs. Every
+/// connection is a task and a descriptor held for up to the read timeout, and
+/// the supervisor's descriptor limit is shared with everything else in the
+/// process — under the MCP server, with every other run. The permit is taken
+/// before `accept`, so a flood waits in the kernel's backlog instead.
 async fn serve_dns_tcp(listener: TcpListener, responder: Arc<DnsResponder>) {
+    let conns = Arc::new(Semaphore::new(MAX_CONCURRENT_DNS_TCP));
     loop {
+        // Only fails if the semaphore is closed, which never happens.
+        let Ok(permit) = Arc::clone(&conns).acquire_owned().await else {
+            return;
+        };
         let Ok((stream, peer)) = listener.accept().await else {
             tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             continue;
@@ -2143,6 +2158,7 @@ async fn serve_dns_tcp(listener: TcpListener, responder: Arc<DnsResponder>) {
         let responder = Arc::clone(&responder);
         tokio::spawn(async move {
             handle_dns_tcp(stream, &responder).await;
+            drop(permit);
         });
     }
 }

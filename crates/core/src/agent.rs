@@ -684,6 +684,17 @@ impl AgentClient {
                             })
                         }
                     };
+                    // A real agent stops at end-of-file and sends `FileDone`; it
+                    // never sends a chunk with nothing in it. An empty chunk
+                    // resets the idle bound above without moving `written`
+                    // toward the ceiling below, so a stream of them would hold
+                    // the run, its slot and its VMM open for as long as the
+                    // guest cared to keep sending.
+                    if bytes.is_empty() {
+                        break Err(AgentError::Unexpected(
+                            "copy-out stream sent an empty chunk".to_string(),
+                        ));
+                    }
                     // Re-enforce the protocol chunk cap host-side (F3).
                     if bytes.len() > EXEC_CHUNK_LEN {
                         break Err(AgentError::OversizeChunk {

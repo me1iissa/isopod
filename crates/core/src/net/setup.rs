@@ -221,6 +221,7 @@ fn provision(opts: SetupOptions) -> Result<SetupReport> {
     for i in 0..slot_count {
         let tap = tap_name(i)?;
         set_tap_forwarding(&tap, i < filtered_from)?;
+        disable_tap_ipv6(&tap)?;
     }
 
     // 4. Manifest + ownership so the unprivileged runtime can claim slots.
@@ -798,6 +799,8 @@ pub fn build_nft_ruleset(
          \t\ttype filter hook input priority filter; policy accept;\n\
          {input_rules}\
          \t\tiifname \"isopod-tap*\" ct state new drop\n\
+         \t\tiifname \"isopod-tap*\" ct state established,related accept\n\
+         \t\tiifname \"isopod-tap*\" drop\n\
          \t}}\n\
          }}\n",
         net = SLOT_SUPERNET,
@@ -1010,6 +1013,31 @@ fn set_tap_forwarding(tap: &str, on: bool) -> Result<()> {
     std::fs::write(&path, if on { "1\n" } else { "0\n" }).with_context(|| format!("writing {path}"))
 }
 
+/// Take IPv6 off a tap entirely, and stop it honouring router advertisements.
+///
+/// A guest has no IPv6 route and the forward chain drops its IPv6, but the tap
+/// is still a host interface: with the kernel defaults it has a link-local
+/// address and accepts router advertisements (`accept_ra` is 1 whenever host
+/// IPv6 forwarding is off, which is the usual case). Neighbour discovery is not
+/// connection-tracked as `new`, so a root guest could advertise itself as a
+/// router and have the *host* install a default route or an on-link prefix
+/// through the tap. The input chain now drops everything from a tap that is not
+/// a reply; this removes the receiver as well, so neither depends on the other.
+///
+/// A host built or booted without IPv6 has no such files, and nothing to turn
+/// off, so their absence is not an error.
+fn disable_tap_ipv6(tap: &str) -> Result<()> {
+    for (knob, value) in [("accept_ra", "0\n"), ("disable_ipv6", "1\n")] {
+        let path = format!("/proc/sys/net/ipv6/conf/{tap}/{knob}");
+        match std::fs::write(&path, value) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("writing {path}"))),
+        }
+    }
+    Ok(())
+}
+
 /// Read the live `net.ipv4.ip_forward` value (0 if unreadable).
 fn read_ip_forward() -> u8 {
     std::fs::read_to_string(IP_FORWARD_PROC)
@@ -1158,6 +1186,13 @@ mod tests {
         // saddr: a guest running root code can spoof its source IP, but cannot
         // change which tap its packets arrive on.
         assert!(rs.contains("iifname \"isopod-tap*\" ct state new drop"));
+        // ...and nothing else from a tap reaches the host either: neighbour
+        // discovery and other untracked traffic is not `new`, so the chain ends
+        // in an unconditional drop behind an accept for replies only.
+        let tail = rs
+            .find("iifname \"isopod-tap*\" ct state established,related accept\n\t\tiifname \"isopod-tap*\" drop\n\t}\n}")
+            .expect("input chain must end reply-accept then drop");
+        assert!(tail > rs.find("chain input").expect("input chain"));
 
         // F1: public-only egress — private/CGNAT/link-local destinations dropped.
         assert!(rs.contains(

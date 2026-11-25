@@ -43,7 +43,7 @@
 //! already root, so they grant nothing there anyway.
 
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -252,11 +252,41 @@ pub fn adapt(tree: &Path, agent: &Path) -> Result<AdaptReport> {
     }
 
     // The agent, and the one path the kernel actually boots.
+    //
+    // Neither path may be reached through a symbolic link the image supplied.
+    // The extractor stores a link verbatim and only refuses to write *through*
+    // one; this write happens after it, on the host, as the operator. An image
+    // shipping `/.isopod/init -> /home/you/.bashrc` (or `/.isopod -> /somewhere`)
+    // would otherwise have the agent copied over that file and made executable.
+    // The mountpoint exemption in `ensure_dir` is for directories isopod only
+    // needs to exist; this is one it writes into, so a link here is refused.
+    let agent_dir = tree.join(AGENT_DIR);
+    if std::fs::symlink_metadata(&agent_dir).is_ok_and(|md| md.file_type().is_symlink()) {
+        bail!(
+            "the image has a symbolic link at /{AGENT_DIR}, where isopod installs its \
+             guest agent; this image cannot be adapted"
+        );
+    }
     ensure_dir(tree, AGENT_DIR)?;
     let dest = tree.join(AGENT_PATH);
-    std::fs::copy(agent, &dest)
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        remove_any(&dest).with_context(|| format!("removing the image's own /{AGENT_PATH}"))?;
+    }
+    // `create_new` is O_CREAT|O_EXCL, which fails on an existing name of any
+    // kind, a dangling link included, so the open cannot follow one even if
+    // something reappears at the path between the removal and here.
+    let mut src = std::fs::File::open(agent)
+        .with_context(|| format!("opening the guest agent {}", agent.display()))?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&dest)
         .with_context(|| format!("installing the guest agent at /{AGENT_PATH}"))?;
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+    std::io::copy(&mut src, &mut out)
+        .with_context(|| format!("installing the guest agent at /{AGENT_PATH}"))?;
+    // Through the descriptor, so the mode lands on the file just written.
+    out.set_permissions(std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod 0755 /{AGENT_PATH}"))?;
 
     let init = tree.join("init");

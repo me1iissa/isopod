@@ -62,7 +62,7 @@ A finding only matters if it crosses that boundary: host code execution, host fi
 The load-bearing controls are configured conservatively:
 
 - **The VMM is hardened.** Firecracker runs **unprivileged** (in the `kvm` group), with its **seccomp BPF filter on** (never `--no-seccomp`), **all capabilities dropped**, and `no_new_privs` set.
-- **Guest→host is blocked.** A guest cannot reach host services; the guest→host vsock path (to the host CID) is reset and MMDS is not configured.
+- **Guest→host is blocked.** A guest cannot reach host services; the guest→host vsock path (to the host CID) is reset and MMDS is not configured. The input chain accepts from a tap only the broker's own ports and replies to connections the host opened, and drops everything else — not just new connections, which left untracked traffic such as IPv6 router advertisements to reach the host stack. IPv6 is also disabled on every tap, with `accept_ra` off. **A host provisioned before 0.20.4 needs one `sudo isopod setup` to pick this up.**
 - **Guest→guest is blocked.** Concurrent guests on different network slots cannot reach one another (`tap↔tap` drop in the nftables ruleset).
 - **A network slot has one run on it.** A slot is claimed by an exclusive `flock` held for the run's lifetime, so no timing, no crash, and no concurrency gets two runs onto one tap and `/30`. The kernel releases the lock when the owning process dies — `kill -9` included — so there is no lock to sweep and no bookkeeping to reconcile. That is a statement about the *lock*, not about the slot: a `kill -9` of the supervisor leaves its Firecracker running and still holding the tap, so the slot is not usable until the next run's `reap_orphans` SIGKILLs it — which does test pid liveness, on a recorded pid and start time.
 - **`--no-network` is airtight.** With no NIC attached, the guest has no route out at all; exec still works because control RPC is vsock, not the network.
@@ -78,8 +78,8 @@ The load-bearing controls are configured conservatively:
 
 isopod can wrap each Firecracker in a **rootless microjail** — set **`ISOPOD_JAIL=1`** in the environment of the runtime (CLI or MCP server). With no privileged host component it adds:
 
-- a **user + pid namespace** with a single-id map, so a VMM/KVM escape lands as an **unprivileged, unmapped uid on the host** (no host capabilities), not your account;
-- a **minimal chroot** (built from identity bind mounts) exposing only the VM's own files + `/dev/kvm` + the tap device — **your home directory and the rest of `~/.isopod` are not visible**;
+- a **user + pid namespace** with a single-id map, so a VMM/KVM escape holds **no host capabilities** and sees no other process. The map is your own uid — an unprivileged user namespace can map nothing else — so file permission checks still treat it as you; what confines it is the chroot below, not the uid;
+- a **minimal chroot** (built from identity bind mounts) exposing the VM's own directory read-write, and read-only the four store directories a VMM reads from (`bin`, `images`, `stages`, `snapshots`), plus `/dev/kvm` and the tap device. **Your home directory, the credential store (`credentials.json`), the network slot state and every other VM's directory — including its API and vsock sockets — are not visible.** Before 0.20.4 the whole of `~/.isopod` was bound read-only, which exposed all of those; a read-only bind does not stop a `connect()` to a socket inside it;
 - a **per-VM cgroup v2 slice** with `memory.max` / `cpu.max` / `pids.max`, so a runaway guest is cgroup-OOM-killed and cannot exhaust host RAM, CPU, or pids.
 
 Drawn as containment layers — what an escape from the box in the middle would still have to get through:
@@ -87,20 +87,20 @@ Drawn as containment layers — what an escape from the box in the middle would 
 ```mermaid
 flowchart TB
     subgraph HOST["Host — your user account"]
-        HIDE["not visible from inside<br/>your home · the rest of ~/.isopod · other VMs"]
+        HIDE["not visible from inside<br/>your home · credentials.json · other VMs and their sockets"]
         subgraph JAIL["isopod-jail — user + pid namespace, single-id map<br/>per-VM cgroup v2 slice with memory.max · cpu.max · pids.max"]
             subgraph CH["minimal chroot — identity bind mounts only"]
                 FCP["firecracker<br/>seccomp on · caps dropped · no_new_privs"]
-                SEEN["reachable — this VM's own files · /dev/kvm · its tap device"]
+                SEEN["reachable — this VM's own files (rw) · bin, images, stages, snapshots (ro) · /dev/kvm · its tap device"]
             end
         end
     end
-    FCP -.->|"a VMM or KVM escape lands as"| ESC["an unprivileged, unmapped uid<br/>with no host capabilities"]
+    FCP -.->|"a VMM or KVM escape lands as"| ESC["your uid, with no host capabilities,<br/>inside the chroot"]
 ```
 
 Without `ISOPOD_JAIL=1` the two inner boxes do not exist, and that dashed arrow lands in the outermost one — as your own account, with your files and the whole `~/.isopod` store in reach.
 
-It requires an environment that supports it: unprivileged user namespaces, a delegated cgroup v2 subtree (a normal systemd user session), and membership in the `kvm` group. When enabled, isopod runs a preflight and **fails closed** with a clear message if any prerequisite is missing (it never silently runs unjailed). It is **opt-in in this release** for portability; enabling it is strongly recommended for untrusted or multi-tenant workloads.
+It requires an environment that supports it: unprivileged user namespaces, a delegated cgroup v2 subtree (a normal systemd user session), and membership in the `kvm` group. When enabled, isopod runs a preflight and **fails closed** with a clear message if any prerequisite is missing (it never silently runs unjailed). The switch itself cannot be typoed off: unset, empty, `0`, `false`, `no` and `off` mean off, and **any other value means on** — `ISOPOD_JAIL=true` used to run unjailed without a word. `ISOPOD_VERIFY_SNAPSHOT` reads the same way. It is **opt-in in this release** for portability; enabling it is strongly recommended for untrusted or multi-tenant workloads.
 
 ---
 
@@ -130,7 +130,7 @@ A qualifying `sandbox_run` resumes a **full-VM memory snapshot** of a booted-idl
 ### What is explicitly **not** claimed
 
 - **The hot-path memory-file check is identity, not cryptography.** A full blake3 of the memory file costs ~315 ms per 512 MiB on the reference host — more than the ~410 ms cold boot the warm path exists to beat — so a resume checks that it is the same file it hashed (size and mtime), not that the bytes still hash the same. That detects truncation, partial writes and ordinary processes; it does **not** detect an attacker who restores the metadata. Set `ISOPOD_VERIFY_SNAPSHOT=1` to digest both files in full on every resume and pay that cost deliberately.
-- **On the unjailed path the snapshot store is writable by your own account.** Anything that can write `~/.isopod/snapshots/*/memfile` and defeat the identity check has code execution in later warm sandboxes. The durable containment is `ISOPOD_JAIL=1`, whose read-only bind of `~/.isopod` — recursive, including every submount — denies the write outright.
+- **On the unjailed path the snapshot store is writable by your own account.** Anything that can write `~/.isopod/snapshots/*/memfile` and defeat the identity check has code execution in later warm sandboxes. The durable containment is `ISOPOD_JAIL=1`, whose read-only bind of the snapshot store — recursive, including every submount — denies the write outright.
 - **Pre-snapshot process state is shared and is not protected.** The guest agent's own ASLR layout and hash seeds are identical across resumes of one snapshot. Consistent with the boundary above, nothing *inside* the guest is defended; snapshots are built only from a pristine base with no committed layers and no scratch, so no lower-trust workload can influence a snapshot a later run resumes.
 
 ---

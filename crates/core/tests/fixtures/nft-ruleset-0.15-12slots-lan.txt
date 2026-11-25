@@ -79,5 +79,7 @@ table inet isopod {
 		iifname "isopod-tap11" ip daddr 10.107.11.1 udp dport 5353 accept
 		iifname "isopod-tap11" ip daddr 10.107.11.1 tcp dport 5353 accept
 		iifname "isopod-tap*" ct state new drop
+		iifname "isopod-tap*" ct state established,related accept
+		iifname "isopod-tap*" drop
 	}
 }

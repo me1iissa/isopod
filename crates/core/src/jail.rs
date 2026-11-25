@@ -55,9 +55,36 @@ const CPU_PERIOD_US: u64 = 100_000;
 const PIDS_MAX: u32 = 128;
 
 /// Whether the jail is enabled for this process (`ISOPOD_JAIL=1`).
+///
+/// Unset, empty, `0`, `false`, `no` and `off` mean off; anything else — a typo
+/// included — turns the jail **on**.
 #[must_use]
 pub fn is_enabled() -> bool {
-    std::env::var(ENABLE_VAR).as_deref() == Ok("1")
+    hardening_switch(ENABLE_VAR, std::env::var_os(ENABLE_VAR).as_deref())
+}
+
+/// Read an opt-in hardening switch so that a typo cannot switch it off.
+///
+/// Unset, empty, `0`, `false`, `no` and `off` (any case, surrounding whitespace
+/// ignored) mean off. `1`, `true`, `yes` and `on` mean on. **Every other value
+/// also means on**, with a warning naming it: someone who set the variable at
+/// all was asking for the protection, and `ISOPOD_JAIL=enabled` silently running
+/// unjailed is the failure this exists to prevent. A switch that is on by
+/// mistake fails loudly at preflight; one that is off by mistake fails silently.
+pub(crate) fn hardening_switch(name: &str, value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(raw) = value else { return false };
+    let text = raw.to_string_lossy();
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => true,
+        _ => {
+            tracing::warn!(
+                "{name} is set to an unrecognised value; treating it as enabled \
+                 (use 1 to enable, 0 to disable)"
+            );
+            true
+        }
+    }
 }
 
 /// One identity bind mount for the chroot.
@@ -107,12 +134,25 @@ pub struct JailSpec {
     pub root: PathBuf,
 }
 
-/// The standard chroot binds for a run/resume: the whole isopod home read-only
-/// (covers the FC binary if under it, the kernel, base squashfs, committed
-/// layers, and snapshots), and the VM directory read-write (its `api.sock`,
-/// `vsock.sock`, scratch, and logs), nested over the read-only home bind. An
-/// `$ISOPOD_FC_BIN` outside the home is bound read-only as a file (Firecracker
-/// release binaries are statically linked, so the file alone suffices).
+/// The parts of the isopod home a jailed Firecracker may read. Everything it
+/// opens lives in one of these: its own binary (`bin`), the guest kernel and
+/// base images (`images`), committed stage layers (`stages`) and warm-pool
+/// snapshots (`snapshots`).
+///
+/// This is a list of what is bound, not of what is hidden, so anything added to
+/// the home later is out of the jail unless it is named here. What that keeps
+/// out today: `credentials.json`, the `net` slot state, and — most importantly —
+/// `vms`, which holds every *other* sandbox's `api.sock` and `vsock.sock`. A
+/// read-only bind does not stop `connect(2)` on a socket inside it, and the
+/// single-id map makes the jailed process the owner of those files as far as
+/// permission checks go, so binding the whole home exposed all of them.
+const JAIL_RO_SUBDIRS: &[&str] = &["bin", "images", "stages", "snapshots"];
+
+/// The standard chroot binds for a run/resume: the readable parts of the isopod
+/// home (`bin`, `images`, `stages`, `snapshots`) read-only, and this VM's own directory read-write
+/// (its `api.sock`, `vsock.sock`, scratch, and logs). An `$ISOPOD_FC_BIN`
+/// outside those is bound read-only as a file (Firecracker release binaries are
+/// statically linked, so the file alone suffices).
 ///
 /// # Errors
 /// If the isopod home cannot be resolved.
@@ -128,11 +168,21 @@ pub fn standard_binds(vm_dir: &Path, fc_path: &Path) -> Result<Vec<Bind>> {
 }
 
 /// Pure inner of [`standard_binds`] (home injected) so it is unit-testable.
+///
+/// A subdirectory that does not exist is skipped rather than created: a bind
+/// needs a source, and nothing Firecracker was told to open can be inside a
+/// directory that is not there.
 fn binds_for(home: &Path, vm_dir: &Path, fc_path: &Path) -> Vec<Bind> {
-    let mut binds = vec![Bind::ro(home), Bind::rw(vm_dir)];
-    if !fc_path.starts_with(home) {
+    let mut binds: Vec<Bind> = JAIL_RO_SUBDIRS
+        .iter()
+        .map(|sub| home.join(sub))
+        .filter(|dir| dir.is_dir())
+        .map(Bind::ro)
+        .collect();
+    if !binds.iter().any(|b| fc_path.starts_with(&b.path)) {
         binds.push(Bind::ro(fc_path));
     }
+    binds.push(Bind::rw(vm_dir));
     binds
 }
 
@@ -703,23 +753,72 @@ mod tests {
     }
 
     #[test]
-    fn binds_cover_home_and_vm_dir_and_external_fc() {
-        let home = Path::new("/home/u/.isopod");
-        let vm_dir = Path::new("/home/u/.isopod/vms/dev-1");
+    fn binds_expose_only_the_named_subdirs_never_the_whole_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for sub in [
+            "bin",
+            "images",
+            "stages",
+            "snapshots",
+            "vms/dev-1",
+            "vms/other",
+            "net",
+        ] {
+            std::fs::create_dir_all(home.join(sub)).expect("mkdir");
+        }
+        std::fs::write(home.join("credentials.json"), "{}").expect("write");
+        let vm_dir = home.join("vms/dev-1");
 
-        // FC under home -> just home ro + vm_dir rw.
-        let fc_in = Path::new("/home/u/.isopod/bin/firecracker");
+        // FC under home/bin -> the four read-only subdirs + vm_dir rw.
+        let binds = binds_for(home, &vm_dir, &home.join("bin/firecracker"));
         assert_eq!(
-            binds_for(home, vm_dir, fc_in),
-            vec![Bind::ro(home), Bind::rw(vm_dir)]
+            binds,
+            vec![
+                Bind::ro(home.join("bin")),
+                Bind::ro(home.join("images")),
+                Bind::ro(home.join("stages")),
+                Bind::ro(home.join("snapshots")),
+                Bind::rw(&vm_dir),
+            ]
         );
+        // The properties the list exists for: no bind is the home itself or an
+        // ancestor of the credential store, the slot state, or another VM.
+        for hidden in ["credentials.json", "net", "vms/other", "vms"] {
+            let hidden = home.join(hidden);
+            assert!(
+                !binds.iter().any(|b| hidden.starts_with(&b.path)),
+                "{} is reachable inside the jail",
+                hidden.display()
+            );
+        }
 
-        // FC outside home -> add a read-only bind of the binary.
+        // FC outside the bound subdirs -> add a read-only bind of the binary.
         let fc_out = Path::new("/opt/fc/firecracker");
-        assert_eq!(
-            binds_for(home, vm_dir, fc_out),
-            vec![Bind::ro(home), Bind::rw(vm_dir), Bind::ro(fc_out)]
-        );
+        assert!(binds_for(home, &vm_dir, fc_out).contains(&Bind::ro(fc_out)));
+
+        // A subdirectory that does not exist is not bound.
+        std::fs::remove_dir(home.join("snapshots")).expect("rmdir");
+        assert!(!binds_for(home, &vm_dir, fc_out).contains(&Bind::ro(home.join("snapshots"))));
+    }
+
+    #[test]
+    fn a_hardening_switch_cannot_be_typoed_off() {
+        use std::ffi::OsStr;
+        let sw = |v: Option<&str>| hardening_switch("ISOPOD_TEST", v.map(OsStr::new));
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("No"),
+            Some(" OFF "),
+        ] {
+            assert!(!sw(off), "{off:?} should be off");
+        }
+        for on in ["1", "true", "YES", "on", " 1", "enabled", "2", "tru"] {
+            assert!(sw(Some(on)), "{on:?} should be on");
+        }
     }
 
     #[test]

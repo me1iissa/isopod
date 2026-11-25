@@ -331,7 +331,7 @@ enum DevCommand {
         #[arg(long, default_value = "dev-busybox")]
         flavor: String,
     },
-    /// Build the vendored Firecracker (v1.16.1) and install it to ~/.isopod/bin
+    /// Build the vendored Firecracker (v1.16.2) and install it to ~/.isopod/bin
     BuildFc,
 }
 

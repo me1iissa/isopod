@@ -430,9 +430,10 @@ const VERIFY_ENV: &str = "ISOPOD_VERIFY_SNAPSHOT";
 /// default is [`Integrity::Fast`] plus `ISOPOD_JAIL=1` for anyone whose threat
 /// model includes a writer on the host.
 fn hot_path_integrity() -> Integrity {
-    match std::env::var(VERIFY_ENV).as_deref() {
-        Ok("1") => Integrity::Full,
-        _ => Integrity::Fast,
+    if crate::jail::hardening_switch(VERIFY_ENV, std::env::var_os(VERIFY_ENV).as_deref()) {
+        Integrity::Full
+    } else {
+        Integrity::Fast
     }
 }
 

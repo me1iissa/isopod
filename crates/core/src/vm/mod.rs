@@ -865,6 +865,13 @@ pub struct CopiedFile {
 /// a runaway guest file cannot fill the host disk unboundedly.
 const COPY_OUT_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Wall budget for one run's whole `--copy-out` batch. The copy runs after the
+/// exec's own timeout has stopped applying, and its per-frame idle bound only
+/// catches a guest that goes *silent*: one that trickles a byte per frame stays
+/// inside it indefinitely. This bounds the batch however the bytes arrive, so
+/// teardown — and with it the release of the slot and the VMM — always happens.
+const COPY_OUT_WALL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Which boot path served a run: a warm snapshot resume or a cold boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -2735,10 +2742,18 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
                 isopod.copy.bytes_b2 = Empty,
             );
             let t_copy = Instant::now();
-            match copy_out_files(&vm.agent, &params.opts.copy_out)
-                .instrument(copy_span.clone())
-                .await
-            {
+            let copy = tokio::time::timeout(
+                COPY_OUT_WALL_TIMEOUT,
+                copy_out_files(&vm.agent, &params.opts.copy_out).instrument(copy_span.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "copy-out did not finish within {}s; the guest was still sending",
+                    COPY_OUT_WALL_TIMEOUT.as_secs()
+                ))
+            });
+            match copy {
                 Ok(copied) => {
                     // One aggregate span for the whole batch — never one span
                     // per file — with count and volume as log2 buckets only.
