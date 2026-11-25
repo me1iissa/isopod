@@ -534,13 +534,10 @@ fn range_is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
                 return range_is_dialable(&IpAddr::V4(v4), allow_private);
             }
             // Teredo, the discard prefix, and documentation: never a destination.
-            if (seg[0] == 0x2001 && seg[1] == 0)
-                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0)
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
-            {
-                return false;
-            }
-            true
+            let teredo = seg[0] == 0x2001 && seg[1] == 0;
+            let discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
+            let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            !(teredo || discard || documentation)
         }
     }
 }
