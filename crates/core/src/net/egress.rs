@@ -38,7 +38,7 @@
 //! syntax has data to justify it.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -444,13 +444,48 @@ pub enum DenyReason {
 /// run reach a sibling's SOCKS proxy, its DNS responder, and — the reason this is
 /// not merely untidy — its credential endpoint, spending a token that was
 /// injected into a different run.
+///
+/// **The host's own addresses** are refused as well, whatever range they are in
+/// — see [`is_host_own_address`]. The broker dials from the host, so a
+/// connection to one of the host's own addresses is delivered locally and never
+/// crosses the tap-pinned input chain: an allowlisted name whose DNS the guest
+/// controls could otherwise point at the host's public or LAN address and reach
+/// every service bound to `0.0.0.0`.
+///
+/// Ranges that are never a real public destination are refused outright:
+/// `0.0.0.0/8`, the IETF protocol and benchmarking blocks, `240.0.0.0/4`, the
+/// deprecated 6to4 relay anycast, and `168.63.129.16` — a platform endpoint
+/// inside Azure that is public by its number and internal by its function. An
+/// IPv6 address that only *carries* an IPv4 one (mapped, compatible, NAT64,
+/// 6to4) is judged as the address it carries.
 #[must_use]
 pub fn is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
+    range_is_dialable(ip, allow_private) && !is_host_own_address(ip)
+}
+
+/// Is `ip` one of this host's own addresses?
+///
+/// Asked of the kernel rather than read from an interface list: binding a
+/// socket to an address succeeds only if the address is local. That is one
+/// syscall, needs no privilege, and cannot drift from what the routing layer
+/// would actually do with the connection.
+///
+/// A host running with `net.ipv4.ip_nonlocal_bind=1` lets every bind succeed,
+/// which makes every address look local and every destination refused. That is
+/// the safe direction to be wrong in.
+#[must_use]
+pub fn is_host_own_address(ip: &IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(*ip, 0)).is_ok()
+}
+
+/// The range half of [`is_dialable`]: a pure function of the address.
+fn range_is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             // `10.107.0.0/16`, asserted against `SLOT_SUPERNET` in the tests so
             // the two cannot drift apart.
-            if v4.octets()[0] == 10 && v4.octets()[1] == 107 {
+            if o[0] == 10 && o[1] == 107 {
                 return false;
             }
             if v4.is_loopback()
@@ -462,8 +497,18 @@ pub fn is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
             {
                 return false;
             }
+            // Never a public destination, with or without `--allow-lan-egress`.
+            let reserved = o[0] == 0                                   // 0.0.0.0/8
+                || o[0] >= 240                                         // 240.0.0.0/4
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)             // 192.0.0.0/24
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)           // 6to4 relay
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))         // 198.18.0.0/15
+                || o == [168, 63, 129, 16]; // Azure platform endpoint
+            if reserved {
+                return false;
+            }
             // 100.64.0.0/10, RFC 6598 — carrier NAT, and not `is_private`.
-            let cgnat = v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]);
+            let cgnat = o[0] == 100 && (64..128).contains(&o[1]);
             if v4.is_private() || cgnat {
                 return allow_private;
             }
@@ -473,23 +518,56 @@ pub fn is_dialable(ip: &IpAddr, allow_private: bool) -> bool {
             if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
                 return false;
             }
+            let seg = v6.segments();
             // fe80::/10 link-local and fec0::/10 site-local.
-            let seg = v6.segments()[0];
-            if seg & 0xffc0 == 0xfe80 || seg & 0xffc0 == 0xfec0 {
+            if seg[0] & 0xffc0 == 0xfe80 || seg[0] & 0xffc0 == 0xfec0 {
                 return false;
             }
             // fc00::/7 unique-local — the v6 equivalent of a private range.
-            if seg & 0xfe00 == 0xfc00 {
+            if seg[0] & 0xfe00 == 0xfc00 {
                 return allow_private;
             }
-            // An IPv4-mapped v6 address must be judged as the v4 address it is,
-            // or it becomes a way to spell 127.0.0.1 that passes every v6 check.
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_dialable(&IpAddr::V4(mapped), allow_private);
+            // An address that carries an IPv4 one must be judged as that IPv4
+            // address, or it becomes a way to spell 127.0.0.1 that passes every
+            // v6 check.
+            if let Some(v4) = embedded_ipv4(v6) {
+                return range_is_dialable(&IpAddr::V4(v4), allow_private);
             }
-            true
+            // Teredo, the discard prefix, and documentation: never a destination.
+            let teredo = seg[0] == 0x2001 && seg[1] == 0;
+            let discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
+            let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            !(teredo || discard || documentation)
         }
     }
+}
+
+/// The IPv4 address an IPv6 address carries, if it is one of the spellings that
+/// carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`),
+/// NAT64 (`64:ff9b::/96`, and the local-use `64:ff9b:1::/48`), and 6to4
+/// (`2002:AABB:CCDD::/48`).
+fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let seg = v6.segments();
+    let low = || {
+        let [a, b] = seg[6].to_be_bytes();
+        let [c, d] = seg[7].to_be_bytes();
+        std::net::Ipv4Addr::new(a, b, c, d)
+    };
+    if seg[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(low());
+    }
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && (seg[2..6] == [0, 0, 0, 0] || seg[2] == 1) {
+        return Some(low());
+    }
+    if seg[0] == 0x2002 {
+        let [a, b] = seg[1].to_be_bytes();
+        let [c, d] = seg[2].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
 }
 
 impl DenyReason {
@@ -1042,5 +1120,45 @@ mod tests {
             HostRule::parse_cidr("192.0.2.0/24").unwrap().display(),
             "192.0.2.0/24"
         );
+    }
+
+    #[test]
+    fn reserved_and_embedded_addresses_are_never_dialable() {
+        for never in [
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "168.63.129.16",
+            // Spellings of 127.0.0.1 and the metadata address.
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::a9fe:a9fe",
+            "2002:7f00:0001::1",
+            "2002:a9fe:a9fe::",
+            "2001:0:1::1",
+            "100::1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = never.parse().expect("ip");
+            assert!(!is_dialable(&ip, true), "{never} must not be dialable");
+        }
+        // A carried private address still follows --allow-lan-egress.
+        let nat64_private: IpAddr = "64:ff9b::c0a8:0101".parse().expect("ip");
+        assert!(!range_is_dialable(&nat64_private, false));
+        assert!(range_is_dialable(&nat64_private, true));
+        // And an ordinary public v6 address is untouched.
+        let public: IpAddr = "2606:4700:4700::1111".parse().expect("ip");
+        assert!(range_is_dialable(&public, false));
+    }
+
+    #[test]
+    fn the_hosts_own_addresses_are_recognised() {
+        // Loopback is always local; a documentation address never is.
+        assert!(is_host_own_address(&"127.0.0.1".parse().expect("ip")));
+        assert!(!is_host_own_address(&"192.0.2.1".parse().expect("ip")));
+        assert!(!is_host_own_address(&"1.1.1.1".parse().expect("ip")));
     }
 }

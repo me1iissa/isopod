@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 # Distro packaging (built by the release workflow with cargo-deb /
-# cargo-generate-rpm; `dist/firecracker` is staged there by `dev build-fc`).
+# cargo-generate-rpm; `dist/firecracker` is the pinned upstream release, staged there by
+# `image fetch-fc`).
 [package.metadata.deb]
 name = "isopod"
 maintainer = "Melissa <184648288+me1iissa@users.noreply.github.com>"

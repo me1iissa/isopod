@@ -40,6 +40,12 @@ egress restriction (F1), the unbounded-log DoS (F3), and the jailer (F2) land.
 
 ## What holds (verified secure)
 
+> **Correction (2026-11-25).** S1 below was verified by reading `Seccomp: 2`
+> from `/proc/<pid>/status`. That shows a filter is installed, not what it
+> allows: the Firecracker this assessment inspected was built for the glibc
+> target, for which upstream ships no rules, and carried an allow-everything
+> filter. Fixed in 0.21.0 — see SECURITY.md, *What holds*.
+
 | # | Property | How verified |
 |---|----------|--------------|
 | S1 | **VMM hardened**: live `firecracker` runs as uid 1000, `CapEff=0` (all caps dropped), `NoNewPrivs=1`, `Seccomp=2` (BPF filter **on**). No `--no-seccomp`/`--seccomp` override. | `/proc/<fc>/status`; `process.rs` |

@@ -17,7 +17,7 @@ flowchart TB
     K["Linux x86_64 with /dev/kvm, your user in the kvm group"] --> HOW{"install from"}
     HOW -->|"a release .deb, .rpm or tarball"| PKG["isopod · isopod-mcp · isopod-jail installed<br/>Firecracker and the guest agent come prebuilt"]
     HOW -->|"a source checkout"| SRC["cargo build --release"]
-    SRC --> BFC["isopod dev build-fc<br/>compiles the vendored Firecracker"]
+    SRC --> BFC["isopod image fetch-fc<br/>installs the pinned Firecracker release"]
     PKG --> FK
     BFC --> FK["isopod image fetch-kernel<br/>pinned guest kernel, digest-verified"]
     FK --> BA["isopod image build-all<br/>guest rootfs and squashfs bases"]
@@ -80,7 +80,7 @@ sudo dnf install ./isopod-*.x86_64.rpm    # Fedora/RHEL-family
 The package installs `isopod`, `isopod-mcp`, and `isopod-jail` into
 `/usr/bin`, plus **prebuilt Firecracker and guest-agent binaries** under
 `/usr/lib/isopod/` — so you skip the Rust toolchain, the submodule, and the
-`dev build-fc` step entirely. Continue at §3 (you still build guest images
+`image fetch-fc` step entirely. Continue at §3 (you still build guest images
 and run `setup`; `image fetch-kernel` + `image build-all` + `sudo isopod
 setup` is your whole remaining path). A source build in your home directory,
 if you later make one, takes precedence over the packaged Firecracker.
@@ -128,15 +128,17 @@ The rest of this doc writes `isopod` for brevity; substitute
 All of this is unprivileged and idempotent. Artifacts land under `~/.isopod/`,
 and each command prints a JSON object on success telling you what it produced.
 
-**Package installs skip `dev build-fc`** — the packaged Firecracker at
+**Package installs skip `image fetch-fc`** — the packaged Firecracker at
 `/usr/lib/isopod/firecracker` is found automatically. Start at
 `fetch-kernel`.
 
 ```bash
-# (Source builds only.) Compile the vendored Firecracker v1.16.2 and install
-# it to ~/.isopod/bin. This is the slowest step (a full Rust release build —
-# typically a few minutes). Verify: ~/.isopod/bin/firecracker --version
-isopod dev build-fc
+# (Source builds only.) Install the pinned upstream Firecracker v1.16.2 release
+# to ~/.isopod/bin — a ~7 MiB download verified against a vendored sha256.
+# It is upstream's static build because that is the one with a seccomp filter;
+# a local `dev build-fc` has none and is refused at run time.
+# Verify: ~/.isopod/bin/firecracker --version
+isopod image fetch-fc
 
 # Download the pinned guest kernel — a few tens of MiB from Firecracker's
 # public CI artifact store, verified against a vendored sha256 digest.
@@ -556,7 +558,7 @@ Everything is under `~/.isopod`, file-locked for concurrent sessions:
 
 | Path | Contents |
 |---|---|
-| `~/.isopod/bin/` | The Firecracker binary (and jail helper) `dev build-fc` installs. |
+| `~/.isopod/bin/` | The Firecracker binary `image fetch-fc` installs (and the jail helper). |
 | `~/.isopod/images/` | Guest kernel + rootfs/base images, stamped with their protocol version. |
 | `~/.isopod/stages/` | The content-addressed stage store (one directory per layer + `meta.json`). |
 | `~/.isopod/vms/` | Per-run VM records: config, exec/serial logs, throwaway disks. |

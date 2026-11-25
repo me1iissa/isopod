@@ -32,6 +32,8 @@ isopod-oci-unpack = { path = "../oci-unpack" }
 # Layer blobs arrive gzipped in practice; the layout reader hands back the
 # verified compressed bytes and the decoder is the caller's choice.
 flate2 = { workspace = true }
+# `fetch-fc` reads one file out of the upstream release archive, in memory.
+tar = { workspace = true }
 # The network half of an import. Kept out of `oci-unpack` on purpose: the
 # extractor is reviewable without any notion of where bytes came from.
 isopod-oci-registry = { path = "../oci-registry" }

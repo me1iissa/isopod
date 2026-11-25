@@ -187,6 +187,42 @@ async fn timed<T>(
     }
 }
 
+/// The most of a guest-authored message that is carried into an error.
+const GUEST_TEXT_MAX: usize = 2048;
+
+/// Make a guest-authored string safe to put in an error.
+///
+/// A message in an `Error` response is written by whatever is running in the
+/// guest, which may not be the agent at all, and it can be as long as a frame
+/// (8 MiB). The error it lands in is printed to the operator's terminal and
+/// returned to the model that called the tool, neither of which the exec
+/// output's inline cap covers. So it is cut to a size that still explains a
+/// real failure, and every control character except newline and tab is
+/// replaced, along with the invisible Unicode format characters — that takes
+/// terminal escape sequences and direction overrides out of it.
+fn guest_text(message: &str) -> String {
+    let mut out: String = message
+        .chars()
+        .take(GUEST_TEXT_MAX)
+        .map(|c| {
+            // Control characters carry terminal escapes. The invisible format
+            // characters — zero-width and bidirectional overrides — carry text
+            // that reads differently from what it says, to a person or a model.
+            let invisible = matches!(c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if (c.is_control() && c != '\n' && c != '\t') || invisible {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if message.chars().nth(GUEST_TEXT_MAX).is_some() {
+        out.push_str(" [truncated]");
+    }
+    out
+}
+
 /// Answer to [`AgentClient::ping`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pong {
@@ -362,10 +398,10 @@ impl AgentClient {
                     });
                 }
                 if let Some(message) = overlay_error {
-                    return Err(AgentError::OverlayDegraded(message));
+                    return Err(AgentError::OverlayDegraded(guest_text(&message)));
                 }
                 if let Some(message) = resolv_error {
-                    return Err(AgentError::ResolverNotApplied(message));
+                    return Err(AgentError::ResolverNotApplied(guest_text(&message)));
                 }
                 Ok(Pong {
                     agent_version,
@@ -373,7 +409,7 @@ impl AgentClient {
                     uptime_s,
                 })
             }
-            ResponseBody::Error { message } => Err(AgentError::Guest(message)),
+            ResponseBody::Error { message } => Err(AgentError::Guest(guest_text(&message))),
             other => Err(unexpected("ping", &other)),
         }
     }
@@ -519,7 +555,7 @@ impl AgentClient {
                 ResponseBody::Error { message } => {
                     out.flush().await?;
                     err.flush().await?;
-                    return Err(AgentError::Guest(message));
+                    return Err(AgentError::Guest(guest_text(&message)));
                 }
                 other => return Err(unexpected("exec", &other)),
             }
@@ -557,7 +593,7 @@ impl AgentClient {
             match frame::aio::read_frame::<_, Response>(&mut stream).await {
                 Ok(Some(resp)) => match resp.body {
                     ResponseBody::Ok => Ok(()),
-                    ResponseBody::Error { message } => Err(AgentError::Guest(message)),
+                    ResponseBody::Error { message } => Err(AgentError::Guest(guest_text(&message))),
                     other => Err(unexpected("halt", &other)),
                 },
                 Ok(None) => Ok(()),               // clean EOF right after Halt
@@ -598,7 +634,7 @@ impl AgentClient {
                 })?;
                 Ok(GetFile { bytes, mode })
             }
-            ResponseBody::Error { message } => Err(AgentError::Guest(message)),
+            ResponseBody::Error { message } => Err(AgentError::Guest(guest_text(&message))),
             other => Err(unexpected("get_file", &other)),
         }
     }
@@ -760,7 +796,9 @@ impl AgentClient {
                     }
                     break Ok(CopyOutcome { total_bytes, mode });
                 }
-                ResponseBody::Error { message } => break Err(AgentError::Guest(message)),
+                ResponseBody::Error { message } => {
+                    break Err(AgentError::Guest(guest_text(&message)))
+                }
                 other => break Err(unexpected("copy_out", &other)),
             }
         };
@@ -847,7 +885,7 @@ impl AgentClient {
     async fn expect_ok(&self, label: &'static str, op: RequestOp) -> Result<(), AgentError> {
         match self.request_one(label, op).await? {
             ResponseBody::Ok => Ok(()),
-            ResponseBody::Error { message } => Err(AgentError::Guest(message)),
+            ResponseBody::Error { message } => Err(AgentError::Guest(guest_text(&message))),
             other => Err(unexpected(label, &other)),
         }
     }
@@ -2558,6 +2596,17 @@ mod tests {
             "the link's target must be untouched"
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn guest_text_is_bounded_and_carries_no_control_characters() {
+        assert_eq!(guest_text("no such file"), "no such file");
+        assert_eq!(guest_text("a\x1b[31mb\r\x07c\nd\te"), "a?[31mb??c\nd\te");
+        assert_eq!(guest_text("safe\u{202E}txt.exe\u{200B}"), "safe?txt.exe?");
+        let long = "x".repeat(GUEST_TEXT_MAX * 4);
+        let cut = guest_text(&long);
+        assert!(cut.ends_with(" [truncated]"));
+        assert_eq!(cut.chars().count(), GUEST_TEXT_MAX + " [truncated]".len());
     }
 
     /// Serve one copy-out request with `respond`, and return the client's error.

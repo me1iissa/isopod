@@ -466,6 +466,20 @@ pub(crate) fn commit_in_timed(
     if label.trim().is_empty() {
         bail!("stage label must not be empty");
     }
+    // The scratch image sits in the VM directory, which the VMM process could
+    // write to for the whole run. It is about to be read in full and copied into
+    // a store later guests mount, so it must be the ordinary file isopod created
+    // there: a symbolic link in its place would have this copy any file the
+    // operator can read into a stage, and a FIFO or device would hang the hash.
+    // The VMM has been killed by the time a commit runs, so this cannot race.
+    let scratch_md = std::fs::symlink_metadata(scratch_path)
+        .with_context(|| format!("stat {}", scratch_path.display()))?;
+    if !scratch_md.file_type().is_file() {
+        bail!(
+            "refusing to commit {}: it is not a regular file",
+            scratch_path.display()
+        );
+    }
     let t_hash = Instant::now();
     let stage_id = {
         let _g = tracing::debug_span!(target: crate::obs::TARGET, "isopod.commit.hash").entered();
@@ -480,6 +494,29 @@ pub(crate) fn commit_in_timed(
             list_in(root)?.into_iter().find(|s| s.label == label),
         )
     };
+
+    // The mirror image of the exact-label clash below. An exact label wins over
+    // a prefix, so a new label that is a proper prefix of an existing one would
+    // capture every reference that today resolves to that stage by prefix:
+    // with `python-env` in the store, committing `py` moves `--stage py` onto
+    // new content, and whoever forks it next runs that content with their own
+    // credentials and allowlist. The label is the caller's choice — over MCP, a
+    // model's — so this is refused rather than left to whoever commits second.
+    if by_label.is_none() {
+        if let Some(shadowed) = list_in(root)?
+            .into_iter()
+            .find(|s| s.label != label && s.label.starts_with(label))
+        {
+            bail!(
+                "stage label {label:?} is a prefix of the existing label {:?} (stage {}). \
+                 References are resolved by label prefix, so this label would take over \
+                 ones that resolve to that stage today. Pick a label that is not a prefix \
+                 of another.",
+                shadowed.label,
+                shadowed.stage_id,
+            );
+        }
+    }
 
     match (by_id, by_label) {
         // Content-addressed store: identical bytes *under the same label* ⇒
@@ -988,16 +1025,21 @@ mod tests {
         let why = commit_in(&root, &second, "my", None, &sqfs(), false)
             .map(|_| String::new())
             .unwrap_or_else(|e| e.to_string());
-        // Committing *is* allowed here — "my" is not an existing label, only a
-        // prefix of one — but the reference it captures must now be unambiguous
-        // rather than silently redirected.
-        if why.is_empty() {
-            let after = resolve_in(&root, "my").unwrap();
-            assert_ne!(
-                after.stage_id, original.stage_id,
-                "an exact label match is the documented winner"
-            );
-        }
+        // Refused: an exact label wins over a prefix, so "my" would have taken
+        // over the reference that resolves to "myenv" today.
+        assert!(why.contains("is a prefix of the existing label"), "{why:?}");
+        assert_eq!(resolve_in(&root, "my").unwrap().stage_id, original.stage_id);
+        // The other direction is fine: a longer label shadows nothing.
+        let longer = fixture(home.path(), "d.img", b"longer label content");
+        commit_in(&root, &longer, "myenv-2", None, &sqfs(), false).unwrap();
+
+        // A scratch that is not a regular file is never read.
+        let link = home.path().join("link.img");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let why = commit_in(&root, &link, "viaLink", None, &sqfs(), false)
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e.to_string());
+        assert!(why.contains("not a regular file"), "{why:?}");
 
         // The case that must never be permitted: reusing the exact label.
         let third = fixture(home.path(), "c.img", b"third content");

@@ -48,6 +48,7 @@ table inet isopod {
 		iifname "isopod-tap10" ip saddr != 10.107.10.2 drop
 		iifname "isopod-tap11" ip saddr != 10.107.11.2 drop
 		iifname "isopod-tap*" meta nfproto ipv6 drop
+		iifname "isopod-tap*" ip daddr { 0.0.0.0/8, 192.0.0.0/24, 192.88.99.0/24, 198.18.0.0/15, 240.0.0.0/4, 168.63.129.16 } drop
 		iifname "eth0" oifname "isopod-tap*" ct state established,related accept
 		iifname "isopod-tap*" oifname "eth0" accept
 		iifname "isopod-tap*" drop

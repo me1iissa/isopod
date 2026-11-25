@@ -14,7 +14,7 @@ isopod targets **Linux with KVM**. You need:
 
 - **KVM access** — `/dev/kvm` must exist and your user must be in the `kvm` group (`ls -l /dev/kvm`, `groups`). If you are developing inside a VM or WSL2, nested virtualization must be enabled.
 - **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml): `stable`, with the `x86_64-unknown-linux-musl` target (the guest agent is a static musl binary). `rustup` reads this file automatically; running `cargo` in the repo installs the pinned channel and target on first use.
-- **The vendored Firecracker submodule** — Firecracker **v1.16.2** is vendored as a git submodule at `vendor/firecracker` and built from source. Fetch it before building anything:
+- **The vendored Firecracker submodule** — Firecracker **v1.16.2** is vendored as a git submodule at `vendor/firecracker`, as the source the typed client is written against and for work on Firecracker itself. **It is not what runs**: `isopod image fetch-fc` installs upstream's release binary, pinned by sha256, because a local build has no seccomp filter (upstream ships one only for musl targets) and is refused at run time. Fetch the submodule before building anything:
 
   ```bash
   git submodule update --init --recursive
@@ -48,7 +48,7 @@ This produces three binaries under `target/release/`:
 To bring up a working environment (Firecracker binary, guest kernel, guest images), then run once:
 
 ```bash
-./target/release/isopod dev build-fc        # build vendored Firecracker into ~/.isopod/bin
+./target/release/isopod image fetch-fc      # pinned upstream Firecracker release into ~/.isopod/bin
 ./target/release/isopod image fetch-kernel  # pinned, digest-verified guest kernel
 ./target/release/isopod image build-all     # every guest image incl. the squashfs bases (unprivileged)
 sudo ./target/release/isopod setup          # one-time host networking (the only root step)

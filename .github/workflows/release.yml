@@ -50,9 +50,12 @@ jobs:
           mkdir -p dist
           install -m755 target/x86_64-unknown-linux-musl/release/isopod-guest-agent dist/
 
-      - name: Build vendored Firecracker
+      # The pinned upstream release, not a local build: Firecracker's seccomp
+      # filter exists only for the musl target, and a plain cargo build on this
+      # runner silently produces a binary with an allow-everything filter.
+      - name: Fetch the pinned Firecracker release
         run: |
-          ./target/release/isopod dev build-fc
+          ./target/release/isopod image fetch-fc
           mkdir -p dist
           install -m755 "$HOME/.isopod/bin/firecracker" dist/firecracker
 

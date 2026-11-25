@@ -35,10 +35,12 @@ use crate::stage::{self, StageMeta};
 
 mod build_fc;
 pub(crate) mod console;
+mod fetch_fc;
 mod registry;
 mod resources;
 
 pub use build_fc::{build_fc, BinPaths, BuildFcOutcome};
+pub use fetch_fc::{fetch_fc, require_filtered, FetchFcOutcome, FC_RELEASE_VERSION};
 pub use registry::{gc as vm_gc, list as vm_list, reap_orphans, GcReport, VmRecord};
 pub use resources::{Resources, DEFAULT_MEM_MIB, DEFAULT_VCPUS};
 
@@ -67,7 +69,8 @@ const DEV_FLAVOR: RootfsFlavor = RootfsFlavor::DevBusybox;
 pub enum FcProvenance {
     /// From the `$ISOPOD_FC_BIN` override.
     Env,
-    /// From `~/.isopod/bin/firecracker` (produced by `isopod dev build-fc`).
+    /// From `~/.isopod/bin/firecracker` (installed by `isopod image fetch-fc`,
+    /// or produced by `isopod dev build-fc`).
     VendoredBuild,
     /// From `/usr/lib/isopod/firecracker` (shipped by the distro package).
     SystemPackage,
@@ -168,13 +171,16 @@ fn resolve_fc_bin() -> Result<FcBinary> {
     let env = std::env::var_os("ISOPOD_FC_BIN")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
-    resolve_fc_bin_from(
+    let fc = resolve_fc_bin_from(
         env,
         home.join("bin/firecracker"),
         PathBuf::from(SYSTEM_FC_BIN),
         home.join("m0/bin/firecracker"),
         &|p| p.exists(),
-    )
+    )?;
+    // Wherever it came from, it does not run without a seccomp filter.
+    fetch_fc::require_filtered(&fc.path)?;
+    Ok(fc)
 }
 
 /// Pure resolution of the firecracker binary, split out so precedence is
@@ -221,7 +227,7 @@ fn resolve_fc_bin_from(
         });
     }
     bail!(
-        "no firecracker binary found: set $ISOPOD_FC_BIN, run `isopod dev build-fc`, \
+        "no firecracker binary found: run `isopod image fetch-fc`, set $ISOPOD_FC_BIN, \
          install the isopod package (provides {}), or provide {} or {}",
         system.display(),
         vendored.display(),
@@ -2129,7 +2135,7 @@ fn build_egress_report(
     // not be shaped by the inline caps.
     match serialize_egress_jsonl(&events) {
         Ok(body) => {
-            if let Err(e) = std::fs::write(&log_path, body) {
+            if let Err(e) = write_replacing_without_following(&log_path, body.as_ref()) {
                 eprintln!("run: could not write {}: {e}", log_path.display());
             }
         }
@@ -2969,6 +2975,26 @@ async fn run_command(
     }
 }
 
+/// Write `body` to `path`, replacing whatever is there without writing through
+/// it.
+///
+/// For files the supervisor writes into the VM directory after a run. That
+/// directory was writable by the VMM process, and `fs::write` follows a
+/// symbolic link — so the name is cleared and then created exclusively, which
+/// fails on any entry that reappears, a dangling link included.
+fn write_replacing_without_following(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, body)
+}
+
 /// Reconstruct a [`StreamCapture`] from a teed log file (used to recover output
 /// after a host-side wall-clock timeout drops the live stream). Reads only the
 /// inline head — never the whole file — because this path runs exactly when a
@@ -2976,18 +3002,30 @@ async fn run_command(
 /// slurping it whole was a host-OOM lever (F3).
 async fn capture_from_log(path: &Path, cap: usize) -> Result<StreamCapture> {
     use tokio::io::AsyncReadExt;
-    let mut file = match tokio::fs::File::open(path).await {
+    // The log lives in the VM directory, which the VMM process can write to. Its
+    // contents go back to the caller as the command's output, so a symbolic link
+    // swapped in at this name would return any file the operator can read.
+    // O_NOFOLLOW refuses a link; O_NONBLOCK keeps a FIFO from hanging the open.
+    let opened = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await;
+    let mut file = match opened {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(StreamCapture::from_bytes(&[], cap));
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {}", path.display()))),
     };
-    let total_bytes = file
+    let md = file
         .metadata()
         .await
-        .with_context(|| format!("stat {}", path.display()))?
-        .len();
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !md.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let total_bytes = md.len();
     let mut inline = Vec::new();
     (&mut file)
         .take(cap as u64)
@@ -3975,5 +4013,58 @@ mod tests {
         assert!(body.ends_with('\n'), "trailing newline keeps appends clean");
         // The deny reason is machine-readable for downstream tooling.
         assert!(body.contains("\"reason\":\"not_allowed\""), "{body}");
+    }
+
+    /// The exec log is read back from a directory the VMM could write to. A
+    /// symbolic link there must not be read through, or a timed-out run would
+    /// return any file the operator can read as the command's output.
+    #[tokio::test]
+    async fn a_symlinked_exec_log_is_not_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"TOP-SECRET").unwrap();
+        let log = dir.path().join("exec-stdout.log");
+        std::os::unix::fs::symlink(&secret, &log).unwrap();
+        assert!(capture_from_log(&log, 4096).await.is_err());
+
+        // A directory in its place is refused too, rather than read as empty.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        assert!(capture_from_log(&log, 4096).await.is_err());
+
+        // The ordinary case still works, and a missing log is empty output.
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::write(&log, b"real output").unwrap();
+        assert_eq!(
+            capture_from_log(&log, 4096).await.unwrap().inline,
+            b"real output"
+        );
+        std::fs::remove_file(&log).unwrap();
+        assert!(capture_from_log(&log, 4096)
+            .await
+            .unwrap()
+            .inline
+            .is_empty());
+    }
+
+    /// The egress log is written where the VMM could have planted a link.
+    #[test]
+    fn a_post_run_write_replaces_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"OPERATOR-DATA").unwrap();
+        let log = dir.path().join("egress.jsonl");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+
+        write_replacing_without_following(&log, b"{}\n").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"OPERATOR-DATA");
+        assert!(std::fs::symlink_metadata(&log)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(std::fs::read(&log).unwrap(), b"{}\n");
+        // And it overwrites its own earlier output.
+        write_replacing_without_following(&log, b"second").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"second");
     }
 }
