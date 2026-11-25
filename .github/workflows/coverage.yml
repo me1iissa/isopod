@@ -49,7 +49,7 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add llvm-tools
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-llvm-cov
       # Caching here is fine, unlike in release.yml: nothing this job produces
