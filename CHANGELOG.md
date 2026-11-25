@@ -112,7 +112,8 @@ empty chunk reset that bound without counting toward the size ceiling. A
 hostile guest agent could keep a run, its network slot and its Firecracker
 process alive indefinitely. Empty chunks are refused, and a copy must sustain
 at least 1 MiB/s once it has run for 60 s — a floor far below a real transfer,
-so a large file is not cut off, but a trickle is.
+so a large file is not cut off, but a trickle is. The whole batch is also capped
+at 3600 s, the same hour that caps a run.
 
 ### Security — `image import` wrote the guest agent through an image's symlink
 
