@@ -33,9 +33,10 @@ use crate::paths;
 // ---------------------------------------------------------------------------
 // The pin. To bump: change the version, download the new
 // `firecracker-<version>-x86_64.tgz` from the upstream releases page, check it
-// against the `.sha256.txt` published beside it, and re-pin all three digests
-// (`sha256sum` of the archive and of the two binaries inside it). Keep it equal
-// to the `vendor/firecracker` submodule tag; a test asserts the version string.
+// against the `.sha256.txt` published beside it, and re-pin both digests
+// (`sha256sum` of the archive and of the `firecracker` binary inside it). Keep
+// it equal to the `vendor/firecracker` submodule tag — that is checked by
+// review, not by a test; a test only ties the CLI help text to this version.
 // ---------------------------------------------------------------------------
 
 /// Upstream release tag.
@@ -334,9 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn the_pin_matches_the_vendored_submodule_tag() {
-        // The release that runs and the source that is vendored must be the
-        // same version, or a review of one says nothing about the other.
+    fn the_cli_help_names_the_pinned_release() {
+        // The help text states a version; it must be the one that is fetched.
+        // (Nothing here can read the submodule's tag: keeping the vendored
+        // source at the pinned release is a review item, per the pin block.)
         let cli = include_str!("../../../cli/src/main.rs");
         assert!(
             cli.contains(&format!("Firecracker ({FC_RELEASE_VERSION})")),

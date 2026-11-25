@@ -167,6 +167,13 @@ pub const EXEC_LOG_CAP: u64 = 64 * 1024 * 1024;
 const LOG_TRUNCATED_MARKER: &[u8] =
     b"\n[isopod: log cap reached; output beyond this point was not persisted]\n";
 
+/// How long a copy-out may run before its transfer rate is judged at all.
+const COPY_OUT_RATE_GRACE: Duration = Duration::from_secs(60);
+/// The slowest sustained copy-out that is still treated as a transfer. Chosen
+/// far below anything a working guest produces over vsock, so it bounds a
+/// hostile trickle without ever failing a large, slow, legitimate file.
+const COPY_OUT_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
+
 /// Bound a vsock I/O future with `budget`, mapping expiry to
 /// [`AgentError::Timeout`] (F8).
 async fn timed<T>(
@@ -191,13 +198,19 @@ const GUEST_TEXT_MAX: usize = 2048;
 /// returned to the model that called the tool, neither of which the exec
 /// output's inline cap covers. So it is cut to a size that still explains a
 /// real failure, and every control character except newline and tab is
-/// replaced — that takes terminal escape sequences out of it.
+/// replaced, along with the invisible Unicode format characters — that takes
+/// terminal escape sequences and direction overrides out of it.
 fn guest_text(message: &str) -> String {
     let mut out: String = message
         .chars()
         .take(GUEST_TEXT_MAX)
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
+            // Control characters carry terminal escapes. The invisible format
+            // characters — zero-width and bidirectional overrides — carry text
+            // that reads differently from what it says, to a person or a model.
+            let invisible = matches!(c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if (c.is_control() && c != '\n' && c != '\t') || invisible {
                 '?'
             } else {
                 c
@@ -681,6 +694,7 @@ impl AgentClient {
 
         let mut sink = open_copy_out_dest(dest).await?;
         let mut written: u64 = 0;
+        let started = tokio::time::Instant::now();
         let result = loop {
             // Idle-bounded per frame (F8): a healthy guest streams chunks
             // back-to-back, so prolonged silence means it is wedged — without a
@@ -743,7 +757,26 @@ impl AgentClient {
                         )));
                     }
                     match sink.file().write_all(&bytes).await {
-                        Ok(()) => written = written.saturating_add(bytes.len() as u64),
+                        Ok(()) => {
+                            written = written.saturating_add(bytes.len() as u64);
+                            // The idle bound above catches a guest that goes
+                            // silent; this catches one that never does. A byte
+                            // every few seconds stays inside the idle bound
+                            // forever, and this copy runs after the exec's own
+                            // timeout stopped applying — so the time a copy may
+                            // take is tied to what it has delivered. A real
+                            // transfer is orders of magnitude above the floor,
+                            // however large the file.
+                            let allowed = COPY_OUT_RATE_GRACE
+                                + Duration::from_secs(written / COPY_OUT_MIN_BYTES_PER_SEC);
+                            if started.elapsed() > allowed {
+                                break Err(AgentError::Unexpected(format!(
+                                    "copy-out is below the minimum transfer rate \
+                                     ({written} bytes in {}s)",
+                                    started.elapsed().as_secs()
+                                )));
+                            }
+                        }
                         Err(e) => {
                             break Err(
                                 io_err(format!("writing copy-out dest {}", dest.display()))(e),
@@ -2569,9 +2602,70 @@ mod tests {
     fn guest_text_is_bounded_and_carries_no_control_characters() {
         assert_eq!(guest_text("no such file"), "no such file");
         assert_eq!(guest_text("a\x1b[31mb\r\x07c\nd\te"), "a?[31mb??c\nd\te");
+        assert_eq!(guest_text("safe\u{202E}txt.exe\u{200B}"), "safe?txt.exe?");
         let long = "x".repeat(GUEST_TEXT_MAX * 4);
         let cut = guest_text(&long);
         assert!(cut.ends_with(" [truncated]"));
         assert_eq!(cut.chars().count(), GUEST_TEXT_MAX + " [truncated]".len());
+    }
+
+    /// Serve one copy-out request with `respond`, and return the client's error.
+    async fn copy_out_failure<F, Fut>(respond: F) -> (String, Vec<u8>)
+    where
+        F: FnOnce(tokio::net::UnixStream, u64) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let dest = dir.path().join("keepme.txt");
+        std::fs::write(&dest, b"ORIGINAL").unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let mut conn = accept_handshake(&listener).await;
+            let req = read_req(&mut conn).await;
+            assert!(matches!(req.op, RequestOp::CopyOut { .. }));
+            respond(conn, req.id).await;
+        });
+        let err = AgentClient::new(&sock)
+            .copy_out("/some/file", &dest, 1 << 30)
+            .await
+            .expect_err("the copy must fail");
+        server.abort();
+        (err.to_string(), std::fs::read(&dest).unwrap())
+    }
+
+    /// An empty chunk resets the idle bound without moving toward the size
+    /// ceiling, so a stream of them would never end. It is refused outright.
+    #[tokio::test]
+    async fn copy_out_refuses_an_empty_chunk() {
+        let (err, dest) = copy_out_failure(|mut conn, id| async move {
+            let empty = ResponseBody::FileChunk {
+                data_b64: String::new(),
+            };
+            write_resp(&mut conn, id, empty).await;
+            let mut b = [0u8; 1];
+            let _ = conn.read(&mut b).await;
+        })
+        .await;
+        assert!(err.contains("empty chunk"), "{err}");
+        assert_eq!(dest, b"ORIGINAL");
+    }
+
+    /// One byte every 20 s never trips the 30 s idle bound. The rate floor must
+    /// end it anyway. Paused clock, so this takes no real time.
+    #[tokio::test(start_paused = true)]
+    async fn copy_out_refuses_a_trickle_that_stays_inside_the_idle_bound() {
+        let (err, dest) = copy_out_failure(|mut conn, id| async move {
+            loop {
+                let one = ResponseBody::FileChunk {
+                    data_b64: b64_encode(b"x"),
+                };
+                write_resp(&mut conn, id, one).await;
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+        })
+        .await;
+        assert!(err.contains("minimum transfer rate"), "{err}");
+        assert_eq!(dest, b"ORIGINAL");
     }
 }

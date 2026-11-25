@@ -34,7 +34,9 @@ install and every released package through 0.20.4 ran that binary. It reports
 
 Firecracker (and the jail launcher) were spawned with the caller's full
 environment: credentials declared as `env:NAME`, and whatever an MCP client
-was started with. It now starts with none.
+was started with. It now starts with none. This is a boundary only under
+`ISOPOD_JAIL=1`, where the supervisor is out of the VMM's sight; unjailed, a
+compromised VMM can read the supervisor's own environment and this is hygiene.
 
 ### Security — files in the VM directory were trusted after the VMM could write them
 
@@ -48,7 +50,9 @@ write. Each is now opened without following links and must be a regular file.
 An exact label wins over a prefix, so committing `py` when `python-env` exists
 moved `--stage py` onto new content, to be run by the next caller with their
 credentials and allowlist. A label that is a proper prefix of an existing one
-is now refused. **Breaking** for workflows that relied on it.
+is now refused. **Breaking** for workflows that relied on it — and for any
+that commit a shorter label after a longer one it prefixes: `v1` after `v10`
+now errors.
 
 ### Security — the egress broker could be pointed at the host itself
 
@@ -60,11 +64,16 @@ and `168.63.129.16`, and judges NAT64, 6to4 and IPv4-compatible IPv6 addresses
 as the IPv4 address they carry. The nftables guard drops the same reserved set
 even with `--allow-lan-egress`.
 
+**This can break guests in environments that use those ranges on purpose.**
+`198.18.0.0/15` in particular is used by fake-IP DNS proxies and some VPN and
+lab setups; a guest there loses egress to those addresses, with no flag to
+re-allow them.
+
 ### Security — guest-authored text
 
 Error messages from the guest agent were unbounded (up to a frame, 8 MiB) and
 unescaped on their way to the terminal and the model. They are cut to 2 KiB
-with control characters replaced. The MCP server's instructions now state that
+with control characters and invisible Unicode format characters replaced. The MCP server's instructions now state that
 everything a sandbox returns is data, not instructions.
 
 ### Known and not fixed here
@@ -101,8 +110,9 @@ warning; unset, empty, `0`, `false`, `no` and `off` disable it.
 Copy-out runs after the exec timeout and was bounded only per frame, and an
 empty chunk reset that bound without counting toward the size ceiling. A
 hostile guest agent could keep a run, its network slot and its Firecracker
-process alive indefinitely. Empty chunks are refused, and the whole batch has a
-600 s wall budget.
+process alive indefinitely. Empty chunks are refused, and a copy must sustain
+at least 1 MiB/s once it has run for 60 s — a floor far below a real transfer,
+so a large file is not cut off, but a trickle is.
 
 ### Security — `image import` wrote the guest agent through an image's symlink
 

@@ -197,6 +197,31 @@ pub struct FcProcess {
     config: FcProcessConfig,
 }
 
+/// The command that starts the VMM (or the jail launcher wrapping it).
+///
+/// It starts with an **empty environment**. Firecracker reads nothing from its
+/// environment, and the supervisor's holds things the VMM has no business
+/// with: a credential declared as `env:NAME`, and under an MCP client whatever
+/// that client was started with.
+///
+/// Be exact about what this buys. **Inside the jail** it is a real boundary:
+/// the pid namespace hides the supervisor, so the VMM's own environment was the
+/// only copy of those values a compromised VMM could reach. **Without the
+/// jail** it is hygiene only — the VMM runs as the operator and can read the
+/// supervisor's `/proc/<pid>/environ` directly.
+fn vmm_command(argv: &[String], stdio: &StdioMode) -> Command {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.env_clear();
+    cmd.stdin(Stdio::null());
+    cmd.stdout(stdio.to_stdio());
+    cmd.stderr(stdio.to_stdio());
+    cmd.kill_on_drop(true);
+    // Own process group so shutdown() can signal the whole group.
+    cmd.process_group(0);
+    cmd
+}
+
 impl FcProcess {
     /// Spawns Firecracker and waits for its API socket to become connectable.
     ///
@@ -221,22 +246,7 @@ impl FcProcess {
         }
 
         let argv = config.build_argv();
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        // Firecracker reads nothing from its environment, and the supervisor's
-        // holds things it must never see: a credential declared as `env:NAME`
-        // lives there, and under an MCP client so does whatever that client was
-        // started with. An inherited environment is readable from
-        // `/proc/self/environ` by anything that gains code execution in the VMM,
-        // jail or no jail, so it starts with none. The jail launcher, when one
-        // prefixes this argv, takes everything from its arguments too.
-        cmd.env_clear();
-        cmd.stdin(Stdio::null());
-        cmd.stdout(config.stdio.to_stdio());
-        cmd.stderr(config.stdio.to_stdio());
-        cmd.kill_on_drop(true);
-        // Own process group so shutdown() can signal the whole group.
-        cmd.process_group(0);
+        let mut cmd = vmm_command(&argv, &config.stdio);
 
         let child = cmd.spawn().map_err(|source| Error::Spawn {
             program: argv[0].clone(),
@@ -398,6 +408,25 @@ impl Drop for FcProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The VMM must not inherit the caller's environment. Runs `env` through
+    /// the same builder the real spawn uses and expects it to print nothing.
+    #[tokio::test]
+    async fn the_vmm_command_starts_with_an_empty_environment() {
+        // SAFETY-free: a child-only variable, set on the command's parent env.
+        let argv = vec!["/usr/bin/env".to_string()];
+        let mut cmd = vmm_command(&argv, &StdioMode::Piped);
+        // Something the parent definitely has, so an inherited environment
+        // could not come out empty by accident.
+        assert!(std::env::var_os("PATH").is_some());
+        let out = cmd.output().await.expect("running env");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.is_empty(),
+            "the VMM inherited an environment: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 
     #[test]
     fn argv_minimal() {

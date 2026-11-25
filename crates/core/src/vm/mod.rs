@@ -871,13 +871,6 @@ pub struct CopiedFile {
 /// a runaway guest file cannot fill the host disk unboundedly.
 const COPY_OUT_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-/// Wall budget for one run's whole `--copy-out` batch. The copy runs after the
-/// exec's own timeout has stopped applying, and its per-frame idle bound only
-/// catches a guest that goes *silent*: one that trickles a byte per frame stays
-/// inside it indefinitely. This bounds the batch however the bytes arrive, so
-/// teardown — and with it the release of the slot and the VMM — always happens.
-const COPY_OUT_WALL_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Which boot path served a run: a warm snapshot resume or a cold boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -2132,15 +2125,7 @@ fn build_egress_report(
     // not be shaped by the inline caps.
     match serialize_egress_jsonl(&events) {
         Ok(body) => {
-            // Exclusive create after clearing the name: `fs::write` follows a
-            // symbolic link, and this directory was writable by the VMM.
-            let _ = std::fs::remove_file(&log_path);
-            let written = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&log_path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_ref()));
-            if let Err(e) = written {
+            if let Err(e) = write_replacing_without_following(&log_path, body.as_ref()) {
                 eprintln!("run: could not write {}: {e}", log_path.display());
             }
         }
@@ -2756,17 +2741,9 @@ async fn exec_and_teardown(mut vm: BootedVm, params: &ExecParams<'_>) -> Result<
                 isopod.copy.bytes_b2 = Empty,
             );
             let t_copy = Instant::now();
-            let copy = tokio::time::timeout(
-                COPY_OUT_WALL_TIMEOUT,
-                copy_out_files(&vm.agent, &params.opts.copy_out).instrument(copy_span.clone()),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(anyhow!(
-                    "copy-out did not finish within {}s; the guest was still sending",
-                    COPY_OUT_WALL_TIMEOUT.as_secs()
-                ))
-            });
+            let copy = copy_out_files(&vm.agent, &params.opts.copy_out)
+                .instrument(copy_span.clone())
+                .await;
             match copy {
                 Ok(copied) => {
                     // One aggregate span for the whole batch — never one span
@@ -2978,6 +2955,26 @@ async fn run_command(
             })
         }
     }
+}
+
+/// Write `body` to `path`, replacing whatever is there without writing through
+/// it.
+///
+/// For files the supervisor writes into the VM directory after a run. That
+/// directory was writable by the VMM process, and `fs::write` follows a
+/// symbolic link — so the name is cleared and then created exclusively, which
+/// fails on any entry that reappears, a dangling link included.
+fn write_replacing_without_following(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, body)
 }
 
 /// Reconstruct a [`StreamCapture`] from a teed log file (used to recover output
@@ -3998,5 +3995,58 @@ mod tests {
         assert!(body.ends_with('\n'), "trailing newline keeps appends clean");
         // The deny reason is machine-readable for downstream tooling.
         assert!(body.contains("\"reason\":\"not_allowed\""), "{body}");
+    }
+
+    /// The exec log is read back from a directory the VMM could write to. A
+    /// symbolic link there must not be read through, or a timed-out run would
+    /// return any file the operator can read as the command's output.
+    #[tokio::test]
+    async fn a_symlinked_exec_log_is_not_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"TOP-SECRET").unwrap();
+        let log = dir.path().join("exec-stdout.log");
+        std::os::unix::fs::symlink(&secret, &log).unwrap();
+        assert!(capture_from_log(&log, 4096).await.is_err());
+
+        // A directory in its place is refused too, rather than read as empty.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        assert!(capture_from_log(&log, 4096).await.is_err());
+
+        // The ordinary case still works, and a missing log is empty output.
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::write(&log, b"real output").unwrap();
+        assert_eq!(
+            capture_from_log(&log, 4096).await.unwrap().inline,
+            b"real output"
+        );
+        std::fs::remove_file(&log).unwrap();
+        assert!(capture_from_log(&log, 4096)
+            .await
+            .unwrap()
+            .inline
+            .is_empty());
+    }
+
+    /// The egress log is written where the VMM could have planted a link.
+    #[test]
+    fn a_post_run_write_replaces_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"OPERATOR-DATA").unwrap();
+        let log = dir.path().join("egress.jsonl");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+
+        write_replacing_without_following(&log, b"{}\n").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"OPERATOR-DATA");
+        assert!(std::fs::symlink_metadata(&log)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(std::fs::read(&log).unwrap(), b"{}\n");
+        // And it overwrites its own earlier output.
+        write_replacing_without_following(&log, b"second").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"second");
     }
 }
